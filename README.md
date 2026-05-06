@@ -506,11 +506,6 @@ Convert base64-encoded data (like images from canvas, camera, or API responses) 
 
 ---
 
-## Articles & Resources
-
-- [**I Got Tired of React Native File Downloads Being a Mess — So I Built rn-file-toolkit**](https://medium.com/@chavanrohit413/i-got-tired-of-react-native-file-downloads-being-a-mess-so-i-built-rn-file-toolkit-29b7a8b5c743) — Deep dive into the problems with existing solutions and how rn-file-toolkit solves them
-
----
 
 ## Links
 
