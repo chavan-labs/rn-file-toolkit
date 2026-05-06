@@ -26,4 +26,4 @@ export interface Spec extends TurboModule {
   zip(sourcePath: string, destPath: string): Promise<Object>;
 }
 
-export default TurboModuleRegistry.getEnforcing<Spec>('Downloader');
+export default TurboModuleRegistry.getEnforcing<Spec>('FileToolkit');

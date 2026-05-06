@@ -11,7 +11,7 @@ export default function Base64Example() {
     'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg==';
 
   // Sample plain base64 text
-  const sampleBase64Text = 'SGVsbG8gZnJvbSBybi1kb3dubG9hZGVyIQ=='; // "Hello from rn-downloader!"
+  const sampleBase64Text = 'SGVsbG8gZnJvbSBybi1kb3dubG9hZGVyIQ=='; // "Hello from rn-file-toolkit!"
 
   const handleSaveDataURI = async () => {
     setLoading(true);

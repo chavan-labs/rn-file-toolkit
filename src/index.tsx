@@ -1,9 +1,9 @@
 import { useState, useCallback, useRef } from 'react';
 import { NativeEventEmitter, NativeModules } from 'react-native';
-import DownloaderSpec from './NativeDownloader';
+import FileToolkitSpec from './NativeFileToolkit';
 
-const DownloaderModule = NativeModules.Downloader || DownloaderSpec;
-const eventEmitter = new NativeEventEmitter(DownloaderModule);
+const FileToolkitModule = NativeModules.FileToolkit || FileToolkitSpec;
+const eventEmitter = new NativeEventEmitter(FileToolkitModule);
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -482,7 +482,7 @@ async function _executeDownload(
   };
 
   try {
-    const resultPromise = (DownloaderSpec as any).download({
+    const resultPromise = (FileToolkitSpec as any).download({
       url: options.url,
       fileName: options.fileName,
       background: options.background ?? false,
@@ -573,7 +573,7 @@ export async function upload(options: UploadOptions): Promise<UploadResult> {
   }
 
   try {
-    const result = await (DownloaderSpec as any).upload({
+    const result = await (FileToolkitSpec as any).upload({
       url: options.url,
       filePath: options.filePath,
       fieldName: options.fieldName ?? 'file',
@@ -603,7 +603,7 @@ export async function upload(options: UploadOptions): Promise<UploadResult> {
  */
 export async function pauseDownload(downloadId: string): Promise<ActionResult> {
   try {
-    return (await (DownloaderSpec as any).pauseDownload(
+    return (await (FileToolkitSpec as any).pauseDownload(
       downloadId
     )) as ActionResult;
   } catch (error: any) {
@@ -619,7 +619,7 @@ export async function resumeDownload(
   downloadId: string
 ): Promise<ActionResult> {
   try {
-    return (await (DownloaderSpec as any).resumeDownload(
+    return (await (FileToolkitSpec as any).resumeDownload(
       downloadId
     )) as ActionResult;
   } catch (error: any) {
@@ -635,7 +635,7 @@ export async function cancelDownload(
   downloadId: string
 ): Promise<ActionResult> {
   try {
-    return (await (DownloaderSpec as any).cancelDownload(
+    return (await (FileToolkitSpec as any).cancelDownload(
       downloadId
     )) as ActionResult;
   } catch (error: any) {
@@ -650,7 +650,7 @@ export async function cancelDownload(
  */
 export async function getCachedFiles(): Promise<CacheResult> {
   try {
-    return (await (DownloaderSpec as any).getCachedFiles()) as CacheResult;
+    return (await (FileToolkitSpec as any).getCachedFiles()) as CacheResult;
   } catch (error: any) {
     return { success: false, error: error?.message || 'UNKNOWN_ERROR' };
   }
@@ -661,7 +661,9 @@ export async function getCachedFiles(): Promise<CacheResult> {
  */
 export async function deleteFile(filePath: string): Promise<ActionResult> {
   try {
-    return (await (DownloaderSpec as any).deleteFile(filePath)) as ActionResult;
+    return (await (FileToolkitSpec as any).deleteFile(
+      filePath
+    )) as ActionResult;
   } catch (error: any) {
     return { success: false, error: error?.message || 'UNKNOWN_ERROR' };
   }
@@ -672,7 +674,7 @@ export async function deleteFile(filePath: string): Promise<ActionResult> {
  */
 export async function clearCache(): Promise<ActionResult> {
   try {
-    return (await (DownloaderSpec as any).clearCache()) as ActionResult;
+    return (await (FileToolkitSpec as any).clearCache()) as ActionResult;
   } catch (error: any) {
     return { success: false, error: error?.message || 'UNKNOWN_ERROR' };
   }
@@ -693,7 +695,7 @@ export async function getBackgroundDownloads(): Promise<{
   error?: string;
 }> {
   try {
-    return (await (DownloaderSpec as any).getBackgroundDownloads()) as any;
+    return (await (FileToolkitSpec as any).getBackgroundDownloads()) as any;
   } catch (error: any) {
     return { success: false, error: error?.message || 'UNKNOWN_ERROR' };
   }
@@ -709,14 +711,14 @@ function _ensureFsSuccess(result: any, fallback: string): void {
 
 /** Check whether a file or directory exists. */
 export async function exists(filePath: string): Promise<boolean> {
-  const result = await (DownloaderSpec as any).exists(filePath);
+  const result = await (FileToolkitSpec as any).exists(filePath);
   _ensureFsSuccess(result, 'EXISTS_ERROR');
   return !!result.exists;
 }
 
 /** Get file or directory metadata. */
 export async function stat(filePath: string): Promise<FsStat> {
-  const result = await (DownloaderSpec as any).stat(filePath);
+  const result = await (FileToolkitSpec as any).stat(filePath);
   _ensureFsSuccess(result, 'STAT_ERROR');
   return result.stat as FsStat;
 }
@@ -726,7 +728,7 @@ export async function readFile(
   filePath: string,
   encoding: FsEncoding = 'utf8'
 ): Promise<string> {
-  const result = await (DownloaderSpec as any).readFile(filePath, encoding);
+  const result = await (FileToolkitSpec as any).readFile(filePath, encoding);
   _ensureFsSuccess(result, 'READ_FILE_ERROR');
   return result.data ?? '';
 }
@@ -737,7 +739,7 @@ export async function writeFile(
   data: string,
   encoding: FsEncoding = 'utf8'
 ): Promise<void> {
-  const result = await (DownloaderSpec as any).writeFile(
+  const result = await (FileToolkitSpec as any).writeFile(
     filePath,
     data,
     encoding
@@ -750,7 +752,7 @@ export async function copyFile(
   fromPath: string,
   toPath: string
 ): Promise<void> {
-  const result = await (DownloaderSpec as any).copyFile(fromPath, toPath);
+  const result = await (FileToolkitSpec as any).copyFile(fromPath, toPath);
   _ensureFsSuccess(result, 'COPY_FILE_ERROR');
 }
 
@@ -759,19 +761,19 @@ export async function moveFile(
   fromPath: string,
   toPath: string
 ): Promise<void> {
-  const result = await (DownloaderSpec as any).moveFile(fromPath, toPath);
+  const result = await (FileToolkitSpec as any).moveFile(fromPath, toPath);
   _ensureFsSuccess(result, 'MOVE_FILE_ERROR');
 }
 
 /** Create a directory recursively. */
 export async function mkdir(dirPath: string): Promise<void> {
-  const result = await (DownloaderSpec as any).mkdir(dirPath);
+  const result = await (FileToolkitSpec as any).mkdir(dirPath);
   _ensureFsSuccess(result, 'MKDIR_ERROR');
 }
 
 /** List direct entries (names) in a directory. */
 export async function ls(dirPath: string): Promise<string[]> {
-  const result = await (DownloaderSpec as any).ls(dirPath);
+  const result = await (FileToolkitSpec as any).ls(dirPath);
   _ensureFsSuccess(result, 'LS_ERROR');
   return (result.entries || []) as string[];
 }
@@ -781,7 +783,7 @@ export async function ls(dirPath: string): Promise<string[]> {
  *
  * @example
  * ```ts
- * import { fs } from 'rn-downloader';
+ * import { fs } from 'rn-file-toolkit';
  *
  * const ok = await fs.exists('/path/to/file.pdf');
  * const meta = await fs.stat('/path/to/file.pdf');
@@ -903,7 +905,7 @@ export async function saveBase64AsFile(
       }
     }
 
-    const result = await DownloaderModule.saveBase64AsFile({
+    const result = await FileToolkitModule.saveBase64AsFile({
       base64Data,
       fileName,
       destination,
@@ -940,7 +942,7 @@ export async function urlToBase64(
   options: UrlToBase64Options
 ): Promise<UrlToBase64Result> {
   try {
-    const result = await DownloaderModule.urlToBase64({
+    const result = await FileToolkitModule.urlToBase64({
       url: options.url,
       headers: options.headers,
     });
@@ -974,7 +976,7 @@ export async function shareFile(
   options: ShareFileOptions
 ): Promise<ShareFileResult> {
   try {
-    const result = await DownloaderModule.shareFile(options.filePath, {
+    const result = await FileToolkitModule.shareFile(options.filePath, {
       title: options.title,
       subject: options.subject,
     });
@@ -1008,7 +1010,7 @@ export async function openFile(
   options: OpenFileOptions
 ): Promise<OpenFileResult> {
   try {
-    const result = await DownloaderModule.openFile(
+    const result = await FileToolkitModule.openFile(
       options.filePath,
       options.mimeType || ''
     );
@@ -1066,7 +1068,7 @@ export async function unzip(
   destDir: string
 ): Promise<UnzipResult> {
   try {
-    const result = await (DownloaderSpec as any).unzip(sourcePath, destDir);
+    const result = await (FileToolkitSpec as any).unzip(sourcePath, destDir);
     return result as UnzipResult;
   } catch (error: any) {
     return { success: false, error: error?.message || 'UNZIP_ERROR' };
@@ -1107,7 +1109,7 @@ export async function zip(
   destPath: string
 ): Promise<ZipResult> {
   try {
-    const result = await (DownloaderSpec as any).zip(sourcePath, destPath);
+    const result = await (FileToolkitSpec as any).zip(sourcePath, destPath);
     return result as ZipResult;
   } catch (error: any) {
     return { success: false, error: error?.message || 'ZIP_ERROR' };

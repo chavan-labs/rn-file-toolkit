@@ -1,4 +1,4 @@
-package com.downloader
+package com.filetoolkit
 
 import com.facebook.react.BaseReactPackage
 import com.facebook.react.bridge.NativeModule
@@ -7,10 +7,10 @@ import com.facebook.react.module.model.ReactModuleInfo
 import com.facebook.react.module.model.ReactModuleInfoProvider
 import java.util.HashMap
 
-class DownloaderPackage : BaseReactPackage() {
+class FileToolkitPackage : BaseReactPackage() {
   override fun getModule(name: String, reactContext: ReactApplicationContext): NativeModule? {
-    return if (name == DownloaderModule.NAME) {
-      DownloaderModule(reactContext)
+    return if (name == FileToolkitModule.NAME) {
+      FileToolkitModule(reactContext)
     } else {
       null
     }
@@ -18,9 +18,9 @@ class DownloaderPackage : BaseReactPackage() {
 
   override fun getReactModuleInfoProvider() = ReactModuleInfoProvider {
     mapOf(
-      DownloaderModule.NAME to ReactModuleInfo(
-        name = DownloaderModule.NAME,
-        className = DownloaderModule.NAME,
+      FileToolkitModule.NAME to ReactModuleInfo(
+        name = FileToolkitModule.NAME,
+        className = FileToolkitModule.NAME,
         canOverrideExistingModule = false,
         needsEagerInit = false,
         isCxxModule = false,

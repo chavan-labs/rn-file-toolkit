@@ -1,6 +1,6 @@
 # Contributing
 
-👋 **Thank you for considering contributing to rn-downloader!**
+👋 **Thank you for considering contributing to rn-file-toolkit!**
 
 Contributions are always welcome, no matter how large or small! Whether you're fixing a typo, adding a feature, or improving documentation — every contribution helps make this library better for the community.
 
@@ -13,7 +13,7 @@ There are many ways you can contribute to this project:
 - 🐛 **Report bugs** — found an issue? Let us know!
 - 💡 **Suggest features** — have an idea? Open a discussion
 - 📝 **Improve documentation** — help others understand the library better
-- 🔧 **Fix issues** — check out the [open issues](https://github.com/chavan-labs/rn-downloader/issues)
+- 🔧 **Fix issues** — check out the [open issues](https://github.com/chavan-labs/rn-file-toolkit/issues)
 - ✨ **Add features** — implement something new and useful
 - 🧪 **Write tests** — help improve code coverage
 - 💬 **Help others** — answer questions in issues or discussions
@@ -41,9 +41,9 @@ The [example app](/example/) demonstrates usage of the library. You need to run 
 
 It is configured to use the local version of the library, so any changes you make to the library's source code will be reflected in the example app. Changes to the library's JavaScript code will be reflected in the example app without a rebuild, but native code changes will require a rebuild of the example app.
 
-If you want to use Android Studio or Xcode to edit the native code, you can open the `example/android` or `example/ios` directories respectively in those editors. To edit the Objective-C or Swift files, open `example/ios/DownloaderExample.xcworkspace` in Xcode and find the source files at `Pods > Development Pods > rn-downloader`.
+If you want to use Android Studio or Xcode to edit the native code, you can open the `example/android` or `example/ios` directories respectively in those editors. To edit the Objective-C or Swift files, open `example/ios/DownloaderExample.xcworkspace` in Xcode and find the source files at `Pods > Development Pods > rn-file-toolkit`.
 
-To edit the Java or Kotlin files, open `example/android` in Android studio and find the source files at `rn-downloader` under `Android`.
+To edit the Java or Kotlin files, open `example/android` in Android studio and find the source files at `rn-file-toolkit` under `Android`.
 
 You can use various commands from the root directory to work with the project.
 

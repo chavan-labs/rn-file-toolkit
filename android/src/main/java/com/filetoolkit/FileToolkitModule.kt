@@ -1,4 +1,4 @@
-package com.downloader
+package com.filetoolkit
 
 import android.app.DownloadManager
 import android.content.Context
@@ -38,8 +38,8 @@ private data class DownloadState(
   @Volatile var bytesDownloaded: Long = 0L
 )
 
-class DownloaderModule(private val reactContext: ReactApplicationContext) :
-  NativeDownloaderSpec(reactContext) {
+class FileToolkitModule(private val reactContext: ReactApplicationContext) :
+  NativeFileToolkitSpec(reactContext) {
 
   // downloadId → state
   private val activeDownloads = ConcurrentHashMap<String, DownloadState>()
@@ -135,7 +135,7 @@ class DownloaderModule(private val reactContext: ReactApplicationContext) :
       val dm = reactContext.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
       val request = DownloadManager.Request(Uri.parse(urlString)).apply {
         setTitle(notificationTitle ?: fileName)
-        setDescription(notificationDesc ?: "rn-downloader-id:$downloadId")
+        setDescription(notificationDesc ?: "rn-file-toolkit-id:$downloadId")
         setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
 
         // Add headers
@@ -711,8 +711,8 @@ class DownloaderModule(private val reactContext: ReactApplicationContext) :
 
         do {
           val description = cursor.getString(descIdx) ?: ""
-          if (description.startsWith("rn-downloader-id:")) {
-            val downloadId = description.removePrefix("rn-downloader-id:")
+          if (description.startsWith("rn-file-toolkit-id:")) {
+            val downloadId = description.removePrefix("rn-file-toolkit-id:")
             val status = cursor.getInt(statusIdx)
             val total = cursor.getLong(totalIdx)
             val current = cursor.getLong(currentIdx)
@@ -1198,7 +1198,7 @@ class DownloaderModule(private val reactContext: ReactApplicationContext) :
   }
 
   companion object {
-    const val NAME = NativeDownloaderSpec.NAME
+    const val NAME = NativeFileToolkitSpec.NAME
   }
 }
 

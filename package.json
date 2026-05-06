@@ -1,6 +1,6 @@
 {
-  "name": "rn-downloader",
-  "version": "2.1.5",
+  "name": "rn-file-toolkit",
+  "version": "1.0.1",
   "description": "The simplest and most reliable way to download files in React Native with progress, permissions, and file handling built-in.",
   "main": "./lib/commonjs/index.js",
   "module": "./lib/module/index.js",
@@ -40,7 +40,7 @@
     "!**/.*"
   ],
   "scripts": {
-    "example": "yarn workspace rn-downloader-example",
+    "example": "yarn workspace rn-file-toolkit-example",
     "clean": "del-cli android/build example/android/build example/android/app/build example/ios/build lib",
     "prepare": "bob build",
     "typecheck": "tsc",
@@ -109,14 +109,14 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/chavan-labs/rn-downloader.git"
+    "url": "git+https://github.com/chavan-labs/rn-file-toolkit.git"
   },
   "author": "Rohit Chavan <chavanrohit413@gmail.com> (https://github.com/chavan-labs)",
   "license": "MIT",
   "bugs": {
-    "url": "https://github.com/chavan-labs/rn-downloader/issues"
+    "url": "https://github.com/chavan-labs/rn-file-toolkit/issues"
   },
-  "homepage": "https://github.com/chavan-labs/rn-downloader#readme",
+  "homepage": "https://github.com/chavan-labs/rn-file-toolkit#readme",
   "publishConfig": {
     "registry": "https://registry.npmjs.org/"
   },
@@ -172,11 +172,11 @@
     ]
   },
   "codegenConfig": {
-    "name": "DownloaderSpec",
+    "name": "FileToolkitSpec",
     "type": "modules",
     "jsSrcsDir": "src",
     "android": {
-      "javaPackageName": "com.downloader"
+      "javaPackageName": "com.filetoolkit"
     }
   },
   "prettier": {

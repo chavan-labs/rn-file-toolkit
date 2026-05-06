@@ -2,11 +2,11 @@
 #import <React/RCTLog.h>
 #import <CommonCrypto/CommonDigest.h>
 #import <UIKit/UIKit.h>
-#import "Downloader.h"
+#import "FileToolkit.h"
 #include <zlib.h>
 
 // ─── Foreground session delegate ──────────────────────────────────────────────
-@interface Downloader () <NSURLSessionDownloadDelegate, NSURLSessionDataDelegate, UIDocumentInteractionControllerDelegate>
+@interface FileToolkit () <NSURLSessionDownloadDelegate, NSURLSessionDataDelegate, UIDocumentInteractionControllerDelegate>
 @property (nonatomic, strong) NSURLSession *fgSession;       // foreground
 @property (nonatomic, strong) NSURLSession *bgSession;       // background
 // downloadId → resolve/reject blocks
@@ -30,7 +30,7 @@
 @property (nonatomic, strong) UIDocumentInteractionController *documentController;
 @end
 
-@implementation Downloader
+@implementation FileToolkit
 
 RCT_EXPORT_MODULE()
 
@@ -53,7 +53,7 @@ RCT_EXPORT_MODULE()
 
         // Background session (survives app suspension)
         NSURLSessionConfiguration *bgConfig =
-            [NSURLSessionConfiguration backgroundSessionConfigurationWithIdentifier:@"com.downloader.background"];
+            [NSURLSessionConfiguration backgroundSessionConfigurationWithIdentifier:@"com.filetoolkit.background"];
         bgConfig.discretionary = NO;
         bgConfig.sessionSendsLaunchEvents = YES;
         self.bgSession = [NSURLSession sessionWithConfiguration:bgConfig delegate:self delegateQueue:nil];
@@ -804,12 +804,12 @@ totalBytesExpectedToSend:(int64_t)totalBytesExpectedToSend {
 - (std::shared_ptr<facebook::react::TurboModule>)getTurboModule:
     (const facebook::react::ObjCTurboModule::InitParams &)params
 {
-    return std::make_shared<facebook::react::NativeDownloaderSpecJSI>(params);
+    return std::make_shared<facebook::react::NativeFileToolkitSpecJSI>(params);
 }
 
 + (NSString *)moduleName
 {
-  return @"Downloader";
+  return @"FileToolkit";
 }
 
 // ─── upload ───────────────────────────────────────────────────────────────────
@@ -1193,7 +1193,7 @@ RCT_EXPORT_METHOD(unzip:(NSString *)sourcePath
         if (![standardizedDestPath isEqualToString:standardizedDestDir] &&
             ![standardizedDestPath hasPrefix:safePrefix]) {
             if (error) {
-                *error = [NSError errorWithDomain:@"RNDownloader"
+                *error = [NSError errorWithDomain:@"RNFileToolkit"
                                              code:-100
                                          userInfo:@{NSLocalizedDescriptionKey: @"ZIP entry has invalid path"}];
             }
@@ -1228,7 +1228,7 @@ RCT_EXPORT_METHOD(unzip:(NSString *)sourcePath
 
             // inflateInit2 with -15 for raw deflate (no zlib wrapper)
             if (inflateInit2(&strm, -15) != Z_OK) {
-                if (error) *error = [NSError errorWithDomain:@"RNDownloader" code:-1
+                if (error) *error = [NSError errorWithDomain:@"RNFileToolkit" code:-1
                     userInfo:@{NSLocalizedDescriptionKey: @"zlib inflateInit2 failed"}];
                 return NO;
             }
@@ -1240,7 +1240,7 @@ RCT_EXPORT_METHOD(unzip:(NSString *)sourcePath
                 int ret = inflate(&strm, Z_FINISH);
                 inflateEnd(&strm);
                 if (ret != Z_STREAM_END && ret != Z_OK) {
-                    if (error) *error = [NSError errorWithDomain:@"RNDownloader" code:-2
+                    if (error) *error = [NSError errorWithDomain:@"RNFileToolkit" code:-2
                         userInfo:@{NSLocalizedDescriptionKey: [NSString stringWithFormat:@"inflate error %d", ret]}];
                     return NO;
                 }

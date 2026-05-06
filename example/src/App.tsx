@@ -13,7 +13,7 @@ import {
   shareFile,
   openFile,
   type ProgressInfo,
-} from 'rn-downloader';
+} from 'rn-file-toolkit';
 
 export default function App() {
   const [progress, setProgress] = useState<number>(0);
@@ -122,7 +122,7 @@ export default function App() {
       >
         {/* ── Normal download ── */}
         <View style={styles.card}>
-          <Text style={styles.title}>🚀 rn-downloader</Text>
+          <Text style={styles.title}>🚀 rn-file-toolkit</Text>
           <Text style={styles.subtitle}>Pure native downloads, zero deps.</Text>
 
           <View style={styles.progressContainer}>

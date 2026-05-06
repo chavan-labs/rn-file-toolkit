@@ -1,10 +1,10 @@
-# rn-downloader
+# rn-file-toolkit
 
-[![npm version](https://img.shields.io/npm/v/rn-downloader.svg?style=flat-square)](https://www.npmjs.com/package/rn-downloader)
-[![npm downloads](https://img.shields.io/npm/dm/rn-downloader.svg?style=flat-square)](https://www.npmjs.com/package/rn-downloader)
-[![license](https://img.shields.io/npm/l/rn-downloader.svg?style=flat-square)](https://github.com/chavan-labs/rn-downloader/blob/main/LICENSE)
+[![npm version](https://img.shields.io/npm/v/rn-file-toolkit.svg?style=flat-square)](https://www.npmjs.com/package/rn-file-toolkit)
+[![npm downloads](https://img.shields.io/npm/dm/rn-file-toolkit.svg?style=flat-square)](https://www.npmjs.com/package/rn-file-toolkit)
+[![license](https://img.shields.io/npm/l/rn-file-toolkit.svg?style=flat-square)](https://github.com/chavan-labs/rn-file-toolkit/blob/main/LICENSE)
 [![TypeScript](https://img.shields.io/badge/TypeScript-Ready-blue.svg?style=flat-square)](https://www.typescriptlang.org/)
-[![platforms](https://img.shields.io/badge/platforms-iOS%20%7C%20Android-lightgrey.svg?style=flat-square)](https://github.com/chavan-labs/rn-downloader)
+[![platforms](https://img.shields.io/badge/platforms-iOS%20%7C%20Android-lightgrey.svg?style=flat-square)](https://github.com/chavan-labs/rn-file-toolkit)
 
 The easiest way to download **and manage files** in React Native — with background support, pause/resume, upload, queueing, and built-in filesystem APIs.
 
@@ -25,7 +25,7 @@ Most React Native file download solutions have one or more of these problems:
 - **Split libraries** — downloading is in one package, filesystem operations in another (read/write/copy/stat/exists), adding extra dependency and complexity
 - **Poor DX** — complicated APIs that require managing multiple IDs, listeners, and cleanup logic
 
-**rn-downloader** was built to solve these issues. It provides a simple, unified API while leveraging platform-native download managers (URLSession on iOS, DownloadManager on Android) for reliable, battery-efficient downloads. Everything works out of the box — background downloads, progress tracking, pause/resume — without wrestling with native configuration.
+**rn-file-toolkit** was built to solve these issues. It provides a simple, unified API while leveraging platform-native download managers (URLSession on iOS, DownloadManager on Android) for reliable, battery-efficient downloads. Everything works out of the box — background downloads, progress tracking, pause/resume — without wrestling with native configuration.
 
 ## ✨ Features
 
@@ -57,7 +57,7 @@ Most React Native file download solutions have one or more of these problems:
 ## Installation
 
 ```sh
-npm install rn-downloader
+npm install rn-file-toolkit
 ```
 
 ---
@@ -67,7 +67,7 @@ npm install rn-downloader
 ### `download(options)`
 
 ```javascript
-import { download } from 'rn-downloader';
+import { download } from 'rn-file-toolkit';
 
 const result = await download({
   url: 'https://example.com/file.pdf',
@@ -114,7 +114,7 @@ const result = await download({
 Avoid crashing your app (or saturating the network) when kicking off many simultaneous downloads. The built-in queue lets you cap concurrency and prioritise individual items — all in pure JavaScript, with zero native changes required.
 
 ```javascript
-import { download, setQueueOptions, getQueueStatus } from 'rn-downloader';
+import { download, setQueueOptions, getQueueStatus } from 'rn-file-toolkit';
 
 // 1. Configure the global queue (call once, e.g. at app startup)
 setQueueOptions({ maxConcurrent: 3 }); // default is 3
@@ -160,7 +160,7 @@ console.log(`Running: ${active}  Waiting: ${pending}  Limit: ${maxConcurrent}`);
 The easiest way to manage a download inside a React component. Get status, rich progress (with speed & ETA), and full controls — all with zero boilerplate.
 
 ```tsx
-import { useDownload } from 'rn-downloader';
+import { useDownload } from 'rn-file-toolkit';
 
 function DownloadScreen() {
   const { start, pause, resume, cancel, status, progress, result } =
@@ -221,7 +221,7 @@ function DownloadScreen() {
 ### `upload(options)`
 
 ```javascript
-import { upload } from 'rn-downloader';
+import { upload } from 'rn-file-toolkit';
 
 const result = await upload({
   url: 'https://example.com/api/upload',
@@ -246,7 +246,7 @@ if (result.success) {
 Save a base64 string or data URI as a file. Perfect for handling base64 images, documents, or any binary data.
 
 ```javascript
-import { saveBase64AsFile } from 'rn-downloader';
+import { saveBase64AsFile } from 'rn-file-toolkit';
 
 // From data URI (auto-detects file extension)
 const result = await saveBase64AsFile({
@@ -274,7 +274,7 @@ if (result.success) {
 Convert a web URL (image, video, gif, etc.) to base64 string. Perfect for converting remote media to base64 for local processing.
 
 ```javascript
-import { urlToBase64 } from 'rn-downloader';
+import { urlToBase64 } from 'rn-file-toolkit';
 
 const result = await urlToBase64({
   url: 'https://example.com/photo.jpg',
@@ -298,7 +298,7 @@ if (result.success) {
 Share a file with other apps using the native share dialog.
 
 ```javascript
-import { shareFile } from 'rn-downloader';
+import { shareFile } from 'rn-file-toolkit';
 
 const result = await shareFile({
   filePath: '/path/to/document.pdf',
@@ -318,7 +318,7 @@ if (result.success) {
 Open a file with the default app or app chooser.
 
 ```javascript
-import { openFile } from 'rn-downloader';
+import { openFile } from 'rn-file-toolkit';
 
 const result = await openFile({
   filePath: '/path/to/document.pdf',
@@ -340,7 +340,7 @@ Compress and extract ZIP archives natively — **no third-party library required
 - **iOS** uses `zlib` (system framework, linked via `s.libraries = 'z'` in the podspec — ships on every iPhone/iPad).
 
 ```javascript
-import { download, unzip, zip } from 'rn-downloader';
+import { download, unzip, zip } from 'rn-file-toolkit';
 
 // ── Unzip a downloaded archive ──────────────────────────────────────────────
 const dl = await download({
@@ -393,7 +393,7 @@ const dirResult = await zip(
 ### Pause / Resume / Cancel
 
 ```javascript
-import { pauseDownload, resumeDownload, cancelDownload } from 'rn-downloader';
+import { pauseDownload, resumeDownload, cancelDownload } from 'rn-file-toolkit';
 
 await pauseDownload(downloadId);
 await resumeDownload(downloadId);
@@ -405,7 +405,7 @@ await cancelDownload(downloadId);
 ### Cache Management
 
 ```javascript
-import { getCachedFiles, deleteFile, clearCache } from 'rn-downloader';
+import { getCachedFiles, deleteFile, clearCache } from 'rn-file-toolkit';
 
 // List all files in the cache/documents folders
 const { files } = await getCachedFiles();
@@ -424,7 +424,7 @@ await clearCache();
 Use built-in file system helpers without adding another dependency.
 
 ```javascript
-import { fs } from 'rn-downloader';
+import { fs } from 'rn-file-toolkit';
 
 await fs.exists('/path/to/file.pdf'); // → true/false
 
@@ -508,14 +508,14 @@ Convert base64-encoded data (like images from canvas, camera, or API responses) 
 
 ## Articles & Resources
 
-- [**I Got Tired of React Native File Downloads Being a Mess — So I Built rn-downloader**](https://medium.com/@chavanrohit413/i-got-tired-of-react-native-file-downloads-being-a-mess-so-i-built-rn-downloader-29b7a8b5c743) — Deep dive into the problems with existing solutions and how rn-downloader solves them
+- [**I Got Tired of React Native File Downloads Being a Mess — So I Built rn-file-toolkit**](https://medium.com/@chavanrohit413/i-got-tired-of-react-native-file-downloads-being-a-mess-so-i-built-rn-file-toolkit-29b7a8b5c743) — Deep dive into the problems with existing solutions and how rn-file-toolkit solves them
 
 ---
 
 ## Links
 
-- [GitHub](https://github.com/chavan-labs/rn-downloader)
-- [npm](https://www.npmjs.com/package/rn-downloader)
+- [GitHub](https://github.com/chavan-labs/rn-file-toolkit)
+- [npm](https://www.npmjs.com/package/rn-file-toolkit)
 
 ---
 

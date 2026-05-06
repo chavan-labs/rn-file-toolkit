@@ -8,9 +8,9 @@ const {
 const pkg = require('./package.json');
 
 /**
- * Config plugin to add necessary permissions and background modes for rn-downloader.
+ * Config plugin to add necessary permissions and background modes for rn-file-toolkit.
  */
-const withDownloaderPermissions = (config) => {
+const withFileToolkitPermissions = (config) => {
   // 1. Android: Add internet and storage permissions
   config = withAndroidManifest(config, (modConfig) => {
     AndroidConfig.Permissions.addPermission(
@@ -43,7 +43,7 @@ const withDownloaderPermissions = (config) => {
 };
 
 module.exports = createRunOncePlugin(
-  withDownloaderPermissions,
+  withFileToolkitPermissions,
   pkg.name,
   pkg.version
 );
