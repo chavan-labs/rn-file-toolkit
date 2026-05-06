@@ -1,5 +1,9 @@
 # rn-file-toolkit
 
+> [!IMPORTANT]
+> **`rn-downloader` has been moved!** This package is the rebranded and upgraded version of `rn-downloader`. See [README_MIGRATION.md](./README_MIGRATION.md) for migration steps.
+
+
 [![npm version](https://img.shields.io/npm/v/rn-file-toolkit.svg?style=flat-square)](https://www.npmjs.com/package/rn-file-toolkit)
 [![npm downloads](https://img.shields.io/npm/dm/rn-file-toolkit.svg?style=flat-square)](https://www.npmjs.com/package/rn-file-toolkit)
 [![license](https://img.shields.io/npm/l/rn-file-toolkit.svg?style=flat-square)](https://github.com/chavan-labs/rn-file-toolkit/blob/main/LICENSE)
