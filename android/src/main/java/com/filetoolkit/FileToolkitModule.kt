@@ -6,6 +6,12 @@ import android.content.Intent
 import android.net.Uri
 import android.os.Environment
 import androidx.core.content.FileProvider
+import android.content.BroadcastReceiver
+import android.content.IntentFilter
+import android.database.Cursor
+import android.os.Handler
+import android.os.Looper
+import android.os.Build
 import com.facebook.react.bridge.ReactApplicationContext
 import com.facebook.react.bridge.ReadableMap
 import com.facebook.react.bridge.Promise
@@ -47,6 +53,34 @@ class FileToolkitModule(private val reactContext: ReactApplicationContext) :
   private val bgDownloadIds = ConcurrentHashMap<String, Long>()
   // Stored promises for foreground downloads — resolved on completion (not early)
   private val foregroundPromises = ConcurrentHashMap<String, Promise>()
+
+  private val bgPollHandler = Handler(Looper.getMainLooper())
+  private val bgPollRunnable = object : Runnable {
+    override fun run() {
+      if (bgDownloadIds.isNotEmpty()) {
+        pollBackgroundDownloads()
+      }
+      bgPollHandler.postDelayed(this, 1500)
+    }
+  }
+
+  private val downloadReceiver = object : BroadcastReceiver() {
+    override fun onReceive(context: Context?, intent: Intent?) {
+      if (intent?.action == DownloadManager.ACTION_DOWNLOAD_COMPLETE) {
+        val id = intent.getLongExtra(DownloadManager.EXTRA_DOWNLOAD_ID, -1L)
+        handleBackgroundDownloadComplete(id)
+      }
+    }
+  }
+
+  init {
+    val filter = IntentFilter(DownloadManager.ACTION_DOWNLOAD_COMPLETE)
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+      reactContext.registerReceiver(downloadReceiver, filter, Context.RECEIVER_EXPORTED)
+    } else {
+      reactContext.registerReceiver(downloadReceiver, filter)
+    }
+  }
 
   // ─── Helpers ───────────────────────────────────────────────────────────────
 
@@ -114,7 +148,7 @@ class FileToolkitModule(private val reactContext: ReactApplicationContext) :
     val isBackground = options.takeIf { it.hasKey("background") }?.getBoolean("background") ?: false
     val rawFileName = if (options.hasKey("fileName")) options.getString("fileName") else null
     val fileName = resolveFileName(urlString, rawFileName)
-    val downloadId = UUID.randomUUID().toString()
+    val downloadId = if (options.hasKey("downloadId")) options.getString("downloadId")!! else UUID.randomUUID().toString()
 
     val headersMap = options.getMap("headers")
     val destination = options.takeIf { it.hasKey("destination") }?.getString("destination")
@@ -153,6 +187,10 @@ class FileToolkitModule(private val reactContext: ReactApplicationContext) :
       val bgId = dm.enqueue(request)
       bgDownloadIds[downloadId] = bgId
       activeDownloads.remove(downloadId)
+
+      // Start polling if not running
+      bgPollHandler.removeCallbacks(bgPollRunnable)
+      bgPollHandler.post(bgPollRunnable)
 
       promise.resolve(Arguments.createMap().apply {
         putBoolean("success", true)
@@ -353,7 +391,85 @@ class FileToolkitModule(private val reactContext: ReactApplicationContext) :
     }
   }
 
-  // ─── pauseDownload ─────────────────────────────────────────────────────────
+  private fun pollBackgroundDownloads() {
+    val dm = reactContext.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
+    val query = DownloadManager.Query()
+    val cursor = dm.query(query) ?: return
+    
+    val currentBgIds = bgDownloadIds.values.toSet()
+    
+    if (cursor.moveToFirst()) {
+      val descIdx = cursor.getColumnIndex(DownloadManager.COLUMN_DESCRIPTION)
+      val idIdx = cursor.getColumnIndex(DownloadManager.COLUMN_ID)
+      val statusIdx = cursor.getColumnIndex(DownloadManager.COLUMN_STATUS)
+      val totalIdx = cursor.getColumnIndex(DownloadManager.COLUMN_TOTAL_SIZE_BYTES)
+      val currentIdx = cursor.getColumnIndex(DownloadManager.COLUMN_BYTES_DOWNLOADED_SO_FAR)
+      
+      do {
+        val bgId = cursor.getLong(idIdx)
+        if (!currentBgIds.contains(bgId)) continue
+
+        val description = cursor.getString(descIdx) ?: ""
+        if (description.startsWith("rn-file-toolkit-id:")) {
+          val downloadId = description.removePrefix("rn-file-toolkit-id:")
+          val status = cursor.getInt(statusIdx)
+          val total = cursor.getLong(totalIdx)
+          val current = cursor.getLong(currentIdx)
+          
+          if (status == DownloadManager.STATUS_RUNNING || status == DownloadManager.STATUS_PENDING) {
+            val progress = if (total > 0) (current * 100 / total).toInt() else 0
+            val evt = Arguments.createMap().apply {
+              putString("downloadId", downloadId)
+              putInt("progress", progress)
+              putDouble("bytesDownloaded", current.toDouble())
+              putDouble("totalBytes", total.toDouble())
+            }
+            emit("onDownloadProgress", evt)
+          }
+        }
+      } while (cursor.moveToNext())
+    }
+    cursor.close()
+  }
+
+  private fun handleBackgroundDownloadComplete(bgId: Long) {
+    val dm = reactContext.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
+    val query = DownloadManager.Query().setFilterById(bgId)
+    val cursor = dm.query(query) ?: return
+    if (cursor.moveToFirst()) {
+      val descIdx = cursor.getColumnIndex(DownloadManager.COLUMN_DESCRIPTION)
+      val statusIdx = cursor.getColumnIndex(DownloadManager.COLUMN_STATUS)
+      val uriIdx = cursor.getColumnIndex(DownloadManager.COLUMN_LOCAL_URI)
+      val reasonIdx = cursor.getColumnIndex(DownloadManager.COLUMN_REASON)
+
+      val description = cursor.getString(descIdx) ?: ""
+      if (description.startsWith("rn-file-toolkit-id:")) {
+        val downloadId = description.removePrefix("rn-file-toolkit-id:")
+        val status = cursor.getInt(statusIdx)
+        bgDownloadIds.remove(downloadId) // cleanup
+
+        if (status == DownloadManager.STATUS_SUCCESSFUL) {
+          val localUri = cursor.getString(uriIdx)
+          val filePath = localUri?.removePrefix("file://") ?: ""
+          emit("onDownloadComplete", Arguments.createMap().apply {
+            putBoolean("success", true)
+            putString("downloadId", downloadId)
+            putString("filePath", filePath)
+          })
+        } else {
+          val reason = cursor.getInt(reasonIdx)
+          emit("onDownloadError", Arguments.createMap().apply {
+            putBoolean("success", false)
+            putString("downloadId", downloadId)
+            putString("error", "DownloadManager failed with reason/code: $reason")
+          })
+        }
+      }
+    }
+    cursor.close()
+  }
+
+  // ─── executeDownload (Foreground) ─────────────────────────────────────────────────────────
 
   override fun pauseDownload(downloadId: String, promise: Promise) {
     val state = activeDownloads[downloadId]
@@ -753,6 +869,7 @@ class FileToolkitModule(private val reactContext: ReactApplicationContext) :
     }
 
     val fieldName = if (options.hasKey("fieldName")) options.getString("fieldName") else "file"
+    val uploadId = if (options.hasKey("uploadId")) options.getString("uploadId") else UUID.randomUUID().toString()
     val headersMap = options.getMap("headers")
     val paramsMap = options.getMap("parameters")
 
@@ -778,6 +895,7 @@ class FileToolkitModule(private val reactContext: ReactApplicationContext) :
         connection.requestMethod = "POST"
         connection.setRequestProperty("Connection", "Keep-Alive")
         connection.setRequestProperty("Content-Type", "multipart/form-data; boundary=$boundary")
+        connection.setChunkedStreamingMode(0)
 
         // Add custom headers
         headersMap?.toHashMap()?.forEach { (key, value) ->
@@ -819,6 +937,7 @@ class FileToolkitModule(private val reactContext: ReactApplicationContext) :
                 lastProgress = progress
                 val evt = Arguments.createMap().apply {
                   putString("url", urlString)
+                  putString("uploadId", uploadId)
                   putInt("progress", progress)
                 }
                 emit("onUploadProgress", evt)
@@ -845,6 +964,7 @@ class FileToolkitModule(private val reactContext: ReactApplicationContext) :
           putBoolean("success", responseCode in 200..299)
           putInt("status", responseCode)
           putString("data", responseBody)
+          putString("uploadId", uploadId)
           if (responseCode !in 200..299) putString("error", "HTTP $responseCode")
         })
 
@@ -852,6 +972,7 @@ class FileToolkitModule(private val reactContext: ReactApplicationContext) :
         promise.resolve(Arguments.createMap().apply {
           putBoolean("success", false)
           putString("error", e.message ?: "UPLOAD_ERROR")
+          putString("uploadId", uploadId)
         })
       }
     }

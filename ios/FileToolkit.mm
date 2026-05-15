@@ -137,7 +137,7 @@ RCT_EXPORT_MODULE()
     }
 
     BOOL isBackground = [options[@"background"] boolValue];
-    NSString *downloadId = [self generateDownloadId];
+    NSString *downloadId = options[@"downloadId"] ?: [self generateDownloadId];
     NSURL *url = [NSURL URLWithString:urlString];
     NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:url];
     
@@ -651,9 +651,14 @@ didCompleteWithError:(NSError *)error {
     if (uploadId) {
         NSDictionary *funcs = self.uploadPromises[uploadId];
         RCTPromiseResolveBlock uploadResolve = funcs[@"resolve"];
+        NSString *tempFile = funcs[@"tempFile"];
+
+        if (tempFile) {
+            [[NSFileManager defaultManager] removeItemAtPath:tempFile error:nil];
+        }
 
         if (error) {
-            if (uploadResolve) uploadResolve(@{@"success": @NO, @"error": error.localizedDescription});
+            if (uploadResolve) uploadResolve(@{@"success": @NO, @"error": error.localizedDescription, @"uploadId": uploadId});
         } else {
             NSHTTPURLResponse *httpResponse = (NSHTTPURLResponse *)task.response;
             NSData *responseData = self.uploadResponseData[uploadId] ?: [NSData data];
@@ -662,7 +667,8 @@ didCompleteWithError:(NSError *)error {
             if (uploadResolve) uploadResolve(@{
                 @"success": @(httpResponse.statusCode >= 200 && httpResponse.statusCode < 300),
                 @"status": @(httpResponse.statusCode),
-                @"data": respString
+                @"data": respString,
+                @"uploadId": uploadId
             });
         }
 
@@ -778,7 +784,7 @@ totalBytesExpectedToSend:(int64_t)totalBytesExpectedToSend {
     if (totalBytesExpectedToSend > 0) {
         int progress = (int)((totalBytesSent * 100) / totalBytesExpectedToSend);
         [self sendEventWithName:@"onUploadProgress"
-                           body:@{@"url": url, @"progress": @(progress)}];
+                           body:@{@"url": url, @"uploadId": uploadId, @"progress": @(progress)}];
     }
 }
 
@@ -822,6 +828,7 @@ totalBytesExpectedToSend:(int64_t)totalBytesExpectedToSend {
         return;
     }
 
+    NSString *uploadId = options[@"uploadId"] ?: [self generateDownloadId];
     NSString *fieldName = options[@"fieldName"] ?: @"file";
     NSDictionary *headers = options[@"headers"];
     NSDictionary *params  = options[@"parameters"];
@@ -837,28 +844,63 @@ totalBytesExpectedToSend:(int64_t)totalBytesExpectedToSend {
         }
     }
 
-    NSMutableData *body = [NSMutableData data];
+    // Create a temporary file to avoid OutOfMemory crash for large uploads
+    NSString *tempFileName = [NSString stringWithFormat:@"upload_%@.tmp", [[NSUUID UUID] UUIDString]];
+    NSString *tempFilePath = [NSTemporaryDirectory() stringByAppendingPathComponent:tempFileName];
+    
+    [[NSFileManager defaultManager] createFileAtPath:tempFilePath contents:nil attributes:nil];
+    NSFileHandle *fileHandle = [NSFileHandle fileHandleForWritingAtPath:tempFilePath];
+    if (!fileHandle) {
+        resolve(@{@"success": @NO, @"error": @"Failed to create temp file for upload"});
+        return;
+    }
+
+    NSMutableData *preamble = [NSMutableData data];
     [params enumerateKeysAndObjectsUsingBlock:^(id key, id value, BOOL *stop) {
-        [body appendData:[[NSString stringWithFormat:@"--%@\r\n", boundary] dataUsingEncoding:NSUTF8StringEncoding]];
-        [body appendData:[[NSString stringWithFormat:@"Content-Disposition: form-data; name=\"%@\"\r\n\r\n", key] dataUsingEncoding:NSUTF8StringEncoding]];
-        [body appendData:[[NSString stringWithFormat:@"%@\r\n", value] dataUsingEncoding:NSUTF8StringEncoding]];
+        [preamble appendData:[[NSString stringWithFormat:@"--%@\r\n", boundary] dataUsingEncoding:NSUTF8StringEncoding]];
+        [preamble appendData:[[NSString stringWithFormat:@"Content-Disposition: form-data; name=\"%@\"\r\n\r\n", key] dataUsingEncoding:NSUTF8StringEncoding]];
+        [preamble appendData:[[NSString stringWithFormat:@"%@\r\n", value] dataUsingEncoding:NSUTF8StringEncoding]];
     }];
 
     NSString *fileName = [filePath lastPathComponent];
-    [body appendData:[[NSString stringWithFormat:@"--%@\r\n", boundary] dataUsingEncoding:NSUTF8StringEncoding]];
-    [body appendData:[[NSString stringWithFormat:@"Content-Disposition: form-data; name=\"%@\"; filename=\"%@\"\r\n", fieldName, fileName] dataUsingEncoding:NSUTF8StringEncoding]];
-    [body appendData:[@"Content-Type: application/octet-stream\r\n\r\n" dataUsingEncoding:NSUTF8StringEncoding]];
-    [body appendData:[NSData dataWithContentsOfFile:filePath]];
-    [body appendData:[@"\r\n" dataUsingEncoding:NSUTF8StringEncoding]];
-    [body appendData:[[NSString stringWithFormat:@"--%@--\r\n", boundary] dataUsingEncoding:NSUTF8StringEncoding]];
+    [preamble appendData:[[NSString stringWithFormat:@"--%@\r\n", boundary] dataUsingEncoding:NSUTF8StringEncoding]];
+    [preamble appendData:[[NSString stringWithFormat:@"Content-Disposition: form-data; name=\"%@\"; filename=\"%@\"\r\n", fieldName, fileName] dataUsingEncoding:NSUTF8StringEncoding]];
+    [preamble appendData:[@"Content-Type: application/octet-stream\r\n\r\n" dataUsingEncoding:NSUTF8StringEncoding]];
+    
+    [fileHandle writeData:preamble];
 
-    // Use delegate-based session for upload progress support
-    NSString *uploadId = [self generateDownloadId];
-    NSURLSessionUploadTask *task = [self.fgSession uploadTaskWithRequest:request fromData:body];
+    // Stream the actual file content to the temp file
+    NSInputStream *inputStream = [NSInputStream inputStreamWithFileAtPath:filePath];
+    [inputStream open];
+    uint8_t buffer[32768]; // 32KB chunks
+    while ([inputStream hasBytesAvailable]) {
+        NSInteger bytesRead = [inputStream read:buffer maxLength:sizeof(buffer)];
+        if (bytesRead > 0) {
+            [fileHandle writeData:[NSData dataWithBytes:buffer length:bytesRead]];
+        } else if (bytesRead < 0) {
+            break;
+        }
+    }
+    [inputStream close];
+
+    NSMutableData *postamble = [NSMutableData data];
+    [postamble appendData:[@"\r\n" dataUsingEncoding:NSUTF8StringEncoding]];
+    [postamble appendData:[[NSString stringWithFormat:@"--%@--\r\n", boundary] dataUsingEncoding:NSUTF8StringEncoding]];
+    [fileHandle writeData:postamble];
+    [fileHandle closeFile];
+
+    NSURL *tempFileURL = [NSURL fileURLWithPath:tempFilePath];
+
+    // Use delegate-based session for upload progress support with fromFile: instead of fromData:
+    NSURLSessionUploadTask *task = [self.fgSession uploadTaskWithRequest:request fromFile:tempFileURL];
     NSString *taskKey = [NSString stringWithFormat:@"%lu", (unsigned long)task.taskIdentifier];
 
     self.uploadTaskIdMap[taskKey] = uploadId;
-    self.uploadPromises[uploadId] = @{@"resolve": resolve, @"reject": reject};
+    self.uploadPromises[uploadId] = @{
+        @"resolve": resolve, 
+        @"reject": reject, 
+        @"tempFile": tempFilePath
+    };
     self.uploadUrls[uploadId] = urlString;
 
     [task resume];
