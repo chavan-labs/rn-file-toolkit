@@ -1,68 +1,105 @@
-# rn-file-toolkit
-
-[![npm version](https://img.shields.io/npm/v/rn-file-toolkit.svg?style=flat-square)](https://www.npmjs.com/package/rn-file-toolkit)
-[![npm downloads](https://img.shields.io/npm/dm/rn-file-toolkit.svg?style=flat-square)](https://www.npmjs.com/package/rn-file-toolkit)
-[![license](https://img.shields.io/npm/l/rn-file-toolkit.svg?style=flat-square)](https://github.com/chavan-labs/rn-file-toolkit/blob/main/LICENSE)
-[![TypeScript](https://img.shields.io/badge/TypeScript-Ready-blue.svg?style=flat-square)](https://www.typescriptlang.org/)
-[![platforms](https://img.shields.io/badge/platforms-iOS%20%7C%20Android-lightgrey.svg?style=flat-square)](https://github.com/chavan-labs/rn-file-toolkit)
-
-The ultimate, unified file management library for React Native. Download, upload, manage queues, and interact with the filesystem—all powered by pure native implementations (Kotlin + Swift) with **zero third-party dependencies**.
-
-⭐ **Star this repo if you found it useful!**
-
----
-
-## Why rn-file-toolkit?
-Most React Native file solutions are fragmented, bloated, or lack critical features like background queues or stable pause/resume. **rn-file-toolkit** gives you a unified, TurboModule-powered API utilizing OS-native download managers (`URLSession` on iOS, `DownloadManager` on Android) for reliable, battery-efficient file operations.
-
-### ✨ Key Features
-- **Drop-in `useDownload()` Hook:** Built-in state management (`status`, `progress`, `result`) and controls (`pause`, `resume`, `cancel`).
-- **Background Downloads:** Survives app suspension with automatic re-attachment capabilities.
-- **Smart Queueing:** Cap concurrency and set priorities (`high`/`normal`) without native configuration.
-- **Resilient:** Auto-retries on network errors with exponential backoff and Range-based HTTP resume.
-- **Zero-Dependency Zip/Unzip:** Uses native `java.util.zip` and iOS `zlib` for extracting/compressing files.
-- **Rich File System API:** `readFile`, `writeFile`, `copyFile`, `moveFile`, `mkdir`, `ls`, `stat`, `exists`, and `deleteFile`.
-- **Media Utilities:** Base64 encoding/decoding, URL to Base64 conversions, and native share/open dialogs.
+<div align="center">
+  <h1>rn-file-toolkit 🗂️</h1>
+  <p><b>The ultimate, unified native file management toolkit for React Native & Expo</b></p>
+  
+  [![npm version](https://img.shields.io/npm/v/rn-file-toolkit.svg?style=for-the-badge&color=success)](https://www.npmjs.com/package/rn-file-toolkit)
+  [![npm downloads](https://img.shields.io/npm/dt/rn-file-toolkit.svg?style=for-the-badge)](https://www.npmjs.com/package/rn-file-toolkit)
+  [![TypeScript](https://img.shields.io/badge/TypeScript-Ready-blue.svg?style=for-the-badge&logo=typescript)](https://www.typescriptlang.org/)
+  [![platforms](https://img.shields.io/badge/Platforms-iOS%20%7C%20Android-lightgrey.svg?style=for-the-badge&logo=apple&logoColor=white)](https://github.com/chavan-labs/rn-file-toolkit)
+  [![license](https://img.shields.io/npm/l/rn-file-toolkit.svg?style=for-the-badge)](https://github.com/chavan-labs/rn-file-toolkit/blob/main/LICENSE)
+</div>
 
 ---
 
-## Installation
+**rn-file-toolkit** is the modern replacement for legacy file libraries. Download, upload, manage queues, extract archives, and interact with the filesystem—all powered by pure native implementations (Kotlin + Swift) with **zero third-party dependencies**.
 
-```sh
+⭐ **Star this repo if you find it useful to help others discover it!**
+
+## 📖 Table of Contents
+- [Why rn-file-toolkit?](#-why-rn-file-toolkit)
+- [Installation](#-installation)
+- [Quick Start: `useDownload`](#-quick-start-usedownload)
+- [Core APIs](#-core-apis)
+  - [Background Downloads](#background-downloads)
+  - [Multipart Uploads](#multipart-uploads)
+  - [File System (FS)](#file-system-fs)
+  - [Zip & Unzip Archives](#zip--unzip-archives)
+  - [Media & Utilities](#media--utilities)
+- [API Reference](#-api-reference)
+- [Expo Support](#-expo-support)
+- [Contributing](#-contributing)
+
+---
+
+## 🚀 Why rn-file-toolkit?
+
+Most React Native file solutions (`rn-fetch-blob`, `react-native-fs`) are fragmented, lightly maintained, or lack modern features. **rn-file-toolkit** gives you a unified, **TurboModule-ready** API utilizing OS-native managers (`URLSession` on iOS, `DownloadManager` on Android) for reliable, battery-efficient operations.
+
+### ✨ Highlights
+- 🪝 **Drop-in React Hooks:** Built-in state management (`useDownload`) for progress and controls.
+- 📥 **Background Ready:** Downloads and uploads survive app suspension with automatic re-attachment.
+- 🚦 **Smart Queueing:** Cap concurrency and set priorities without touching native code.
+- 🛡️ **Resilient:** Auto-retries on network errors with exponential backoff and HTTP resume.
+- 🗜️ **Zero-Dependency Zip:** Uses native `java.util.zip` and iOS `zlib`.
+- 🗄️ **Rich File System API:** Comprehensive FS methods (`readFile`, `writeFile`, `copyFile`, `mkdir`, `stat`, etc.).
+- 🛠️ **Expo Compatible:** Seamless integration with Expo custom dev clients.
+
+---
+
+## 📦 Installation
+
+```bash
+# npm
 npm install rn-file-toolkit
+
+# yarn
+yarn add rn-file-toolkit
+
+# pnpm
+pnpm add rn-file-toolkit
 ```
 
+*(Optional) If you are not using Expo or an auto-linking setup, run `pod install` in your `ios` directory.*
+
 ---
 
-## Quick Start: `useDownload` Hook
+## ⚡ Quick Start: `useDownload`
 
-The easiest way to manage a download inside a React component. Get status, rich progress (with speed & ETA), and full controls out of the box.
+The easiest way to manage a download inside a React component. Get status, rich progress (with speed & ETA), and full controls instantly.
 
 ```tsx
+import React from 'react';
+import { View, Text, Button } from 'react-native';
 import { useDownload } from 'rn-file-toolkit';
 
-function DownloadScreen() {
+export default function DownloadScreen() {
   const { start, pause, resume, cancel, status, progress, result } = useDownload();
 
   return (
-    <View>
+    <View style={{ padding: 20 }}>
       <Button 
-        title="Download" 
-        onPress={() => start({ url: 'https://example.com/video.mp4', destination: 'documents' })} 
+        title="Start Download" 
+        onPress={() => start({ 
+          url: 'https://example.com/large-video.mp4', 
+          destination: 'documents' 
+        })} 
       />
 
       {status === 'downloading' && progress && (
-        <View>
-          <Text>{progress.percent.toFixed(1)}% ({(progress.speedBps / 1024).toFixed(1)} KB/s)</Text>
-          <Text>ETA: {progress.etaSeconds.toFixed(0)}s</Text>
-          <Button title="Pause" onPress={pause} />
-          <Button title="Cancel" onPress={cancel} />
+        <View style={{ marginTop: 20 }}>
+          <Text>Progress: {progress.percent.toFixed(1)}%</Text>
+          <Text>Speed: {(progress.speedBps / 1024 / 1024).toFixed(2)} MB/s</Text>
+          <Text>ETA: {progress.etaSeconds.toFixed(0)} seconds</Text>
+          <View style={{ flexDirection: 'row', gap: 10, marginTop: 10 }}>
+            <Button title="Pause" onPress={pause} />
+            <Button title="Cancel" onPress={cancel} color="red" />
+          </View>
         </View>
       )}
 
       {status === 'paused' && <Button title="Resume" onPress={resume} />}
-      {status === 'done' && <Text>✅ Saved to: {result?.filePath}</Text>}
-      {status === 'error' && <Text>❌ {result?.error}</Text>}
+      {status === 'done' && <Text style={{ color: 'green' }}>✅ Saved: {result?.filePath}</Text>}
+      {status === 'error' && <Text style={{ color: 'red' }}>❌ Error: {result?.error}</Text>}
     </View>
   );
 }
@@ -70,103 +107,136 @@ function DownloadScreen() {
 
 ---
 
-## Core APIs
+## 🛠️ Core APIs
 
-### `download(options)`
-For programmatic, queue-aware background downloads.
+### Background Downloads
+For programmatic, queue-aware background downloads outside of React components.
 
-```javascript
+```typescript
 import { download, setQueueOptions } from 'rn-file-toolkit';
 
-// Optional: Configure global concurrency queue
+// Optimize global concurrency
 setQueueOptions({ maxConcurrent: 3 });
 
 const result = await download({
   url: 'https://example.com/file.pdf',
   destination: 'documents', // 'downloads' | 'cache' | 'documents'
-  queue: true, // Joins the managed queue
-  priority: 'high', // 'high' | 'normal'
+  queue: true,              // Join the managed queue
+  priority: 'high',         // 'high' | 'normal'
   retry: { attempts: 3, delay: 1000 },
-  checksum: { hash: 'd41d8cd...', algorithm: 'md5' },
-  onProgress: (p) => console.log(`${p.percent.toFixed(1)}%`),
+  onProgress: (p) => console.log(`${p.percent.toFixed(1)}% downloaded`),
 });
 ```
 
-### `upload(options)`
-Robust, memory-efficient multipart file uploading.
+### Multipart Uploads
+Robust, memory-efficient multipart file uploading for large media or documents.
 
-```javascript
+```typescript
 import { upload } from 'rn-file-toolkit';
 
 const result = await upload({
-  url: 'https://example.com/api/upload',
-  filePath: '/path/to/my_image.jpg',
-  fieldName: 'avatar',
-  parameters: { userId: '123' },
-  onProgress: (p) => console.log(`Uploading: ${p}%`),
+  url: 'https://api.example.com/v1/upload',
+  filePath: '/path/to/local/image.jpg',
+  fieldName: 'file',
+  parameters: { userId: '123', folder: 'avatars' },
+  onProgress: (percent) => console.log(`Uploading: ${percent}%`),
 });
 ```
 
-### Filesystem (`fs`)
-Perform native filesystem operations directly.
+### File System (FS)
+Perform native filesystem operations securely.
 
-```javascript
+```typescript
 import { fs } from 'rn-file-toolkit';
 
-await fs.exists('/path/to/file.txt');
-await fs.stat('/path/to/file.txt'); // { size, modified, isDir ... }
-await fs.writeFile('/path/to/file.txt', 'hello', 'utf8'); // Supports 'base64'
-await fs.copyFile('/src/file.txt', '/dst/file.txt');
-await fs.mkdir('/path/to/folder');
-const files = await fs.ls('/path/to/folder');
+// Check & Inspect
+const exists = await fs.exists('/path/to/data.json');
+const stats = await fs.stat('/path/to/data.json'); // { size, modified, isDir }
+
+// Read & Write
+await fs.writeFile('/path/to/data.txt', 'Hello World', 'utf8'); // Also supports 'base64'
+const content = await fs.readFile('/path/to/data.txt', 'utf8');
+
+// Manage Folders & Files
+await fs.mkdir('/path/to/new_folder');
+const files = await fs.ls('/path/to/new_folder');
+await fs.copyFile('/path/src.txt', '/path/dest.txt');
+await fs.moveFile('/path/old.txt', '/path/new.txt');
+await fs.deleteFile('/path/unwanted.txt');
 ```
 
-### Zip & Unzip
-Compress and extract archives securely.
+### Zip & Unzip Archives
+Compress and extract archives directly on the device.
 
-```javascript
+```typescript
 import { unzip, zip } from 'rn-file-toolkit';
 
-await unzip('/path/to/assets.zip', '/path/to/output-folder');
-await zip('/path/to/document.pdf', '/path/to/document.zip');
+// Extract a downloaded zip
+await unzip('/path/to/bundle.zip', '/path/to/extract-folder');
+
+// Compress user data before uploading
+await zip('/path/to/user-data-folder', '/path/to/backup.zip');
 ```
 
 ### Media & Utilities
+Helpful tools for sharing, opening, and encoding files.
 
-```javascript
+```typescript
 import { saveBase64AsFile, urlToBase64, shareFile, openFile } from 'rn-file-toolkit';
 
-// Convert base64 / Data URIs to files
-await saveBase64AsFile({ base64Data: 'data:image/png;base64,...', destination: 'documents' });
+// Base64 to File
+await saveBase64AsFile({ 
+  base64Data: 'data:image/png;base64,...', 
+  destination: 'documents',
+  fileName: 'image.png'
+});
 
-// Fetch remote media as base64
-await urlToBase64({ url: 'https://example.com/photo.jpg' });
+// URL to Base64 (Great for caching small images)
+const b64 = await urlToBase64({ url: 'https://example.com/icon.png' });
 
-// Share with native dialog
-await shareFile({ filePath: '/path/to/document.pdf' });
+// Native Share Sheet
+await shareFile({ filePath: '/path/to/report.pdf' });
 
-// Open with default app
-await openFile({ filePath: '/path/to/document.pdf', mimeType: 'application/pdf' });
+// Open with default system app
+await openFile({ filePath: '/path/to/report.pdf', mimeType: 'application/pdf' });
 ```
 
 ---
 
-## API Type Reference
+## 📚 API Reference
 
-| Type                 | Fields |
-| -------------------- | ------ |
-| `DownloadOptions`    | `url`, `fileName?`, `background?`, `headers?`, `destination?`, `notificationTitle?`, `notificationDescription?`, `checksum?`, `onProgress?`, `retry?`, `queue?`, `priority?` |
-| `ProgressInfo`       | `percent`, `bytesDownloaded`, `totalBytes`, `speedBps`, `etaSeconds` |
-| `RetryOptions`       | `attempts`, `delay?`, `onRetry?` |
-| `QueueOptions`       | `maxConcurrent?` |
-| `DownloadResult`     | `success`, `filePath?`, `downloadId?`, `error?` |
-| `UploadOptions`      | `url`, `filePath`, `fieldName?`, `headers?`, `parameters?`, `onProgress?`, `uploadId?` |
-| `UploadResult`       | `success`, `status?`, `data?`, `error?`, `uploadId?` |
-| `UseDownloadReturn`  | `start`, `pause`, `resume`, `cancel`, `status`, `progress`, `result`, `downloadId` |
-| `FsStat`             | `path`, `name`, `size`, `modified`, `isDir` |
-| `UnzipResult`        | `success`, `destDir?`, `files?`, `error?` |
-| `ZipResult`          | `success`, `zipPath?`, `error?` |
+| Interface | Key Properties | Description |
+| :--- | :--- | :--- |
+| `DownloadOptions` | `url`, `destination`, `queue`, `retry`, `onProgress` | Configuration for downloading a file. |
+| `UploadOptions` | `url`, `filePath`, `fieldName`, `parameters`, `onProgress` | Configuration for multipart uploads. |
+| `ProgressInfo` | `percent`, `bytesDownloaded`, `speedBps`, `etaSeconds` | Rich real-time progress payload. |
+| `UseDownloadReturn` | `start`, `pause`, `resume`, `cancel`, `status`, `progress` | Hook state and control methods. |
+| `FsStat` | `size`, `modified`, `isDir` | Output of the filesystem `stat` method. |
+
+*For advanced types and detailed parameter documentation, please refer to the source TypeScript definitions.*
 
 ---
 
-_Made natively for the community 🤝 by Rohit Chavan_
+## 🎪 Expo Support
+
+**rn-file-toolkit** works seamlessly with Expo custom development clients (EAS Build / `npx expo run:android` / `npx expo run:ios`). Since it contains native code, it is not compatible with Expo Go. 
+
+An Expo config plugin is included automatically. No extra configuration is needed in your `app.json` unless you want to customize permissions.
+
+---
+
+## 🤝 Contributing
+
+Contributions are welcome! If you find a bug or want to request a feature, please [open an issue](https://github.com/chavan-labs/rn-file-toolkit/issues). 
+
+1. Fork the repository
+2. Create your feature branch (`git checkout -b feature/AmazingFeature`)
+3. Commit your changes (`git commit -m 'Add some AmazingFeature'`)
+4. Push to the branch (`git push origin feature/AmazingFeature`)
+5. Open a Pull Request
+
+---
+
+<div align="center">
+  <i>Built with ❤️ for the React Native community by <a href="https://github.com/chavan-labs">Rohit Chavan</a></i>
+</div>

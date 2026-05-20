@@ -1,7 +1,7 @@
 {
   "name": "rn-file-toolkit",
-  "version": "1.0.2",
-  "description": "The simplest and most reliable way to download files in React Native with progress, permissions, and file handling built-in.",
+  "version": "1.0.3",
+  "description": "The ultimate native file management toolkit for React Native. Features background downloads, resumable uploads, filesystem operations, queues, zip/unzip, and media utilities with zero third-party dependencies.",
   "main": "./lib/commonjs/index.js",
   "module": "./lib/module/index.js",
   "types": "./lib/typescript/commonjs/src/index.d.ts",
@@ -105,7 +105,14 @@
     "mkdir",
     "ls",
     "blob-util-alternative",
-    "react-native-fs-alternative"
+    "react-native-fs-alternative",
+    "fs",
+    "zip",
+    "unzip",
+    "archive",
+    "storage",
+    "react-native-file-toolkit",
+    "fetch"
   ],
   "repository": {
     "type": "git",

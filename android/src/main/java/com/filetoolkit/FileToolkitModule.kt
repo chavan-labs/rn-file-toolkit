@@ -598,7 +598,7 @@ class FileToolkitModule(private val reactContext: ReactApplicationContext) :
         putBoolean("success", true)
         putBoolean("exists", file.exists())
       })
-    } catch (e: Exception) {
+    } catch (e: Throwable) {
       promise.resolve(Arguments.createMap().apply {
         putBoolean("success", false)
         putString("error", e.message ?: "EXISTS_ERROR")
@@ -629,7 +629,7 @@ class FileToolkitModule(private val reactContext: ReactApplicationContext) :
           putDouble("modified", file.lastModified().toDouble())
         })
       })
-    } catch (e: Exception) {
+    } catch (e: Throwable) {
       promise.resolve(Arguments.createMap().apply {
         putBoolean("success", false)
         putString("error", e.message ?: "STAT_ERROR")
@@ -650,6 +650,15 @@ class FileToolkitModule(private val reactContext: ReactApplicationContext) :
         return
       }
 
+      // Safety check: reject files > 50MB to prevent crashing the RN bridge
+      if (file.length() > 50L * 1024 * 1024) {
+        promise.resolve(Arguments.createMap().apply {
+          putBoolean("success", false)
+          putString("error", "File exceeds 50MB limit for readFile. Use streaming or base64 encoding for large files.")
+        })
+        return
+      }
+
       val data = if (encoding.equals("base64", ignoreCase = true)) {
         android.util.Base64.encodeToString(file.readBytes(), android.util.Base64.NO_WRAP)
       } else {
@@ -660,7 +669,7 @@ class FileToolkitModule(private val reactContext: ReactApplicationContext) :
         putBoolean("success", true)
         putString("data", data)
       })
-    } catch (e: Exception) {
+    } catch (e: Throwable) {
       promise.resolve(Arguments.createMap().apply {
         putBoolean("success", false)
         putString("error", e.message ?: "READ_FILE_ERROR")
@@ -685,7 +694,7 @@ class FileToolkitModule(private val reactContext: ReactApplicationContext) :
       promise.resolve(Arguments.createMap().apply {
         putBoolean("success", true)
       })
-    } catch (e: Exception) {
+    } catch (e: Throwable) {
       promise.resolve(Arguments.createMap().apply {
         putBoolean("success", false)
         putString("error", e.message ?: "WRITE_FILE_ERROR")
@@ -713,7 +722,7 @@ class FileToolkitModule(private val reactContext: ReactApplicationContext) :
       promise.resolve(Arguments.createMap().apply {
         putBoolean("success", true)
       })
-    } catch (e: Exception) {
+    } catch (e: Throwable) {
       promise.resolve(Arguments.createMap().apply {
         putBoolean("success", false)
         putString("error", e.message ?: "COPY_FILE_ERROR")
@@ -753,7 +762,7 @@ class FileToolkitModule(private val reactContext: ReactApplicationContext) :
       promise.resolve(Arguments.createMap().apply {
         putBoolean("success", true)
       })
-    } catch (e: Exception) {
+    } catch (e: Throwable) {
       promise.resolve(Arguments.createMap().apply {
         putBoolean("success", false)
         putString("error", e.message ?: "MOVE_FILE_ERROR")
@@ -771,7 +780,7 @@ class FileToolkitModule(private val reactContext: ReactApplicationContext) :
         putBoolean("success", ok)
         if (!ok) putString("error", "Could not create directory: $dirPath")
       })
-    } catch (e: Exception) {
+    } catch (e: Throwable) {
       promise.resolve(Arguments.createMap().apply {
         putBoolean("success", false)
         putString("error", e.message ?: "MKDIR_ERROR")
@@ -799,7 +808,7 @@ class FileToolkitModule(private val reactContext: ReactApplicationContext) :
         putBoolean("success", true)
         putArray("entries", entries)
       })
-    } catch (e: Exception) {
+    } catch (e: Throwable) {
       promise.resolve(Arguments.createMap().apply {
         putBoolean("success", false)
         putString("error", e.message ?: "LS_ERROR")
@@ -1018,7 +1027,7 @@ class FileToolkitModule(private val reactContext: ReactApplicationContext) :
         putString("filePath", destFile.absolutePath)
       })
 
-    } catch (e: Exception) {
+    } catch (e: Throwable) {
       promise.resolve(Arguments.createMap().apply {
         putBoolean("success", false)
         putString("error", e.message ?: "BASE64_SAVE_ERROR")
@@ -1079,7 +1088,7 @@ class FileToolkitModule(private val reactContext: ReactApplicationContext) :
           putString("dataUri", "data:$mimeType;base64,$base64String")
         })
 
-      } catch (e: Exception) {
+      } catch (e: Throwable) {
         promise.resolve(Arguments.createMap().apply {
           putBoolean("success", false)
           putString("error", e.message ?: "URL_TO_BASE64_ERROR")

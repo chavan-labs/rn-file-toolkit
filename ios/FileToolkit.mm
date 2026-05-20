@@ -376,6 +376,14 @@ RCT_EXPORT_MODULE()
         return;
     }
 
+    // Safety check: reject files > 50MB to prevent crashing the RN bridge
+    NSDictionary *attrs = [fm attributesOfItemAtPath:filePath error:nil];
+    unsigned long long fileSize = [attrs fileSize];
+    if (fileSize > 50 * 1024 * 1024) {
+        resolve(@{@"success": @NO, @"error": @"File exceeds 50MB limit for readFile. Use streaming or base64 encoding for large files."});
+        return;
+    }
+
     NSError *readError = nil;
     NSData *raw = [NSData dataWithContentsOfFile:filePath options:0 error:&readError];
     if (!raw || readError) {
@@ -1155,9 +1163,10 @@ RCT_EXPORT_METHOD(unzip:(NSString *)sourcePath
         // pure-Foundation approach using NSInputStream with a known zip local-file header parser.
 
         // ── Pure-Foundation zip reader (no third-party, no subprocess) ──────────
-        NSData *zipData = [NSData dataWithContentsOfFile:sourcePath];
+        NSError *readError = nil;
+        NSData *zipData = [NSData dataWithContentsOfFile:sourcePath options:NSDataReadingMappedIfSafe error:&readError];
         if (!zipData) {
-            resolve(@{@"success": @NO, @"error": @"Cannot read zip file"});
+            resolve(@{@"success": @NO, @"error": readError.localizedDescription ?: @"Cannot read zip file"});
             return;
         }
 
@@ -1342,7 +1351,14 @@ RCT_EXPORT_METHOD(zip:(NSString *)sourcePath
         // Delete existing destination file
         [fm removeItemAtPath:destPath error:nil];
 
-        NSMutableData *zipData = [NSMutableData new];
+        // Create the destination file and open a handle for writing
+        [fm createFileAtPath:destPath contents:nil attributes:nil];
+        NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:destPath];
+        if (!fh) {
+            resolve(@{@"success": @NO, @"error": @"Failed to create destination zip file"});
+            return;
+        }
+
         NSMutableArray<NSDictionary *> *centralDirectory = [NSMutableArray new];
 
         NSArray<NSString *> *filesToZip;
@@ -1352,9 +1368,6 @@ RCT_EXPORT_METHOD(zip:(NSString *)sourcePath
             NSMutableArray *files = [NSMutableArray new];
             NSString *file;
             while ((file = [enumerator nextObject])) {
-                NSString *fullPath = [sourcePath stringByAppendingPathComponent:file];
-                BOOL entryIsDir = NO;
-                [fm fileExistsAtPath:fullPath isDirectory:&entryIsDir];
                 [files addObject:file];
             }
             filesToZip = files;
@@ -1369,80 +1382,138 @@ RCT_EXPORT_METHOD(zip:(NSString *)sourcePath
             BOOL entryIsDir = NO;
             [fm fileExistsAtPath:fullPath isDirectory:&entryIsDir];
 
-            NSData *fileData = entryIsDir ? [NSData data] : [NSData dataWithContentsOfFile:fullPath];
-            if (!fileData) continue;
-
             NSData *entryNameData = [relativePath dataUsingEncoding:NSUTF8StringEncoding];
             uint16_t nameLen = (uint16_t)entryNameData.length;
 
-            // Deflate compress (skip compression for directories)
-            NSData *compressedData;
-            uint16_t method;
-            uint32_t crc = 0;
+            uint32_t localHeaderOffset = (uint32_t)[fh offsetInFile];
 
-            if (entryIsDir || fileData.length == 0) {
-                compressedData = fileData;
-                method = 0;
-            } else {
-                // zlib deflate (raw, -15)
-                uLongf bound = compressBound((uLong)fileData.length);
-                NSMutableData *comp = [NSMutableData dataWithLength:bound];
-                z_stream strm;
-                memset(&strm, 0, sizeof(strm));
-                strm.next_in   = (Bytef *)fileData.bytes;
-                strm.avail_in  = (uInt)fileData.length;
-                strm.next_out  = (Bytef *)comp.mutableBytes;
-                strm.avail_out = (uInt)bound;
-                deflateInit2(&strm, Z_DEFAULT_COMPRESSION, Z_DEFLATED, -15, 8, Z_DEFAULT_STRATEGY);
-                deflate(&strm, Z_FINISH);
-                deflateEnd(&strm);
-                [comp setLength:strm.total_out];
-                compressedData = comp;
-                method = 8;
-            }
-
-            // CRC32
-            crc = (uint32_t)crc32(0L, (const Bytef *)fileData.bytes, (uInt)fileData.length);
-
-            uint32_t localHeaderOffset = (uint32_t)zipData.length;
-
-            // Local file header
+            // Write local file header with placeholder CRC/sizes
             uint32_t sig       = CFSwapInt32HostToLittle(0x04034b50);
             uint16_t version   = CFSwapInt16HostToLittle(20);
             uint16_t flags     = 0;
-            uint16_t meth      = CFSwapInt16HostToLittle(method);
-            uint16_t modTime   = 0, modDate = 0; // no time for simplicity
-            uint32_t crcLE     = CFSwapInt32HostToLittle(crc);
-            uint32_t compSz    = CFSwapInt32HostToLittle((uint32_t)compressedData.length);
-            uint32_t uncompSz  = CFSwapInt32HostToLittle((uint32_t)fileData.length);
+            uint16_t modTime   = 0, modDate = 0;
             uint16_t extraLen  = 0;
 
-            [zipData appendBytes:&sig       length:4];
-            [zipData appendBytes:&version   length:2];
-            [zipData appendBytes:&flags     length:2];
-            [zipData appendBytes:&meth      length:2];
-            [zipData appendBytes:&modTime   length:2];
-            [zipData appendBytes:&modDate   length:2];
-            [zipData appendBytes:&crcLE     length:4];
-            [zipData appendBytes:&compSz    length:4];
-            [zipData appendBytes:&uncompSz  length:4];
-            [zipData appendBytes:&nameLen   length:2];
-            [zipData appendBytes:&extraLen  length:2];
-            [zipData appendData:entryNameData];
-            [zipData appendData:compressedData];
+            // Placeholders — will be patched after streaming
+            uint16_t method    = 0;
+            uint32_t crcLE     = 0;
+            uint32_t compSz    = 0;
+            uint32_t uncompSz  = 0;
+
+            [fh writeData:[NSData dataWithBytes:&sig       length:4]];
+            [fh writeData:[NSData dataWithBytes:&version   length:2]];
+            [fh writeData:[NSData dataWithBytes:&flags     length:2]];
+            [fh writeData:[NSData dataWithBytes:&method    length:2]]; // offset +8
+            [fh writeData:[NSData dataWithBytes:&modTime   length:2]];
+            [fh writeData:[NSData dataWithBytes:&modDate   length:2]];
+            [fh writeData:[NSData dataWithBytes:&crcLE     length:4]]; // offset +14
+            [fh writeData:[NSData dataWithBytes:&compSz    length:4]]; // offset +18
+            [fh writeData:[NSData dataWithBytes:&uncompSz  length:4]]; // offset +22
+            [fh writeData:[NSData dataWithBytes:&nameLen   length:2]];
+            [fh writeData:[NSData dataWithBytes:&extraLen  length:2]];
+            [fh writeData:entryNameData];
+
+            uint32_t crc = 0;
+            uint32_t compressedSize = 0;
+            uint32_t uncompressedSize = 0;
+            uint16_t compressionMethod = 0;
+
+            if (entryIsDir) {
+                // Directory entry — no data to write
+            } else {
+                NSInputStream *inputStream = [NSInputStream inputStreamWithFileAtPath:fullPath];
+                [inputStream open];
+
+                if (!inputStream || inputStream.streamStatus == NSStreamStatusError) {
+                    [inputStream close];
+                    continue;
+                }
+
+                // Stream-compress with zlib deflate
+                z_stream strm;
+                memset(&strm, 0, sizeof(strm));
+                deflateInit2(&strm, Z_DEFAULT_COMPRESSION, Z_DEFLATED, -15, 8, Z_DEFAULT_STRATEGY);
+
+                uint8_t inBuf[32768];
+                uint8_t outBuf[32768];
+                int flush = Z_NO_FLUSH;
+
+                while ([inputStream hasBytesAvailable]) {
+                    NSInteger bytesRead = [inputStream read:inBuf maxLength:sizeof(inBuf)];
+                    if (bytesRead <= 0) break;
+
+                    crc = (uint32_t)crc32((uLong)crc, inBuf, (uInt)bytesRead);
+                    uncompressedSize += (uint32_t)bytesRead;
+
+                    strm.next_in = inBuf;
+                    strm.avail_in = (uInt)bytesRead;
+
+                    if (![inputStream hasBytesAvailable]) {
+                        flush = Z_FINISH;
+                    }
+
+                    do {
+                        strm.next_out = outBuf;
+                        strm.avail_out = sizeof(outBuf);
+                        deflate(&strm, flush);
+                        NSUInteger produced = sizeof(outBuf) - strm.avail_out;
+                        if (produced > 0) {
+                            [fh writeData:[NSData dataWithBytes:outBuf length:produced]];
+                            compressedSize += (uint32_t)produced;
+                        }
+                    } while (strm.avail_out == 0);
+                }
+
+                // Finalize deflate if we didn't hit Z_FINISH yet
+                if (flush != Z_FINISH) {
+                    strm.next_in = NULL;
+                    strm.avail_in = 0;
+                    do {
+                        strm.next_out = outBuf;
+                        strm.avail_out = sizeof(outBuf);
+                        deflate(&strm, Z_FINISH);
+                        NSUInteger produced = sizeof(outBuf) - strm.avail_out;
+                        if (produced > 0) {
+                            [fh writeData:[NSData dataWithBytes:outBuf length:produced]];
+                            compressedSize += (uint32_t)produced;
+                        }
+                    } while (strm.avail_out == 0);
+                }
+
+                deflateEnd(&strm);
+                [inputStream close];
+                compressionMethod = 8;
+            }
+
+            // Patch the local file header with actual CRC, sizes, method
+            unsigned long long currentPos = [fh offsetInFile];
+            uint16_t methLE   = CFSwapInt16HostToLittle(compressionMethod);
+            uint32_t crcPatch = CFSwapInt32HostToLittle(crc);
+            uint32_t csPatch  = CFSwapInt32HostToLittle(compressedSize);
+            uint32_t usPatch  = CFSwapInt32HostToLittle(uncompressedSize);
+
+            [fh seekToFileOffset:localHeaderOffset + 8];
+            [fh writeData:[NSData dataWithBytes:&methLE    length:2]];
+            [fh seekToFileOffset:localHeaderOffset + 10]; // skip modTime
+            [fh seekToFileOffset:localHeaderOffset + 14];
+            [fh writeData:[NSData dataWithBytes:&crcPatch  length:4]];
+            [fh writeData:[NSData dataWithBytes:&csPatch   length:4]];
+            [fh writeData:[NSData dataWithBytes:&usPatch   length:4]];
+
+            [fh seekToFileOffset:currentPos]; // restore position
 
             [centralDirectory addObject:@{
                 @"name":            entryNameData,
-                @"method":          @(method),
+                @"method":          @(compressionMethod),
                 @"crc":             @(crc),
-                @"compSize":        @(compressedData.length),
-                @"uncompSize":      @(fileData.length),
+                @"compSize":        @(compressedSize),
+                @"uncompSize":      @(uncompressedSize),
                 @"localOffset":     @(localHeaderOffset),
             }];
         }
 
         // Central directory
-        uint32_t cdOffset = (uint32_t)zipData.length;
+        uint32_t cdOffset = (uint32_t)[fh offsetInFile];
         for (NSDictionary *entry in centralDirectory) {
             NSData *nameData = entry[@"name"];
             uint16_t nameLen = (uint16_t)nameData.length;
@@ -1461,27 +1532,27 @@ RCT_EXPORT_METHOD(zip:(NSString *)sourcePath
             uint32_t extAttr = 0;
             uint32_t localOff = CFSwapInt32HostToLittle((uint32_t)[entry[@"localOffset"] unsignedIntValue]);
 
-            [zipData appendBytes:&cdSig      length:4];
-            [zipData appendBytes:&verMade    length:2];
-            [zipData appendBytes:&verNeeded  length:2];
-            [zipData appendBytes:&flags      length:2];
-            [zipData appendBytes:&meth       length:2];
-            [zipData appendBytes:&modTime    length:2];
-            [zipData appendBytes:&modDate    length:2];
-            [zipData appendBytes:&crcLE      length:4];
-            [zipData appendBytes:&compSz     length:4];
-            [zipData appendBytes:&uncompSz   length:4];
-            [zipData appendBytes:&nameLen    length:2];
-            [zipData appendBytes:&extraLen   length:2];
-            [zipData appendBytes:&commentLen length:2];
-            [zipData appendBytes:&disk       length:2];
-            [zipData appendBytes:&intAttr    length:2];
-            [zipData appendBytes:&extAttr    length:4];
-            [zipData appendBytes:&localOff   length:4];
-            [zipData appendData:nameData];
+            [fh writeData:[NSData dataWithBytes:&cdSig      length:4]];
+            [fh writeData:[NSData dataWithBytes:&verMade    length:2]];
+            [fh writeData:[NSData dataWithBytes:&verNeeded  length:2]];
+            [fh writeData:[NSData dataWithBytes:&flags      length:2]];
+            [fh writeData:[NSData dataWithBytes:&meth       length:2]];
+            [fh writeData:[NSData dataWithBytes:&modTime    length:2]];
+            [fh writeData:[NSData dataWithBytes:&modDate    length:2]];
+            [fh writeData:[NSData dataWithBytes:&crcLE      length:4]];
+            [fh writeData:[NSData dataWithBytes:&compSz     length:4]];
+            [fh writeData:[NSData dataWithBytes:&uncompSz   length:4]];
+            [fh writeData:[NSData dataWithBytes:&nameLen    length:2]];
+            [fh writeData:[NSData dataWithBytes:&extraLen   length:2]];
+            [fh writeData:[NSData dataWithBytes:&commentLen length:2]];
+            [fh writeData:[NSData dataWithBytes:&disk       length:2]];
+            [fh writeData:[NSData dataWithBytes:&intAttr    length:2]];
+            [fh writeData:[NSData dataWithBytes:&extAttr    length:4]];
+            [fh writeData:[NSData dataWithBytes:&localOff   length:4]];
+            [fh writeData:nameData];
         }
 
-        uint32_t cdSize   = CFSwapInt32HostToLittle((uint32_t)(zipData.length - cdOffset));
+        uint32_t cdSize   = CFSwapInt32HostToLittle((uint32_t)([fh offsetInFile] - cdOffset));
         uint32_t cdOffLE  = CFSwapInt32HostToLittle(cdOffset);
         uint16_t numEntries = CFSwapInt16HostToLittle((uint16_t)centralDirectory.count);
         uint16_t commentLen = 0;
@@ -1489,21 +1560,17 @@ RCT_EXPORT_METHOD(zip:(NSString *)sourcePath
         // End of central directory record
         uint32_t eocdSig = CFSwapInt32HostToLittle(0x06054b50);
         uint16_t disk = 0;
-        [zipData appendBytes:&eocdSig    length:4];
-        [zipData appendBytes:&disk       length:2];
-        [zipData appendBytes:&disk       length:2];
-        [zipData appendBytes:&numEntries length:2];
-        [zipData appendBytes:&numEntries length:2];
-        [zipData appendBytes:&cdSize     length:4];
-        [zipData appendBytes:&cdOffLE    length:4];
-        [zipData appendBytes:&commentLen length:2];
+        [fh writeData:[NSData dataWithBytes:&eocdSig    length:4]];
+        [fh writeData:[NSData dataWithBytes:&disk       length:2]];
+        [fh writeData:[NSData dataWithBytes:&disk       length:2]];
+        [fh writeData:[NSData dataWithBytes:&numEntries length:2]];
+        [fh writeData:[NSData dataWithBytes:&numEntries length:2]];
+        [fh writeData:[NSData dataWithBytes:&cdSize     length:4]];
+        [fh writeData:[NSData dataWithBytes:&cdOffLE    length:4]];
+        [fh writeData:[NSData dataWithBytes:&commentLen length:2]];
 
-        NSError *writeErr = nil;
-        if ([zipData writeToFile:destPath options:NSDataWritingAtomic error:&writeErr]) {
-            resolve(@{@"success": @YES, @"zipPath": destPath});
-        } else {
-            resolve(@{@"success": @NO, @"error": writeErr.localizedDescription ?: @"ZIP_WRITE_ERROR"});
-        }
+        [fh closeFile];
+        resolve(@{@"success": @YES, @"zipPath": destPath});
     });
 }
 
