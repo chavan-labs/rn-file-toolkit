@@ -17,6 +17,7 @@
 
 ## 📖 Table of Contents
 - [Why rn-file-toolkit?](#-why-rn-file-toolkit)
+- [Why not Expo FileSystem?](#-why-not-expo-filesystem)
 - [Installation](#-installation)
 - [Quick Start: `useDownload`](#-quick-start-usedownload)
 - [Core APIs](#-core-apis)
@@ -33,7 +34,7 @@
 
 ## 🚀 Why rn-file-toolkit?
 
-Most React Native file solutions (`rn-fetch-blob`, `react-native-fs`) are fragmented, lightly maintained, or lack modern features. **rn-file-toolkit** gives you a unified, **TurboModule-ready** API utilizing OS-native managers (`URLSession` on iOS, `DownloadManager` on Android) for reliable, battery-efficient operations.
+Most React Native file solutions (`rn-fetch-blob`, `react-native-fs`) are fragmented, lightly maintained, or lack modern features. **rn-file-toolkit** gives you a unified, **TurboModule-compatible** API utilizing OS-native managers (`URLSession` on iOS, `DownloadManager` on Android) for reliable, battery-efficient operations.
 
 ### ✨ Highlights
 - 🪝 **Drop-in React Hooks:** Built-in state management (`useDownload`) for progress and controls.
@@ -43,6 +44,19 @@ Most React Native file solutions (`rn-fetch-blob`, `react-native-fs`) are fragme
 - 🗜️ **Zero-Dependency Zip:** Uses native `java.util.zip` and iOS `zlib`.
 - 🗄️ **Rich File System API:** Comprehensive FS methods (`readFile`, `writeFile`, `copyFile`, `mkdir`, `stat`, etc.).
 - 🛠️ **Expo Compatible:** Seamless integration with Expo custom dev clients.
+
+---
+
+## 🤔 Why not Expo FileSystem?
+
+Many developers looking for an **"expo-file-system alternative"** or a **"better react native download manager"** come here. While Expo FileSystem is a great tool for basic file operations, `rn-file-toolkit` is built specifically to handle complex, real-world file management scenarios:
+
+- **Queueing & Concurrency:** Built-in smart queueing allows you to cap concurrent downloads and set priorities without writing complex JavaScript wrappers.
+- **Native Download/Upload Managers:** We hook directly into OS-level managers (`URLSession` on iOS, `DownloadManager` on Android) for maximum reliability and battery efficiency.
+- **Auto-Retries & Resiliency:** Native implementations handle network drops with exponential backoff and HTTP resume automatically.
+- **Multipart Uploads:** Robust, memory-efficient multipart uploads for large media are built right in.
+- **Drop-in React Hooks:** Provides a `useDownload` hook out-of-the-box for instant progress tracking, speed, ETA, and state controls.
+- **Background Persistence:** Downloads and uploads survive app suspension and backgrounding, automatically re-attaching when the app resumes.
 
 ---
 
@@ -238,5 +252,5 @@ Contributions are welcome! If you find a bug or want to request a feature, pleas
 ---
 
 <div align="center">
-  <i>Built with ❤️ for the React Native community by <a href="https://github.com/chavan-labs">Rohit Chavan</a></i>
+  <i>Built with ❤️ for the React Native community by <a href="https://github.com/chavanRk">Rohit Chavan</a></i>
 </div>
