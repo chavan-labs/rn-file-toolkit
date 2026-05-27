@@ -9,12 +9,15 @@ concurrency:
   group: publish-${{ github.ref }}
   cancel-in-progress: false
 
+permissions:
+  contents: read
+
 jobs:
   publish:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v5
 
       - name: Setup Node.js
@@ -22,18 +25,23 @@ jobs:
         with:
           node-version-file: .nvmrc
           registry-url: https://registry.npmjs.org/
-          package-manager-cache: false
+          cache: npm
 
       - name: Enable Corepack
         run: corepack enable
 
-      - name: Check if version changed
+      - name: Check if package version changed
         id: version-check
         run: |
+          PACKAGE_NAME=$(node -p "require('./package.json').name")
           CURRENT_VERSION=$(node -p "require('./package.json').version")
-          PUBLISHED_VERSION=$(npm view rn-file-toolkit version 2>/dev/null || echo "0.0.0")
+
+          PUBLISHED_VERSION=$(npm view $PACKAGE_NAME version 2>/dev/null || echo "0.0.0")
+
+          echo "package=$PACKAGE_NAME" >> $GITHUB_OUTPUT
           echo "current=$CURRENT_VERSION" >> $GITHUB_OUTPUT
           echo "published=$PUBLISHED_VERSION" >> $GITHUB_OUTPUT
+
           if [ "$CURRENT_VERSION" != "$PUBLISHED_VERSION" ]; then
             echo "changed=true" >> $GITHUB_OUTPUT
             echo "📦 Version changed: $PUBLISHED_VERSION → $CURRENT_VERSION"
@@ -44,14 +52,14 @@ jobs:
 
       - name: Install dependencies
         if: steps.version-check.outputs.changed == 'true'
-        run: yarn install --immutable
+        run: npm ci
 
       - name: Build library
         if: steps.version-check.outputs.changed == 'true'
-        run: yarn prepare
+        run: npm run prepare
 
       - name: Publish to npm
         if: steps.version-check.outputs.changed == 'true'
-        run: npm publish
+        run: npm publish --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
