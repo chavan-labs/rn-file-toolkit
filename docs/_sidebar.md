@@ -1,5 +1,6 @@
-- [Home](/)
+- [Home](README.md)
 - [Getting Started](getting-started.md)
 - [API Overview](api-overview.md)
-- [Guides](guides.md)
+- [Examples](examples.md)
+- [Usage Guides](guides.md)
 - [Troubleshooting](troubleshooting.md)
