@@ -123,7 +123,7 @@
   "bugs": {
     "url": "https://github.com/chavan-labs/rn-file-toolkit/issues"
   },
-  "homepage": "https://github.com/chavan-labs/rn-file-toolkit#readme",
+  "homepage": "https://chavan-labs.github.io/rn-file-toolkit/",
   "publishConfig": {
     "registry": "https://registry.npmjs.org/"
   },

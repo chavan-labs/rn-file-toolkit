@@ -16,8 +16,10 @@
 ⭐ **Star this repo if you find it useful to help others discover it!**
 
 ## 📖 Table of Contents
+
 - [Why rn-file-toolkit?](#-why-rn-file-toolkit)
 - [Why not Expo FileSystem?](#-why-not-expo-filesystem)
+- [Documentation Website](#-documentation-website)
 - [Installation](#-installation)
 - [Quick Start: `useDownload`](#-quick-start-usedownload)
 - [Core APIs](#-core-apis)
@@ -37,6 +39,7 @@
 Most React Native file solutions (`rn-fetch-blob`, `react-native-fs`) are fragmented, lightly maintained, or lack modern features. **rn-file-toolkit** gives you a unified, **TurboModule-compatible** API utilizing OS-native managers (`URLSession` on iOS, `DownloadManager` on Android) for reliable, battery-efficient operations.
 
 ### ✨ Highlights
+
 - 🪝 **Drop-in React Hooks:** Built-in state management (`useDownload`) for progress and controls.
 - 📥 **Background Ready:** Downloads and uploads survive app suspension with automatic re-attachment.
 - 🚦 **Smart Queueing:** Cap concurrency and set priorities without touching native code.
@@ -60,6 +63,14 @@ Many developers looking for an **"expo-file-system alternative"** or a **"better
 
 ---
 
+## 🌐 Documentation Website
+
+Full docs are hosted on GitHub Pages:
+
+https://chavan-labs.github.io/rn-file-toolkit/
+
+---
+
 ## 📦 Installation
 
 ```bash
@@ -73,7 +84,7 @@ yarn add rn-file-toolkit
 pnpm add rn-file-toolkit
 ```
 
-*(Optional) If you are not using Expo or an auto-linking setup, run `pod install` in your `ios` directory.*
+_(Optional) If you are not using Expo or an auto-linking setup, run `pod install` in your `ios` directory._
 
 ---
 
@@ -87,22 +98,27 @@ import { View, Text, Button } from 'react-native';
 import { useDownload } from 'rn-file-toolkit';
 
 export default function DownloadScreen() {
-  const { start, pause, resume, cancel, status, progress, result } = useDownload();
+  const { start, pause, resume, cancel, status, progress, result } =
+    useDownload();
 
   return (
     <View style={{ padding: 20 }}>
-      <Button 
-        title="Start Download" 
-        onPress={() => start({ 
-          url: 'https://example.com/large-video.mp4', 
-          destination: 'documents' 
-        })} 
+      <Button
+        title="Start Download"
+        onPress={() =>
+          start({
+            url: 'https://example.com/large-video.mp4',
+            destination: 'documents',
+          })
+        }
       />
 
       {status === 'downloading' && progress && (
         <View style={{ marginTop: 20 }}>
           <Text>Progress: {progress.percent.toFixed(1)}%</Text>
-          <Text>Speed: {(progress.speedBps / 1024 / 1024).toFixed(2)} MB/s</Text>
+          <Text>
+            Speed: {(progress.speedBps / 1024 / 1024).toFixed(2)} MB/s
+          </Text>
           <Text>ETA: {progress.etaSeconds.toFixed(0)} seconds</Text>
           <View style={{ flexDirection: 'row', gap: 10, marginTop: 10 }}>
             <Button title="Pause" onPress={pause} />
@@ -112,8 +128,12 @@ export default function DownloadScreen() {
       )}
 
       {status === 'paused' && <Button title="Resume" onPress={resume} />}
-      {status === 'done' && <Text style={{ color: 'green' }}>✅ Saved: {result?.filePath}</Text>}
-      {status === 'error' && <Text style={{ color: 'red' }}>❌ Error: {result?.error}</Text>}
+      {status === 'done' && (
+        <Text style={{ color: 'green' }}>✅ Saved: {result?.filePath}</Text>
+      )}
+      {status === 'error' && (
+        <Text style={{ color: 'red' }}>❌ Error: {result?.error}</Text>
+      )}
     </View>
   );
 }
@@ -124,6 +144,7 @@ export default function DownloadScreen() {
 ## 🛠️ Core APIs
 
 ### Background Downloads
+
 For programmatic, queue-aware background downloads outside of React components.
 
 ```typescript
@@ -135,14 +156,15 @@ setQueueOptions({ maxConcurrent: 3 });
 const result = await download({
   url: 'https://example.com/file.pdf',
   destination: 'documents', // 'downloads' | 'cache' | 'documents'
-  queue: true,              // Join the managed queue
-  priority: 'high',         // 'high' | 'normal'
+  queue: true, // Join the managed queue
+  priority: 'high', // 'high' | 'normal'
   retry: { attempts: 3, delay: 1000 },
   onProgress: (p) => console.log(`${p.percent.toFixed(1)}% downloaded`),
 });
 ```
 
 ### Multipart Uploads
+
 Robust, memory-efficient multipart file uploading for large media or documents.
 
 ```typescript
@@ -158,6 +180,7 @@ const result = await upload({
 ```
 
 ### File System (FS)
+
 Perform native filesystem operations securely.
 
 ```typescript
@@ -180,6 +203,7 @@ await fs.deleteFile('/path/unwanted.txt');
 ```
 
 ### Zip & Unzip Archives
+
 Compress and extract archives directly on the device.
 
 ```typescript
@@ -193,16 +217,22 @@ await zip('/path/to/user-data-folder', '/path/to/backup.zip');
 ```
 
 ### Media & Utilities
+
 Helpful tools for sharing, opening, and encoding files.
 
 ```typescript
-import { saveBase64AsFile, urlToBase64, shareFile, openFile } from 'rn-file-toolkit';
+import {
+  saveBase64AsFile,
+  urlToBase64,
+  shareFile,
+  openFile,
+} from 'rn-file-toolkit';
 
 // Base64 to File
-await saveBase64AsFile({ 
-  base64Data: 'data:image/png;base64,...', 
+await saveBase64AsFile({
+  base64Data: 'data:image/png;base64,...',
   destination: 'documents',
-  fileName: 'image.png'
+  fileName: 'image.png',
 });
 
 // URL to Base64 (Great for caching small images)
@@ -212,28 +242,31 @@ const b64 = await urlToBase64({ url: 'https://example.com/icon.png' });
 await shareFile({ filePath: '/path/to/report.pdf' });
 
 // Open with default system app
-await openFile({ filePath: '/path/to/report.pdf', mimeType: 'application/pdf' });
+await openFile({
+  filePath: '/path/to/report.pdf',
+  mimeType: 'application/pdf',
+});
 ```
 
 ---
 
 ## 📚 API Reference
 
-| Interface | Key Properties | Description |
-| :--- | :--- | :--- |
-| `DownloadOptions` | `url`, `destination`, `queue`, `retry`, `onProgress` | Configuration for downloading a file. |
-| `UploadOptions` | `url`, `filePath`, `fieldName`, `parameters`, `onProgress` | Configuration for multipart uploads. |
-| `ProgressInfo` | `percent`, `bytesDownloaded`, `speedBps`, `etaSeconds` | Rich real-time progress payload. |
-| `UseDownloadReturn` | `start`, `pause`, `resume`, `cancel`, `status`, `progress` | Hook state and control methods. |
-| `FsStat` | `size`, `modified`, `isDir` | Output of the filesystem `stat` method. |
+| Interface           | Key Properties                                             | Description                             |
+| :------------------ | :--------------------------------------------------------- | :-------------------------------------- |
+| `DownloadOptions`   | `url`, `destination`, `queue`, `retry`, `onProgress`       | Configuration for downloading a file.   |
+| `UploadOptions`     | `url`, `filePath`, `fieldName`, `parameters`, `onProgress` | Configuration for multipart uploads.    |
+| `ProgressInfo`      | `percent`, `bytesDownloaded`, `speedBps`, `etaSeconds`     | Rich real-time progress payload.        |
+| `UseDownloadReturn` | `start`, `pause`, `resume`, `cancel`, `status`, `progress` | Hook state and control methods.         |
+| `FsStat`            | `size`, `modified`, `isDir`                                | Output of the filesystem `stat` method. |
 
-*For advanced types and detailed parameter documentation, please refer to the source TypeScript definitions.*
+_For advanced types and detailed parameter documentation, please refer to the source TypeScript definitions._
 
 ---
 
 ## 🎪 Expo Support
 
-**rn-file-toolkit** works seamlessly with Expo custom development clients (EAS Build / `npx expo run:android` / `npx expo run:ios`). Since it contains native code, it is not compatible with Expo Go. 
+**rn-file-toolkit** works seamlessly with Expo custom development clients (EAS Build / `npx expo run:android` / `npx expo run:ios`). Since it contains native code, it is not compatible with Expo Go.
 
 An Expo config plugin is included automatically. No extra configuration is needed in your `app.json` unless you want to customize permissions.
 
@@ -241,7 +274,7 @@ An Expo config plugin is included automatically. No extra configuration is neede
 
 ## 🤝 Contributing
 
-Contributions are welcome! If you find a bug or want to request a feature, please [open an issue](https://github.com/chavan-labs/rn-file-toolkit/issues). 
+Contributions are welcome! If you find a bug or want to request a feature, please [open an issue](https://github.com/chavan-labs/rn-file-toolkit/issues).
 
 1. Fork the repository
 2. Create your feature branch (`git checkout -b feature/AmazingFeature`)
