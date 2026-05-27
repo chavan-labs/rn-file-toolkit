@@ -22,6 +22,7 @@ jobs:
         with:
           node-version: 20
           registry-url: https://registry.npmjs.org/
+          package-manager-cache: false
 
       - name: Check if version changed
         id: version-check
