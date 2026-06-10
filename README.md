@@ -50,16 +50,26 @@ Most React Native file solutions (`rn-fetch-blob`, `react-native-fs`) are fragme
 
 ---
 
-## 🤔 Why not Expo FileSystem?
+## 🥊 How does it compare?
 
-Many developers looking for an **"expo-file-system alternative"** or a **"better react native download manager"** come here. While Expo FileSystem is a great tool for basic file operations, `rn-file-toolkit` is built specifically to handle complex, real-world file management scenarios:
+If you've been working with React Native for a while, you've probably used `rn-fetch-blob` or `react-native-fs`. While they were fantastic tools back in the day, they haven't aged well and often struggle with modern requirements like seamless Expo integration or background persistence. You might have also tried `expo-file-system`, which is great for the basics but starts to fall short when you need smart queueing or multipart uploads.
 
-- **Queueing & Concurrency:** Built-in smart queueing allows you to cap concurrent downloads and set priorities without writing complex JavaScript wrappers.
-- **Native Download/Upload Managers:** We hook directly into OS-level managers (`URLSession` on iOS, `DownloadManager` on Android) for maximum reliability and battery efficiency.
-- **Auto-Retries & Resiliency:** Native implementations handle network drops with exponential backoff and HTTP resume automatically.
-- **Multipart Uploads:** Robust, memory-efficient multipart uploads for large media are built right in.
-- **Drop-in React Hooks:** Provides a `useDownload` hook out-of-the-box for instant progress tracking, speed, ETA, and state controls.
-- **Background Persistence:** Downloads and uploads survive app suspension and backgrounding, automatically re-attaching when the app resumes.
+We built **rn-file-toolkit** because we were tired of stitching together multiple unmaintained libraries just to download a file reliably in the background while keeping the UI updated.
+
+Here's how it stacks up against the crowd:
+
+| Feature | `rn-file-toolkit` | `react-native-fs` & `rn-fetch-blob` | `expo-file-system` |
+| :--- | :---: | :---: | :---: |
+| **Background Persistence** | ✅ Yes | ⚠️ Spotty / Legacy | ✅ Yes |
+| **Smart Queueing & Concurrency** | ✅ Built-in | ❌ Write your own | ❌ Write your own |
+| **React Hooks (`useDownload`)** | ✅ Out-of-the-box | ❌ Manual | ❌ Manual |
+| **Auto-Retries & Resumption** | ✅ Yes | ❌ Manual | ⚠️ Basic resume only |
+| **Multipart Uploads** | ✅ Yes (Memory efficient) | ⚠️ Basic support | ✅ Yes |
+| **Expo Support (Custom Dev Client)**| ✅ Seamless | ❌ Requires heavy config | ✅ Seamless |
+| **Zero 3rd-party Dependencies** | ✅ Yes | ❌ Varies | ✅ Yes |
+| **Active Maintenance** | ✅ Yes | ❌ Largely unmaintained | ✅ Yes |
+
+We hook directly into OS-level managers (`URLSession` on iOS, `DownloadManager` on Android) to provide maximum reliability, battery efficiency, and zero headaches.
 
 ---
 

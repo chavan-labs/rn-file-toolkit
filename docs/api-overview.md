@@ -15,6 +15,8 @@ Main options:
 - `fileName?: string`
 - `headers?: Record<string, string>`
 - `background?: boolean`
+- `notificationTitle?: string`
+- `notificationDescription?: string`
 - `downloadId?: string`
 - `onProgress?: (info) => void`
 - `queue?: boolean`
@@ -40,6 +42,10 @@ Result (`DownloadResult`):
 ### `pauseDownload(downloadId)` / `resumeDownload(downloadId)` / `cancelDownload(downloadId)`
 
 Control an active download by ID.
+
+### `getBackgroundDownloads()`
+
+Returns an array of actively running or pending background download tasks, allowing you to re-attach or manage them after app restart.
 
 ### `setQueueOptions({ maxConcurrent })`
 
