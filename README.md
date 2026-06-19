@@ -7,6 +7,7 @@
   [![TypeScript](https://img.shields.io/badge/TypeScript-Ready-blue.svg?style=for-the-badge&logo=typescript)](https://www.typescriptlang.org/)
   [![platforms](https://img.shields.io/badge/Platforms-iOS%20%7C%20Android-lightgrey.svg?style=for-the-badge&logo=apple&logoColor=white)](https://github.com/chavan-labs/rn-file-toolkit)
   [![license](https://img.shields.io/npm/l/rn-file-toolkit.svg?style=for-the-badge)](https://github.com/chavan-labs/rn-file-toolkit/blob/main/LICENSE)
+  [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg?style=for-the-badge)](https://makeapullrequest.com)
 </div>
 
 ---
