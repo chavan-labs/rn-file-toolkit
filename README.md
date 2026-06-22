@@ -25,10 +25,14 @@
 - [Quick Start: `useDownload`](#-quick-start-usedownload)
 - [Core APIs](#-core-apis)
   - [Background Downloads](#background-downloads)
+  - [Download Controls](#download-controls)
   - [Multipart Uploads](#multipart-uploads)
+  - [Queue Management](#queue-management)
   - [File System (FS)](#file-system-fs)
   - [Zip & Unzip Archives](#zip--unzip-archives)
+  - [Cache Management](#cache-management)
   - [Media & Utilities](#media--utilities)
+  - [Event Listeners](#event-listeners)
 - [API Reference](#-api-reference)
 - [Expo Support](#-expo-support)
 - [Contributing](#-contributing)
@@ -159,19 +163,54 @@ export default function DownloadScreen() {
 For programmatic, queue-aware background downloads outside of React components.
 
 ```typescript
-import { download, setQueueOptions } from 'rn-file-toolkit';
-
-// Optimize global concurrency
-setQueueOptions({ maxConcurrent: 3 });
+import { download } from 'rn-file-toolkit';
 
 const result = await download({
   url: 'https://example.com/file.pdf',
+  fileName: 'report.pdf', // Optional custom filename
   destination: 'documents', // 'downloads' | 'cache' | 'documents'
+  background: true, // Survive app suspension
+  headers: { Authorization: 'Bearer token' },
   queue: true, // Join the managed queue
   priority: 'high', // 'high' | 'normal'
-  retry: { attempts: 3, delay: 1000 },
+  downloadId: 'my-unique-id', // Optional custom ID for tracking
+  notificationTitle: 'Downloading report…', // Android notification
+  notificationDescription: 'Please wait',
+  checksum: { hash: 'abc123...', algorithm: 'sha256' }, // Verify integrity
+  retry: {
+    attempts: 3,
+    delay: 1000,
+    onRetry: (attempt, error) => console.warn(`Retry #${attempt}: ${error}`),
+  },
   onProgress: (p) => console.log(`${p.percent.toFixed(1)}% downloaded`),
 });
+
+console.log(result.filePath); // Path to the downloaded file
+```
+
+### Download Controls
+
+Pause, resume, or cancel any active download by its ID—works both inside and outside React components.
+
+```typescript
+import {
+  download,
+  pauseDownload,
+  resumeDownload,
+  cancelDownload,
+} from 'rn-file-toolkit';
+
+// Start a download with a known ID
+const result = download({
+  url: 'https://example.com/large-video.mp4',
+  downloadId: 'video-1',
+  destination: 'documents',
+});
+
+// Later… pause, resume, or cancel by ID
+await pauseDownload('video-1');
+await resumeDownload('video-1');
+await cancelDownload('video-1');
 ```
 
 ### Multipart Uploads
@@ -185,21 +224,52 @@ const result = await upload({
   url: 'https://api.example.com/v1/upload',
   filePath: '/path/to/local/image.jpg',
   fieldName: 'file',
+  headers: { Authorization: 'Bearer token' },
   parameters: { userId: '123', folder: 'avatars' },
+  uploadId: 'upload-1', // Optional custom ID for tracking
   onProgress: (percent) => console.log(`Uploading: ${percent}%`),
 });
+
+console.log(result.status); // HTTP status code
+console.log(result.data); // Server response body
+```
+
+### Queue Management
+
+Control download concurrency globally and inspect the queue state.
+
+```typescript
+import { setQueueOptions, getQueueStatus } from 'rn-file-toolkit';
+
+// Set the maximum number of simultaneous downloads
+setQueueOptions({ maxConcurrent: 3 });
+
+// Inspect the queue at any time
+const status = getQueueStatus();
+console.log(status.active); // Currently downloading
+console.log(status.pending); // Waiting in queue
+console.log(status.maxConcurrent); // Concurrency cap
+```
+
+You can also retrieve all downloads currently running in the background (useful after app re-launch):
+
+```typescript
+import { getBackgroundDownloads } from 'rn-file-toolkit';
+
+const active = await getBackgroundDownloads();
+console.log(active); // Array of background download descriptors
 ```
 
 ### File System (FS)
 
-Perform native filesystem operations securely.
+Perform native filesystem operations securely. All methods are available both as the namespaced `fs` object and as standalone named exports.
 
 ```typescript
 import { fs } from 'rn-file-toolkit';
 
 // Check & Inspect
 const exists = await fs.exists('/path/to/data.json');
-const stats = await fs.stat('/path/to/data.json'); // { size, modified, isDir }
+const stats = await fs.stat('/path/to/data.json'); // { path, name, size, modified, isDir }
 
 // Read & Write
 await fs.writeFile('/path/to/data.txt', 'Hello World', 'utf8'); // Also supports 'base64'
@@ -213,18 +283,42 @@ await fs.moveFile('/path/old.txt', '/path/new.txt');
 await fs.deleteFile('/path/unwanted.txt');
 ```
 
+> **Tip:** You can also import each FS method individually:
+> ```typescript
+> import { exists, stat, readFile, writeFile, copyFile, moveFile, deleteFile, mkdir, ls } from 'rn-file-toolkit';
+> ```
+
 ### Zip & Unzip Archives
 
-Compress and extract archives directly on the device.
+Compress and extract archives directly on the device using native `java.util.zip` (Android) and `zlib` (iOS).
 
 ```typescript
 import { unzip, zip } from 'rn-file-toolkit';
 
 // Extract a downloaded zip
-await unzip('/path/to/bundle.zip', '/path/to/extract-folder');
+const unzipResult = await unzip('/path/to/bundle.zip', '/path/to/extract-folder');
+console.log(unzipResult.files); // List of extracted file paths
 
 // Compress user data before uploading
-await zip('/path/to/user-data-folder', '/path/to/backup.zip');
+const zipResult = await zip('/path/to/user-data-folder', '/path/to/backup.zip');
+console.log(zipResult.zipPath); // Path to the created archive
+```
+
+### Cache Management
+
+Inspect and clear files stored in the cache directory.
+
+```typescript
+import { getCachedFiles, clearCache } from 'rn-file-toolkit';
+
+// List all cached files with metadata
+const cache = await getCachedFiles();
+cache.files?.forEach((f) => {
+  console.log(f.fileName, f.filePath, f.size, f.modifiedAt);
+});
+
+// Wipe the entire cache directory
+await clearCache();
 ```
 
 ### Media & Utilities
@@ -239,18 +333,27 @@ import {
   openFile,
 } from 'rn-file-toolkit';
 
-// Base64 to File
+// Base64 to File (accepts raw base64 or data URIs)
 await saveBase64AsFile({
   base64Data: 'data:image/png;base64,...',
   destination: 'documents',
   fileName: 'image.png',
 });
 
-// URL to Base64 (Great for caching small images)
-const b64 = await urlToBase64({ url: 'https://example.com/icon.png' });
+// URL to Base64 (great for caching small images)
+const b64 = await urlToBase64({
+  url: 'https://example.com/icon.png',
+  headers: { Authorization: 'Bearer token' }, // Optional
+});
+console.log(b64.mimeType); // e.g. 'image/png'
+console.log(b64.dataUri); // Ready-to-use data URI string
 
 // Native Share Sheet
-await shareFile({ filePath: '/path/to/report.pdf' });
+await shareFile({
+  filePath: '/path/to/report.pdf',
+  title: 'Share report', // Optional
+  subject: 'Monthly report', // Optional (email subject)
+});
 
 // Open with default system app
 await openFile({
@@ -259,19 +362,111 @@ await openFile({
 });
 ```
 
+### Event Listeners
+
+Subscribe to global download and upload lifecycle events. Each listener returns an unsubscribe function.
+
+```typescript
+import {
+  onDownloadComplete,
+  onDownloadError,
+  onDownloadRetry,
+  onUploadProgress,
+} from 'rn-file-toolkit';
+
+// Fires when any download finishes successfully
+const unsub1 = onDownloadComplete((event) => {
+  console.log('Download done:', event);
+});
+
+// Fires when any download fails
+const unsub2 = onDownloadError((event) => {
+  console.error('Download failed:', event);
+});
+
+// Fires on each retry attempt (when retry is configured)
+const unsub3 = onDownloadRetry((event) => {
+  console.warn(`Retry #${event.attempt}:`, event.error);
+});
+
+// Fires on upload progress updates
+const unsub4 = onUploadProgress((event) => {
+  console.log(`Upload ${event.uploadId}: ${event.progress}%`);
+});
+
+// Clean up when done
+unsub1();
+unsub2();
+unsub3();
+unsub4();
+```
+
 ---
 
 ## 📚 API Reference
 
-| Interface           | Key Properties                                             | Description                             |
-| :------------------ | :--------------------------------------------------------- | :-------------------------------------- |
-| `DownloadOptions`   | `url`, `destination`, `queue`, `retry`, `onProgress`       | Configuration for downloading a file.   |
-| `UploadOptions`     | `url`, `filePath`, `fieldName`, `parameters`, `onProgress` | Configuration for multipart uploads.    |
-| `ProgressInfo`      | `percent`, `bytesDownloaded`, `speedBps`, `etaSeconds`     | Rich real-time progress payload.        |
-| `UseDownloadReturn` | `start`, `pause`, `resume`, `cancel`, `status`, `progress` | Hook state and control methods.         |
-| `FsStat`            | `size`, `modified`, `isDir`                                | Output of the filesystem `stat` method. |
+### Types & Interfaces
 
-_For advanced types and detailed parameter documentation, please refer to the source TypeScript definitions._
+| Interface | Key Properties | Description |
+| :--- | :--- | :--- |
+| `DownloadOptions` | `url`, `fileName`, `destination`, `background`, `headers`, `queue`, `priority`, `downloadId`, `checksum`, `retry`, `onProgress`, `notificationTitle`, `notificationDescription` | Full configuration for downloading a file. |
+| `UploadOptions` | `url`, `filePath`, `fieldName`, `headers`, `parameters`, `uploadId`, `onProgress` | Configuration for multipart uploads. |
+| `ProgressInfo` | `percent`, `bytesDownloaded`, `totalBytes`, `speedBps`, `etaSeconds` | Rich real-time download progress payload. |
+| `DownloadResult` | `success`, `filePath`, `downloadId`, `error` | Result returned after a download completes. |
+| `UploadResult` | `success`, `status`, `data`, `uploadId`, `error` | Result returned after an upload completes. |
+| `ActionResult` | `success`, `error` | Generic result for actions like pause/resume/cancel. |
+| `UseDownloadReturn` | `start`, `pause`, `resume`, `cancel`, `status`, `progress`, `result`, `downloadId` | Hook state and control methods. |
+| `FsApi` | `exists`, `stat`, `readFile`, `writeFile`, `copyFile`, `moveFile`, `deleteFile`, `mkdir`, `ls` | Namespaced filesystem API. |
+| `FsStat` | `path`, `name`, `size`, `modified`, `isDir` | Output of the filesystem `stat` method. |
+| `FsEncoding` | `'utf8'` \| `'base64'` | Encoding used for read/write operations. |
+| `QueueOptions` | `maxConcurrent` | Configuration for the download queue. |
+| `QueueStatus` | `active`, `pending`, `maxConcurrent` | Snapshot of the current queue state. |
+| `CachedFile` | `fileName`, `filePath`, `size`, `modifiedAt` | Metadata for a single cached file. |
+| `CacheResult` | `success`, `files`, `error` | Result of `getCachedFiles()`. |
+| `SaveBase64Options` | `base64Data`, `fileName`, `destination` | Options for saving a base64 string to a file. |
+| `SaveBase64Result` | `success`, `filePath`, `error` | Result of `saveBase64AsFile()`. |
+| `UrlToBase64Options` | `url`, `headers` | Options for converting a URL to base64. |
+| `UrlToBase64Result` | `success`, `base64`, `mimeType`, `dataUri`, `error` | Result of `urlToBase64()`. |
+| `ShareFileOptions` | `filePath`, `title`, `subject` | Options for the native share sheet. |
+| `OpenFileOptions` | `filePath`, `mimeType` | Options for opening a file with the system default app. |
+| `UnzipResult` | `success`, `destDir`, `files`, `error` | Result of `unzip()`. |
+| `ZipResult` | `success`, `zipPath`, `error` | Result of `zip()`. |
+
+### Exported Functions
+
+| Function | Signature | Description |
+| :--- | :--- | :--- |
+| `download` | `(options: DownloadOptions) => Promise<DownloadResult>` | Download a file (supports queue, background, retries). |
+| `upload` | `(options: UploadOptions) => Promise<UploadResult>` | Multipart upload a file. |
+| `pauseDownload` | `(id: string) => Promise<ActionResult>` | Pause an active download by ID. |
+| `resumeDownload` | `(id: string) => Promise<ActionResult>` | Resume a paused download by ID. |
+| `cancelDownload` | `(id: string) => Promise<ActionResult>` | Cancel a download by ID. |
+| `setQueueOptions` | `(options: QueueOptions) => void` | Set global queue concurrency. |
+| `getQueueStatus` | `() => QueueStatus` | Get current queue state (active/pending counts). |
+| `getBackgroundDownloads` | `() => Promise<any>` | Retrieve active background download descriptors. |
+| `getCachedFiles` | `() => Promise<CacheResult>` | List all files in the cache directory. |
+| `clearCache` | `() => Promise<ActionResult>` | Delete all cached files. |
+| `deleteFile` | `(path: string) => Promise<ActionResult>` | Delete a single file by path. |
+| `exists` | `(path: string) => Promise<boolean>` | Check if a file or directory exists. |
+| `stat` | `(path: string) => Promise<FsStat>` | Get metadata for a file or directory. |
+| `readFile` | `(path: string, encoding?: FsEncoding) => Promise<string>` | Read file contents as a string. |
+| `writeFile` | `(path: string, data: string, encoding?: FsEncoding) => Promise<void>` | Write a string to a file. |
+| `copyFile` | `(from: string, to: string) => Promise<void>` | Copy a file. |
+| `moveFile` | `(from: string, to: string) => Promise<void>` | Move or rename a file. |
+| `mkdir` | `(path: string) => Promise<void>` | Create a directory (recursive). |
+| `ls` | `(path: string) => Promise<string[]>` | List directory contents. |
+| `unzip` | `(src: string, dest: string) => Promise<UnzipResult>` | Extract a zip archive. |
+| `zip` | `(src: string, dest: string) => Promise<ZipResult>` | Compress a folder into a zip archive. |
+| `saveBase64AsFile` | `(options: SaveBase64Options) => Promise<SaveBase64Result>` | Save a base64 string as a file. |
+| `urlToBase64` | `(options: UrlToBase64Options) => Promise<UrlToBase64Result>` | Fetch a URL and return its content as base64. |
+| `shareFile` | `(options: ShareFileOptions) => Promise<ShareFileResult>` | Open the native share sheet for a file. |
+| `openFile` | `(options: OpenFileOptions) => Promise<OpenFileResult>` | Open a file with the system default app. |
+| `onDownloadComplete` | `(cb) => () => void` | Subscribe to download completion events. |
+| `onDownloadError` | `(cb) => () => void` | Subscribe to download error events. |
+| `onDownloadRetry` | `(cb) => () => void` | Subscribe to download retry events. |
+| `onUploadProgress` | `(cb) => () => void` | Subscribe to upload progress events. |
+| `useDownload` | `() => UseDownloadReturn` | React hook for managing a download with state. |
+| `fs` | `FsApi` | Namespaced object grouping all filesystem methods. |
 
 ---
 
