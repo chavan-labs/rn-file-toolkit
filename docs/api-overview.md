@@ -41,7 +41,10 @@ Result (`DownloadResult`):
 
 ### `pauseDownload(downloadId)` / `resumeDownload(downloadId)` / `cancelDownload(downloadId)`
 
-Control an active download by ID.
+Control an active download by ID. Returns `Promise<ActionResult>`:
+
+- `success: boolean`
+- `error?: string`
 
 ### `getBackgroundDownloads()`
 
@@ -129,8 +132,21 @@ You can call top-level methods or use the grouped `fs` object.
 
 ## Cache helpers
 
-- `getCachedFiles()`
-- `clearCache()`
+- `getCachedFiles(): Promise<CacheResult>`
+- `clearCache(): Promise<ActionResult>`
+
+`CacheResult` fields:
+
+- `success: boolean`
+- `files?: CachedFile[]`
+- `error?: string`
+
+`CachedFile` fields:
+
+- `fileName: string`
+- `filePath: string`
+- `size: number`
+- `modifiedAt: number`
 
 ## Base64 and media utilities
 
@@ -143,6 +159,12 @@ Options:
 - `destination?: 'downloads' | 'cache' | 'documents'`
 
 If a data URI is provided and `fileName` is omitted, file extension is inferred when possible.
+
+Result (`SaveBase64Result`):
+
+- `success: boolean`
+- `filePath?: string`
+- `error?: string`
 
 ### `urlToBase64(options)`
 
@@ -167,6 +189,12 @@ Options:
 - `title?`
 - `subject?`
 
+Result (`ShareFileResult`):
+
+- `success: boolean`
+- `completed?: boolean`
+- `error?: string`
+
 ### `openFile(options)`
 
 Options:
@@ -174,12 +202,28 @@ Options:
 - `filePath`
 - `mimeType?`
 
+Result (`OpenFileResult`):
+
+- `success: boolean`
+- `error?: string`
+
 ## Archive APIs
 
-- `zip(sourcePath, destinationZipPath)`
-- `unzip(sourceZipPath, destinationDir)`
+- `zip(sourcePath, destinationZipPath): Promise<ZipResult>`
+- `unzip(sourceZipPath, destinationDir): Promise<UnzipResult>`
 
-Both return `{ success, ... }` with error info when operation fails.
+`ZipResult` fields:
+
+- `success: boolean`
+- `zipPath?: string`
+- `error?: string`
+
+`UnzipResult` fields:
+
+- `success: boolean`
+- `destDir?: string`
+- `files?: string[]`
+- `error?: string`
 
 ## Events
 
