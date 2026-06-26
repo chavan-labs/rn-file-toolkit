@@ -225,6 +225,134 @@ Result (`OpenFileResult`):
 - `files?: string[]`
 - `error?: string`
 
+## Disk Space
+
+### `df()`
+
+Returns free and total disk space in bytes.
+
+Result (`DiskSpaceResult`):
+
+- `success: boolean`
+- `freeBytes?: number`
+- `totalBytes?: number`
+- `error?: string`
+
+Also available as `fs.df()`.
+
+## File Appending
+
+### `appendFile(path, data, encoding?)`
+
+Appends data to an existing file (creates the file if it doesn't exist). Unlike `writeFile`, this does not overwrite existing content.
+
+- `path: string` — target file path
+- `data: string` — content to append
+- `encoding?: 'utf8' | 'base64'` — defaults to `utf8`
+
+Throws on failure (consistent with `writeFile`).
+
+Also available as `fs.appendFile()`.
+
+## File Hashing
+
+### `hash(filePath, algorithm?)`
+
+Computes the hash digest of a file on disk.
+
+- `filePath: string` — path to the file
+- `algorithm?: 'md5' | 'sha1' | 'sha256'` — defaults to `md5`
+
+Result (`HashResult`):
+
+- `success: boolean`
+- `hash?: string` — hex-encoded hash string
+- `error?: string`
+
+Also available as `fs.hash()`.
+
+## Session Management
+
+Group downloaded/created files into named sessions for batch management.
+
+### `session.add(sessionId, filePath)`
+
+Register a file path under a session.
+
+### `session.get(sessionId)`
+
+Returns `string[]` — all file paths in the session.
+
+### `session.clear(sessionId)`
+
+Deletes all files in the session from disk and removes the session. Returns `Promise<ActionResult>`.
+
+### `session.clearAll()`
+
+Clears all sessions and their files. Returns `Promise<ActionResult>`.
+
+> **Note:** Session management runs entirely in JavaScript. Session data does not persist across app restarts.
+
+## Cookie Management
+
+### `getCookies(domain)`
+
+Returns cookies matching the given domain from the platform's shared cookie store.
+
+- `domain: string` — the domain to match
+
+Result (`CookiesResult`):
+
+- `success: boolean`
+- `cookies?: Cookie[]`
+- `error?: string`
+
+`Cookie` fields:
+
+- `name: string`
+- `value: string`
+- `domain: string`
+- `path: string`
+- `expiresDate?: number` (timestamp in ms, iOS only)
+- `isSecure?: boolean` (iOS only)
+- `isHTTPOnly?: boolean` (iOS only)
+
+Also available as `cookies.get(domain)`.
+
+### `clearCookies(domain?)`
+
+Clears cookies matching the given domain. Pass an empty string `''` to clear **all** cookies.
+
+- `domain?: string` — defaults to `''` (clear all)
+
+Returns `Promise<ActionResult>`.
+
+Also available as `cookies.clear(domain)`.
+
+## MediaStore / Photos Library
+
+### `saveToMediaStore(options)`
+
+Saves a file to the device's shared media store (Android MediaStore API / iOS Photos Library).
+
+Options (`MediaStoreOptions`):
+
+- `filePath: string` (required) — path to the source file
+- `mediaType?: 'image' | 'video' | 'audio' | 'download'` — defaults to `download`
+- `album?: string` — optional album/subfolder name
+
+Result (`MediaStoreResult`):
+
+- `success: boolean`
+- `uri?: string` — content URI (Android) or file path (iOS)
+- `error?: string`
+
+**Platform notes:**
+
+- **Android:** Uses `MediaStore` ContentResolver API on Android 10+ (scoped storage). Falls back to public directory copy + `MediaScannerConnection` on Android 9-.
+- **iOS:** Uses `PHPhotoLibrary` for images and videos. For audio/download types, copies the file to the Documents directory (iOS has no shared media store for these types).
+- **Permissions:** The host app must include `NSPhotoLibraryAddUsageDescription` in `Info.plist` for iOS. Android may require `WRITE_EXTERNAL_STORAGE` on API < 29.
+
 ## Events
 
 Subscribe helpers:

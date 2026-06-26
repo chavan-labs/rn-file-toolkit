@@ -1327,6 +1327,279 @@ class FileToolkitModule(private val reactContext: ReactApplicationContext) :
     zos.closeEntry()
   }
 
+  // ─── df (disk space) ──────────────────────────────────────────────────────
+
+  override fun df(promise: Promise) {
+    try {
+      val stat = android.os.StatFs(Environment.getDataDirectory().path)
+      val freeBytes = stat.availableBytes
+      val totalBytes = stat.totalBytes
+
+      promise.resolve(Arguments.createMap().apply {
+        putBoolean("success", true)
+        putDouble("freeBytes", freeBytes.toDouble())
+        putDouble("totalBytes", totalBytes.toDouble())
+      })
+    } catch (e: Throwable) {
+      promise.resolve(Arguments.createMap().apply {
+        putBoolean("success", false)
+        putString("error", e.message ?: "DF_ERROR")
+      })
+    }
+  }
+
+  // ─── appendFile ───────────────────────────────────────────────────────────
+
+  override fun appendFile(filePath: String, data: String, encoding: String, promise: Promise) {
+    try {
+      val file = File(filePath)
+      if (!file.exists()) {
+        // Create parent dirs and the file if it doesn't exist
+        file.parentFile?.mkdirs()
+      }
+
+      if (encoding.equals("base64", ignoreCase = true)) {
+        val bytes = android.util.Base64.decode(data, android.util.Base64.DEFAULT)
+        FileOutputStream(file, true).use { fos ->
+          fos.write(bytes)
+        }
+      } else {
+        FileOutputStream(file, true).use { fos ->
+          fos.write(data.toByteArray(Charsets.UTF_8))
+        }
+      }
+
+      promise.resolve(Arguments.createMap().apply {
+        putBoolean("success", true)
+      })
+    } catch (e: Throwable) {
+      promise.resolve(Arguments.createMap().apply {
+        putBoolean("success", false)
+        putString("error", e.message ?: "APPEND_FILE_ERROR")
+      })
+    }
+  }
+
+  // ─── hash ─────────────────────────────────────────────────────────────────
+
+  override fun hash(filePath: String, algorithm: String, promise: Promise) {
+    try {
+      val file = File(filePath)
+      if (!file.exists() || file.isDirectory) {
+        promise.resolve(Arguments.createMap().apply {
+          putBoolean("success", false)
+          putString("error", "File not found: $filePath")
+        })
+        return
+      }
+
+      val hashValue = calculateChecksum(file, algorithm)
+
+      promise.resolve(Arguments.createMap().apply {
+        putBoolean("success", true)
+        putString("hash", hashValue)
+      })
+    } catch (e: Throwable) {
+      promise.resolve(Arguments.createMap().apply {
+        putBoolean("success", false)
+        putString("error", e.message ?: "HASH_ERROR")
+      })
+    }
+  }
+
+  // ─── getCookies ───────────────────────────────────────────────────────────
+
+  override fun getCookies(domain: String, promise: Promise) {
+    try {
+      val cookieManager = android.webkit.CookieManager.getInstance()
+      val cookieString = cookieManager.getCookie(domain)
+
+      val cookiesArray = Arguments.createArray()
+
+      if (!cookieString.isNullOrBlank()) {
+        // CookieManager returns cookies as "name1=value1; name2=value2; ..."
+        cookieString.split(";").forEach { pair ->
+          val trimmed = pair.trim()
+          val eqIndex = trimmed.indexOf("=")
+          if (eqIndex > 0) {
+            val name = trimmed.substring(0, eqIndex)
+            val value = trimmed.substring(eqIndex + 1)
+            cookiesArray.pushMap(Arguments.createMap().apply {
+              putString("name", name)
+              putString("value", value)
+              putString("domain", domain)
+              putString("path", "/")
+            })
+          }
+        }
+      }
+
+      promise.resolve(Arguments.createMap().apply {
+        putBoolean("success", true)
+        putArray("cookies", cookiesArray)
+      })
+    } catch (e: Throwable) {
+      promise.resolve(Arguments.createMap().apply {
+        putBoolean("success", false)
+        putString("error", e.message ?: "GET_COOKIES_ERROR")
+      })
+    }
+  }
+
+  // ─── clearCookies ─────────────────────────────────────────────────────────
+
+  override fun clearCookies(domain: String, promise: Promise) {
+    try {
+      val cookieManager = android.webkit.CookieManager.getInstance()
+
+      if (domain.isBlank()) {
+        // Clear ALL cookies
+        cookieManager.removeAllCookies { success ->
+          promise.resolve(Arguments.createMap().apply {
+            putBoolean("success", success)
+          })
+        }
+      } else {
+        // Android CookieManager does not support per-domain clearing directly.
+        // We read cookies for the domain and set each to expired.
+        val cookieString = cookieManager.getCookie(domain)
+        if (!cookieString.isNullOrBlank()) {
+          cookieString.split(";").forEach { pair ->
+            val trimmed = pair.trim()
+            val eqIndex = trimmed.indexOf("=")
+            if (eqIndex > 0) {
+              val name = trimmed.substring(0, eqIndex)
+              cookieManager.setCookie(domain, "$name=; Expires=Thu, 01 Jan 1970 00:00:00 GMT")
+            }
+          }
+          cookieManager.flush()
+        }
+        promise.resolve(Arguments.createMap().apply {
+          putBoolean("success", true)
+        })
+      }
+    } catch (e: Throwable) {
+      promise.resolve(Arguments.createMap().apply {
+        putBoolean("success", false)
+        putString("error", e.message ?: "CLEAR_COOKIES_ERROR")
+      })
+    }
+  }
+
+  // ─── saveToMediaStore ─────────────────────────────────────────────────────
+
+  override fun saveToMediaStore(options: ReadableMap, promise: Promise) {
+    val filePath = options.getString("filePath")
+    if (filePath.isNullOrBlank()) {
+      promise.resolve(Arguments.createMap().apply {
+        putBoolean("success", false)
+        putString("error", "filePath is required")
+      })
+      return
+    }
+
+    val mediaType = if (options.hasKey("mediaType")) options.getString("mediaType") else "download"
+    val album = if (options.hasKey("album")) options.getString("album") else null
+
+    thread {
+      try {
+        val file = File(filePath)
+        if (!file.exists()) {
+          promise.resolve(Arguments.createMap().apply {
+            putBoolean("success", false)
+            putString("error", "File not found: $filePath")
+          })
+          return@thread
+        }
+
+        val mimeType = getMimeType(filePath)
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+          // Android 10+ — use MediaStore ContentResolver API
+          val contentUri = when (mediaType) {
+            "image" -> android.provider.MediaStore.Images.Media.getContentUri(android.provider.MediaStore.VOLUME_EXTERNAL_PRIMARY)
+            "video" -> android.provider.MediaStore.Video.Media.getContentUri(android.provider.MediaStore.VOLUME_EXTERNAL_PRIMARY)
+            "audio" -> android.provider.MediaStore.Audio.Media.getContentUri(android.provider.MediaStore.VOLUME_EXTERNAL_PRIMARY)
+            else -> android.provider.MediaStore.Downloads.getContentUri(android.provider.MediaStore.VOLUME_EXTERNAL_PRIMARY)
+          }
+
+          val relativePath = when (mediaType) {
+            "image" -> if (album != null) "${Environment.DIRECTORY_PICTURES}/$album" else Environment.DIRECTORY_PICTURES
+            "video" -> if (album != null) "${Environment.DIRECTORY_MOVIES}/$album" else Environment.DIRECTORY_MOVIES
+            "audio" -> if (album != null) "${Environment.DIRECTORY_MUSIC}/$album" else Environment.DIRECTORY_MUSIC
+            else -> if (album != null) "${Environment.DIRECTORY_DOWNLOADS}/$album" else Environment.DIRECTORY_DOWNLOADS
+          }
+
+          val values = android.content.ContentValues().apply {
+            put(android.provider.MediaStore.MediaColumns.DISPLAY_NAME, file.name)
+            put(android.provider.MediaStore.MediaColumns.MIME_TYPE, mimeType)
+            put(android.provider.MediaStore.MediaColumns.RELATIVE_PATH, relativePath)
+            put(android.provider.MediaStore.MediaColumns.IS_PENDING, 1)
+          }
+
+          val resolver = reactContext.contentResolver
+          val uri = resolver.insert(contentUri, values)
+
+          if (uri == null) {
+            promise.resolve(Arguments.createMap().apply {
+              putBoolean("success", false)
+              putString("error", "Failed to create MediaStore entry")
+            })
+            return@thread
+          }
+
+          resolver.openOutputStream(uri)?.use { outputStream ->
+            FileInputStream(file).use { inputStream ->
+              val buffer = ByteArray(8192)
+              var count: Int
+              while (inputStream.read(buffer).also { count = it } != -1) {
+                outputStream.write(buffer, 0, count)
+              }
+            }
+          }
+
+          values.clear()
+          values.put(android.provider.MediaStore.MediaColumns.IS_PENDING, 0)
+          resolver.update(uri, values, null, null)
+
+          promise.resolve(Arguments.createMap().apply {
+            putBoolean("success", true)
+            putString("uri", uri.toString())
+          })
+        } else {
+          // Android 9 and below — copy to public directory and media-scan
+          val destDir = when (mediaType) {
+            "image" -> Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES)
+            "video" -> Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MOVIES)
+            "audio" -> Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MUSIC)
+            else -> Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+          }
+
+          val albumDir = if (album != null) File(destDir, album) else destDir
+          albumDir.mkdirs()
+          val destFile = File(albumDir, file.name)
+          file.copyTo(destFile, overwrite = true)
+
+          android.media.MediaScannerConnection.scanFile(
+            reactContext,
+            arrayOf(destFile.absolutePath),
+            arrayOf(mimeType)
+          ) { _, scannedUri ->
+            promise.resolve(Arguments.createMap().apply {
+              putBoolean("success", true)
+              putString("uri", scannedUri?.toString() ?: destFile.absolutePath)
+            })
+          }
+        }
+      } catch (e: Exception) {
+        promise.resolve(Arguments.createMap().apply {
+          putBoolean("success", false)
+          putString("error", e.message ?: "MEDIA_STORE_ERROR")
+        })
+      }
+    }
+  }
+
   companion object {
     const val NAME = NativeFileToolkitSpec.NAME
   }

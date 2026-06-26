@@ -32,6 +32,12 @@
   - [Zip & Unzip Archives](#zip--unzip-archives)
   - [Cache Management](#cache-management)
   - [Media & Utilities](#media--utilities)
+  - [Disk Space](#disk-space)
+  - [File Appending](#file-appending)
+  - [File Hashing](#file-hashing)
+  - [Session Management](#session-management)
+  - [Cookie Management](#cookie-management)
+  - [MediaStore / Photos Library](#mediastore--photos-library)
   - [Event Listeners](#event-listeners)
 - [API Reference](#-api-reference)
 - [Expo Support](#-expo-support)
@@ -50,7 +56,10 @@ Most React Native file solutions (`rn-fetch-blob`, `react-native-fs`) are fragme
 - 🚦 **Smart Queueing:** Cap concurrency and set priorities without touching native code.
 - 🛡️ **Resilient:** Auto-retries on network errors with exponential backoff and HTTP resume.
 - 🗜️ **Zero-Dependency Zip:** Uses native `java.util.zip` and iOS `zlib`.
-- 🗄️ **Rich File System API:** Comprehensive FS methods (`readFile`, `writeFile`, `copyFile`, `mkdir`, `stat`, etc.).
+- 🗄️ **Rich File System API:** Comprehensive FS methods (`readFile`, `writeFile`, `appendFile`, `copyFile`, `mkdir`, `stat`, `hash`, `df`, etc.).
+- 🍪 **Cookie Management:** Read and clear HTTP cookies from the platform's shared cookie store.
+- 📸 **MediaStore / Photos Library:** Save files directly to the device's shared media store.
+- 📦 **Session Management:** Group files into named sessions for batch cleanup.
 - 🛠️ **Expo Compatible:** Seamless integration with Expo custom dev clients.
 
 ---
@@ -401,6 +410,122 @@ unsub3();
 unsub4();
 ```
 
+### Disk Space
+
+Check available and total device storage.
+
+```typescript
+import { df } from 'rn-file-toolkit';
+// or: import { fs } from 'rn-file-toolkit'; const result = await fs.df();
+
+const space = await df();
+if (space.success) {
+  console.log(`Free: ${(space.freeBytes! / 1024 / 1024 / 1024).toFixed(2)} GB`);
+  console.log(`Total: ${(space.totalBytes! / 1024 / 1024 / 1024).toFixed(2)} GB`);
+}
+```
+
+### File Appending
+
+Append data to the end of a file without overwriting existing content.
+
+```typescript
+import { appendFile } from 'rn-file-toolkit';
+
+// Append a log line
+await appendFile('/path/to/log.txt', 'New log entry\n');
+
+// Append base64 data
+await appendFile('/path/to/data.bin', base64String, 'base64');
+```
+
+### File Hashing
+
+Compute the MD5, SHA-1, or SHA-256 hash of any file on disk.
+
+```typescript
+import { hash } from 'rn-file-toolkit';
+
+const result = await hash('/path/to/file.zip', 'sha256');
+if (result.success) {
+  console.log('SHA-256:', result.hash);
+}
+```
+
+### Session Management
+
+Group downloaded files into sessions for batch cleanup. Useful for temporary file workflows.
+
+```typescript
+import { session, download } from 'rn-file-toolkit';
+
+// Download files and track them in a session
+const result = await download({ url: 'https://example.com/tmp1.pdf', destination: 'cache' });
+if (result.filePath) session.add('my-workflow', result.filePath);
+
+const result2 = await download({ url: 'https://example.com/tmp2.pdf', destination: 'cache' });
+if (result2.filePath) session.add('my-workflow', result2.filePath);
+
+// List session files
+console.log(session.get('my-workflow')); // ['/path/to/tmp1.pdf', '/path/to/tmp2.pdf']
+
+// Clean up everything when done
+await session.clear('my-workflow');
+```
+
+> **Note:** Session data lives in memory and does not persist across app restarts.
+
+### Cookie Management
+
+Read and clear HTTP cookies from the platform's shared cookie store.
+
+```typescript
+import { getCookies, clearCookies } from 'rn-file-toolkit';
+// or: import { cookies } from 'rn-file-toolkit';
+
+// Get cookies for a domain
+const result = await getCookies('example.com');
+result.cookies?.forEach((c) => {
+  console.log(`${c.name}=${c.value} (domain: ${c.domain})`);
+});
+
+// Clear cookies for a specific domain
+await clearCookies('example.com');
+
+// Clear ALL cookies
+await clearCookies();
+```
+
+### MediaStore / Photos Library
+
+Save files to the device's shared media store (Android MediaStore / iOS Photos Library).
+
+```typescript
+import { saveToMediaStore } from 'rn-file-toolkit';
+
+// Save an image to the Photos library / gallery
+const result = await saveToMediaStore({
+  filePath: '/path/to/photo.jpg',
+  mediaType: 'image',
+  album: 'MyApp',  // Optional album/subfolder
+});
+console.log(result.uri); // content://... (Android) or file path (iOS)
+
+// Save a video
+await saveToMediaStore({
+  filePath: '/path/to/video.mp4',
+  mediaType: 'video',
+});
+
+// Save to the Downloads folder
+await saveToMediaStore({
+  filePath: '/path/to/report.pdf',
+  mediaType: 'download',
+});
+```
+
+> **Permissions:** iOS requires `NSPhotoLibraryAddUsageDescription` in your `Info.plist` for image/video saves. Android may require `WRITE_EXTERNAL_STORAGE` on API < 29.
+
 ---
 
 ## 📚 API Reference
@@ -416,7 +541,7 @@ unsub4();
 | `UploadResult` | `success`, `status`, `data`, `uploadId`, `error` | Result returned after an upload completes. |
 | `ActionResult` | `success`, `error` | Generic result for actions like pause/resume/cancel. |
 | `UseDownloadReturn` | `start`, `pause`, `resume`, `cancel`, `status`, `progress`, `result`, `downloadId` | Hook state and control methods. |
-| `FsApi` | `exists`, `stat`, `readFile`, `writeFile`, `copyFile`, `moveFile`, `deleteFile`, `mkdir`, `ls` | Namespaced filesystem API. |
+| `FsApi` | `exists`, `stat`, `readFile`, `writeFile`, `appendFile`, `copyFile`, `moveFile`, `deleteFile`, `mkdir`, `ls`, `df`, `hash` | Namespaced filesystem API. |
 | `FsStat` | `path`, `name`, `size`, `modified`, `isDir` | Output of the filesystem `stat` method. |
 | `FsEncoding` | `'utf8'` \| `'base64'` | Encoding used for read/write operations. |
 | `QueueOptions` | `maxConcurrent` | Configuration for the download queue. |
@@ -466,7 +591,28 @@ unsub4();
 | `onDownloadRetry` | `(cb) => () => void` | Subscribe to download retry events. |
 | `onUploadProgress` | `(cb) => () => void` | Subscribe to upload progress events. |
 | `useDownload` | `() => UseDownloadReturn` | React hook for managing a download with state. |
-| `fs` | `FsApi` | Namespaced object grouping all filesystem methods. |
+| `df` | `() => Promise<DiskSpaceResult>` | Get free and total device disk space. |
+| `appendFile` | `(path: string, data: string, encoding?: FsEncoding) => Promise<void>` | Append data to a file. |
+| `hash` | `(path: string, algorithm?: HashAlgorithm) => Promise<HashResult>` | Compute a file's hash digest. |
+| `getCookies` | `(domain: string) => Promise<CookiesResult>` | Get cookies for a domain. |
+| `clearCookies` | `(domain?: string) => Promise<ActionResult>` | Clear cookies (domain or all). |
+| `saveToMediaStore` | `(options: MediaStoreOptions) => Promise<MediaStoreResult>` | Save file to shared media store. |
+| `fs` | `FsApi` | Namespaced object grouping all filesystem methods (includes `df`, `appendFile`, `hash`). |
+| `cookies` | `{ get, clear }` | Namespaced cookie management. |
+| `session` | `SessionApi` | Namespaced session management. |
+
+### New Types & Interfaces
+
+| Interface | Key Properties | Description |
+| :--- | :--- | :--- |
+| `DiskSpaceResult` | `success`, `freeBytes`, `totalBytes`, `error` | Result of `df()`. |
+| `HashAlgorithm` | `'md5'` \| `'sha1'` \| `'sha256'` | Algorithm for file hashing. |
+| `HashResult` | `success`, `hash`, `error` | Result of `hash()`. |
+| `Cookie` | `name`, `value`, `domain`, `path`, `expiresDate`, `isSecure`, `isHTTPOnly` | A single cookie entry. |
+| `CookiesResult` | `success`, `cookies`, `error` | Result of `getCookies()`. |
+| `MediaStoreOptions` | `filePath`, `mediaType`, `album` | Options for saving to the media store. |
+| `MediaStoreResult` | `success`, `uri`, `error` | Result of `saveToMediaStore()`. |
+| `SessionApi` | `add`, `get`, `clear`, `clearAll` | Session management methods. |
 
 ---
 

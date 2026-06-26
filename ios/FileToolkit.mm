@@ -2,6 +2,7 @@
 #import <React/RCTLog.h>
 #import <CommonCrypto/CommonDigest.h>
 #import <UIKit/UIKit.h>
+#import <Photos/Photos.h>
 #import "FileToolkit.h"
 #include <zlib.h>
 
@@ -1572,6 +1573,225 @@ RCT_EXPORT_METHOD(zip:(NSString *)sourcePath
         [fh closeFile];
         resolve(@{@"success": @YES, @"zipPath": destPath});
     });
+}
+
+// ─── df (disk space) ──────────────────────────────────────────────────────
+
+- (void)df:(RCTPromiseResolveBlock)resolve reject:(RCTPromiseRejectBlock)reject {
+    @try {
+        NSFileManager *fm = [NSFileManager defaultManager];
+        NSString *docPath = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+        NSError *error = nil;
+        NSDictionary *attrs = [fm attributesOfFileSystemForPath:docPath error:&error];
+        if (error || !attrs) {
+            resolve(@{@"success": @NO, @"error": error.localizedDescription ?: @"DF_ERROR"});
+            return;
+        }
+
+        NSNumber *freeBytes = attrs[NSFileSystemFreeSize];
+        NSNumber *totalBytes = attrs[NSFileSystemSize];
+
+        resolve(@{
+            @"success": @YES,
+            @"freeBytes": freeBytes ?: @0,
+            @"totalBytes": totalBytes ?: @0
+        });
+    } @catch (NSException *exception) {
+        resolve(@{@"success": @NO, @"error": exception.reason ?: @"DF_ERROR"});
+    }
+}
+
+// ─── appendFile ───────────────────────────────────────────────────────────
+
+- (void)appendFile:(NSString *)filePath data:(NSString *)data encoding:(NSString *)encoding resolve:(RCTPromiseResolveBlock)resolve reject:(RCTPromiseRejectBlock)reject {
+    @try {
+        NSFileManager *fm = [NSFileManager defaultManager];
+
+        // Create parent dirs if needed
+        NSString *parent = [filePath stringByDeletingLastPathComponent];
+        if (parent.length > 0) {
+            [fm createDirectoryAtPath:parent withIntermediateDirectories:YES attributes:nil error:nil];
+        }
+
+        // Create the file if it doesn't exist
+        if (![fm fileExistsAtPath:filePath]) {
+            [fm createFileAtPath:filePath contents:nil attributes:nil];
+        }
+
+        NSFileHandle *fileHandle = [NSFileHandle fileHandleForWritingAtPath:filePath];
+        if (!fileHandle) {
+            resolve(@{@"success": @NO, @"error": @"Cannot open file for appending"});
+            return;
+        }
+
+        [fileHandle seekToEndOfFile];
+
+        NSData *dataToWrite = nil;
+        if ([[encoding lowercaseString] isEqualToString:@"base64"]) {
+            dataToWrite = [[NSData alloc] initWithBase64EncodedString:data options:NSDataBase64DecodingIgnoreUnknownCharacters];
+            if (!dataToWrite) {
+                [fileHandle closeFile];
+                resolve(@{@"success": @NO, @"error": @"Invalid base64 string"});
+                return;
+            }
+        } else {
+            dataToWrite = [data dataUsingEncoding:NSUTF8StringEncoding];
+        }
+
+        [fileHandle writeData:dataToWrite];
+        [fileHandle closeFile];
+
+        resolve(@{@"success": @YES});
+    } @catch (NSException *exception) {
+        resolve(@{@"success": @NO, @"error": exception.reason ?: @"APPEND_FILE_ERROR"});
+    }
+}
+
+// ─── hash ─────────────────────────────────────────────────────────────────
+
+- (void)hash:(NSString *)filePath algorithm:(NSString *)algorithm resolve:(RCTPromiseResolveBlock)resolve reject:(RCTPromiseRejectBlock)reject {
+    @try {
+        NSFileManager *fm = [NSFileManager defaultManager];
+        BOOL isDir = NO;
+        if (![fm fileExistsAtPath:filePath isDirectory:&isDir] || isDir) {
+            resolve(@{@"success": @NO, @"error": [NSString stringWithFormat:@"File not found: %@", filePath]});
+            return;
+        }
+
+        NSString *hashValue = [self calculateChecksumForPath:filePath algorithm:[algorithm uppercaseString]];
+        if (!hashValue) {
+            resolve(@{@"success": @NO, @"error": @"Failed to compute hash"});
+            return;
+        }
+
+        resolve(@{
+            @"success": @YES,
+            @"hash": hashValue
+        });
+    } @catch (NSException *exception) {
+        resolve(@{@"success": @NO, @"error": exception.reason ?: @"HASH_ERROR"});
+    }
+}
+
+// ─── getCookies ───────────────────────────────────────────────────────────
+
+- (void)getCookies:(NSString *)domain resolve:(RCTPromiseResolveBlock)resolve reject:(RCTPromiseRejectBlock)reject {
+    @try {
+        NSHTTPCookieStorage *storage = [NSHTTPCookieStorage sharedHTTPCookieStorage];
+        NSArray<NSHTTPCookie *> *allCookies = [storage cookies];
+        NSMutableArray *result = [NSMutableArray new];
+
+        for (NSHTTPCookie *cookie in allCookies) {
+            // Match cookies whose domain ends with the requested domain
+            if (domain.length == 0 || [cookie.domain hasSuffix:domain] || [domain hasSuffix:cookie.domain]) {
+                NSMutableDictionary *cookieDict = [NSMutableDictionary dictionaryWithDictionary:@{
+                    @"name": cookie.name ?: @"",
+                    @"value": cookie.value ?: @"",
+                    @"domain": cookie.domain ?: @"",
+                    @"path": cookie.path ?: @"/"
+                }];
+
+                if (cookie.expiresDate) {
+                    cookieDict[@"expiresDate"] = @([cookie.expiresDate timeIntervalSince1970] * 1000);
+                }
+                cookieDict[@"isSecure"] = @(cookie.isSecure);
+                cookieDict[@"isHTTPOnly"] = @(cookie.isHTTPOnly);
+
+                [result addObject:cookieDict];
+            }
+        }
+
+        resolve(@{@"success": @YES, @"cookies": result});
+    } @catch (NSException *exception) {
+        resolve(@{@"success": @NO, @"error": exception.reason ?: @"GET_COOKIES_ERROR"});
+    }
+}
+
+// ─── clearCookies ─────────────────────────────────────────────────────────
+
+- (void)clearCookies:(NSString *)domain resolve:(RCTPromiseResolveBlock)resolve reject:(RCTPromiseRejectBlock)reject {
+    @try {
+        NSHTTPCookieStorage *storage = [NSHTTPCookieStorage sharedHTTPCookieStorage];
+
+        if (domain.length == 0) {
+            // Clear ALL cookies
+            NSArray<NSHTTPCookie *> *allCookies = [storage cookies];
+            for (NSHTTPCookie *cookie in allCookies) {
+                [storage deleteCookie:cookie];
+            }
+        } else {
+            // Clear cookies matching the domain
+            NSArray<NSHTTPCookie *> *allCookies = [storage cookies];
+            for (NSHTTPCookie *cookie in allCookies) {
+                if ([cookie.domain hasSuffix:domain] || [domain hasSuffix:cookie.domain]) {
+                    [storage deleteCookie:cookie];
+                }
+            }
+        }
+
+        resolve(@{@"success": @YES});
+    } @catch (NSException *exception) {
+        resolve(@{@"success": @NO, @"error": exception.reason ?: @"CLEAR_COOKIES_ERROR"});
+    }
+}
+
+// ─── saveToMediaStore ─────────────────────────────────────────────────────
+
+RCT_REMAP_METHOD(saveToMediaStore,
+                 mediaStoreOptions:(NSDictionary *)options
+                 mediaStoreResolver:(RCTPromiseResolveBlock)resolve
+                 mediaStoreRejecter:(RCTPromiseRejectBlock)reject)
+{
+    NSString *filePath = options[@"filePath"];
+    if (!filePath || filePath.length == 0) {
+        resolve(@{@"success": @NO, @"error": @"filePath is required"});
+        return;
+    }
+
+    if (![[NSFileManager defaultManager] fileExistsAtPath:filePath]) {
+        resolve(@{@"success": @NO, @"error": [NSString stringWithFormat:@"File not found: %@", filePath]});
+        return;
+    }
+
+    NSString *mediaType = options[@"mediaType"] ?: @"download";
+
+    if ([mediaType isEqualToString:@"image"] || [mediaType isEqualToString:@"video"]) {
+        // Use Photos framework for images and videos
+        PHPhotoLibrary *photoLibrary = [PHPhotoLibrary sharedPhotoLibrary];
+
+        [photoLibrary performChanges:^{
+            NSURL *fileURL = [NSURL fileURLWithPath:filePath];
+            if ([mediaType isEqualToString:@"image"]) {
+                [PHAssetChangeRequest creationRequestForAssetFromImageAtFileURL:fileURL];
+            } else {
+                [PHAssetChangeRequest creationRequestForAssetFromVideoAtFileURL:fileURL];
+            }
+        } completionHandler:^(BOOL success, NSError *error) {
+            if (success) {
+                resolve(@{@"success": @YES, @"uri": filePath});
+            } else {
+                resolve(@{@"success": @NO, @"error": error.localizedDescription ?: @"Failed to save to Photos"});
+            }
+        }];
+    } else {
+        // For audio/download types, copy to Documents directory (iOS has no shared media store for these)
+        dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+            NSString *fileName = [filePath lastPathComponent];
+            NSURL *docsDir = [[NSFileManager defaultManager]
+                URLsForDirectory:NSDocumentDirectory inDomains:NSUserDomainMask].firstObject;
+            NSURL *destURL = [docsDir URLByAppendingPathComponent:fileName];
+
+            NSError *copyError = nil;
+            [[NSFileManager defaultManager] removeItemAtURL:destURL error:nil];
+            BOOL ok = [[NSFileManager defaultManager] copyItemAtPath:filePath toPath:destURL.path error:&copyError];
+
+            if (ok) {
+                resolve(@{@"success": @YES, @"uri": destURL.path});
+            } else {
+                resolve(@{@"success": @NO, @"error": copyError.localizedDescription ?: @"MEDIA_STORE_ERROR"});
+            }
+        });
+    }
 }
 
 @end

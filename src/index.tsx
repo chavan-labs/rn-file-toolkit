@@ -136,6 +136,56 @@ export interface FsStat {
   isDir: boolean;
 }
 
+export interface DiskSpaceResult {
+  success: boolean;
+  freeBytes?: number;
+  totalBytes?: number;
+  error?: string;
+}
+
+export type HashAlgorithm = 'md5' | 'sha1' | 'sha256';
+
+export interface HashResult {
+  success: boolean;
+  hash?: string;
+  error?: string;
+}
+
+export interface Cookie {
+  name: string;
+  value: string;
+  domain: string;
+  path: string;
+  expiresDate?: number;
+  isSecure?: boolean;
+  isHTTPOnly?: boolean;
+}
+
+export interface CookiesResult {
+  success: boolean;
+  cookies?: Cookie[];
+  error?: string;
+}
+
+export interface MediaStoreOptions {
+  filePath: string;
+  mediaType?: 'image' | 'video' | 'audio' | 'download';
+  album?: string;
+}
+
+export interface MediaStoreResult {
+  success: boolean;
+  uri?: string;
+  error?: string;
+}
+
+export interface SessionApi {
+  add: (sessionId: string, filePath: string) => void;
+  get: (sessionId: string) => string[];
+  clear: (sessionId: string) => Promise<ActionResult>;
+  clearAll: () => Promise<ActionResult>;
+}
+
 export interface FsApi {
   exists: (filePath: string) => Promise<boolean>;
   stat: (filePath: string) => Promise<FsStat>;
@@ -145,11 +195,18 @@ export interface FsApi {
     data: string,
     encoding?: FsEncoding
   ) => Promise<void>;
+  appendFile: (
+    filePath: string,
+    data: string,
+    encoding?: FsEncoding
+  ) => Promise<void>;
   copyFile: (fromPath: string, toPath: string) => Promise<void>;
   moveFile: (fromPath: string, toPath: string) => Promise<void>;
   deleteFile: (filePath: string) => Promise<void>;
   mkdir: (dirPath: string) => Promise<void>;
   ls: (dirPath: string) => Promise<string[]>;
+  df: () => Promise<DiskSpaceResult>;
+  hash: (filePath: string, algorithm?: HashAlgorithm) => Promise<HashResult>;
 }
 
 export interface QueueOptions {
@@ -226,8 +283,8 @@ const _globalQueue = new DownloadQueue();
 
 function _generateId(): string {
   return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
-    const r = (Math.random() * 16) | 0;
-    const v = c === 'x' ? r : (r & 0x3) | 0x8;
+    const r = Math.floor(Math.random() * 16);
+    const v = c === 'x' ? r : (r % 4) + 8;
     return v.toString(16);
   });
 }
@@ -468,11 +525,125 @@ export async function ls(path: string): Promise<string[]> {
   return res.entries || [];
 }
 
+export async function df(): Promise<DiskSpaceResult> {
+  try {
+    return await (FileToolkitModule as any).df();
+  } catch (err: any) {
+    return { success: false, error: err.message || 'DF_ERROR' };
+  }
+}
+
+export async function appendFile(
+  path: string,
+  data: string,
+  enc: FsEncoding = 'utf8'
+): Promise<void> {
+  const res = await (FileToolkitModule as any).appendFile(path, data, enc);
+  _ensure(res, 'APPEND_ERROR');
+}
+
+export async function hash(
+  path: string,
+  algorithm: HashAlgorithm = 'md5'
+): Promise<HashResult> {
+  try {
+    return await (FileToolkitModule as any).hash(path, algorithm);
+  } catch (err: any) {
+    return { success: false, error: err.message || 'HASH_ERROR' };
+  }
+}
+
+export async function getCookies(domain: string): Promise<CookiesResult> {
+  try {
+    return await (FileToolkitModule as any).getCookies(domain);
+  } catch (err: any) {
+    return { success: false, error: err.message || 'GET_COOKIES_ERROR' };
+  }
+}
+
+export async function clearCookies(domain: string = ''): Promise<ActionResult> {
+  try {
+    return await (FileToolkitModule as any).clearCookies(domain);
+  } catch (err: any) {
+    return { success: false, error: err.message || 'CLEAR_COOKIES_ERROR' };
+  }
+}
+
+export async function saveToMediaStore(
+  opts: MediaStoreOptions
+): Promise<MediaStoreResult> {
+  try {
+    return await (FileToolkitModule as any).saveToMediaStore({
+      filePath: opts.filePath,
+      mediaType: opts.mediaType ?? 'download',
+      album: opts.album,
+    });
+  } catch (err: any) {
+    return { success: false, error: err.message || 'MEDIA_STORE_ERROR' };
+  }
+}
+
+// ─── Session Management (JS-only) ──────────────────────────────────────────
+
+const _sessionRegistry = new Map<string, Set<string>>();
+
+function _sessionAdd(sessionId: string, filePath: string): void {
+  let set = _sessionRegistry.get(sessionId);
+  if (!set) {
+    set = new Set();
+    _sessionRegistry.set(sessionId, set);
+  }
+  set.add(filePath);
+}
+
+function _sessionGet(sessionId: string): string[] {
+  const set = _sessionRegistry.get(sessionId);
+  return set ? Array.from(set) : [];
+}
+
+async function _sessionClear(sessionId: string): Promise<ActionResult> {
+  const set = _sessionRegistry.get(sessionId);
+  if (!set) return { success: true };
+  const errors: string[] = [];
+  for (const filePath of set) {
+    const res = await deleteFile(filePath);
+    if (!res.success && res.error) errors.push(res.error);
+  }
+  _sessionRegistry.delete(sessionId);
+  return errors.length > 0
+    ? { success: false, error: errors.join('; ') }
+    : { success: true };
+}
+
+async function _sessionClearAll(): Promise<ActionResult> {
+  const errors: string[] = [];
+  for (const [sessionId] of _sessionRegistry) {
+    const res = await _sessionClear(sessionId);
+    if (!res.success && res.error) errors.push(res.error);
+  }
+  return errors.length > 0
+    ? { success: false, error: errors.join('; ') }
+    : { success: true };
+}
+
+export const session: SessionApi = {
+  add: _sessionAdd,
+  get: _sessionGet,
+  clear: _sessionClear,
+  clearAll: _sessionClearAll,
+};
+
+export const cookies = {
+  get: getCookies,
+  clear: clearCookies,
+};
+
 export const fs: FsApi = {
   exists,
   stat,
   readFile,
   writeFile,
+  appendFile,
   copyFile,
   moveFile,
   deleteFile: async (p) => {
@@ -480,6 +651,8 @@ export const fs: FsApi = {
   },
   mkdir,
   ls,
+  df,
+  hash,
 };
 
 export function onDownloadComplete(cb: any) {
@@ -676,11 +849,19 @@ export default {
   stat,
   readFile,
   writeFile,
+  appendFile,
   copyFile,
   moveFile,
   mkdir,
   ls,
+  df,
+  hash,
+  getCookies,
+  clearCookies,
+  saveToMediaStore,
   fs,
+  cookies,
+  session,
   useDownload,
   unzip,
   zip,

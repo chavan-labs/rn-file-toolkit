@@ -24,6 +24,12 @@ export interface Spec extends TurboModule {
   openFile(filePath: string, mimeType: string): Promise<Object>;
   unzip(sourcePath: string, destDir: string): Promise<Object>;
   zip(sourcePath: string, destPath: string): Promise<Object>;
+  df(): Promise<Object>;
+  appendFile(filePath: string, data: string, encoding: string): Promise<Object>;
+  hash(filePath: string, algorithm: string): Promise<Object>;
+  getCookies(domain: string): Promise<Object>;
+  clearCookies(domain: string): Promise<Object>;
+  saveToMediaStore(options: Object): Promise<Object>;
 }
 
 export default TurboModuleRegistry.getEnforcing<Spec>('FileToolkit');
