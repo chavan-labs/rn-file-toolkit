@@ -91,6 +91,13 @@ RCT_EXPORT_MODULE()
         [[NSFileManager defaultManager] createDirectoryAtURL:dirURL withIntermediateDirectories:YES attributes:nil error:nil];
     }
     
+    // Use a toolkit-owned subdirectory for cache and documents to avoid
+    // conflicts with the app's own files (clearCache only removes this folder)
+    if ([destType isEqualToString:@"cache"] || [destType isEqualToString:@"documents"]) {
+        dirURL = [dirURL URLByAppendingPathComponent:@"RNFileToolkit"];
+        [[NSFileManager defaultManager] createDirectoryAtURL:dirURL withIntermediateDirectories:YES attributes:nil error:nil];
+    }
+    
     return [dirURL URLByAppendingPathComponent:fileName];
 }
 
@@ -239,10 +246,12 @@ RCT_EXPORT_MODULE()
             URLsForDirectory:NSDocumentDirectory inDomains:NSUserDomainMask].firstObject;
         downloadsDir = [fallbackDocs URLByAppendingPathComponent:@"Downloads"];
     }
-    NSURL *cacheDir = [[NSFileManager defaultManager]
-        URLsForDirectory:NSCachesDirectory inDomains:NSUserDomainMask].firstObject;
-    NSURL *docsDir = [[NSFileManager defaultManager]
-        URLsForDirectory:NSDocumentDirectory inDomains:NSUserDomainMask].firstObject;
+    NSURL *cacheDir = [[[NSFileManager defaultManager]
+        URLsForDirectory:NSCachesDirectory inDomains:NSUserDomainMask].firstObject
+        URLByAppendingPathComponent:@"RNFileToolkit"];
+    NSURL *docsDir = [[[NSFileManager defaultManager]
+        URLsForDirectory:NSDocumentDirectory inDomains:NSUserDomainMask].firstObject
+        URLByAppendingPathComponent:@"RNFileToolkit"];
 
     NSMutableArray<NSURL *> *dirs = [NSMutableArray new];
     if (downloadsDir) [dirs addObject:downloadsDir];
@@ -292,15 +301,15 @@ RCT_EXPORT_MODULE()
 // ─── clearCache ───────────────────────────────────────────────────────────────
 
 - (void)clearCache:(RCTPromiseResolveBlock)resolve reject:(RCTPromiseRejectBlock)reject {
-    // Only clear app-private directories — never touch Downloads
+    // Only clear the toolkit-owned subdirectory — never touch the app's own files or Downloads
     NSURL *cacheDir = [[NSFileManager defaultManager]
         URLsForDirectory:NSCachesDirectory inDomains:NSUserDomainMask].firstObject;
     NSURL *docsDir = [[NSFileManager defaultManager]
         URLsForDirectory:NSDocumentDirectory inDomains:NSUserDomainMask].firstObject;
 
     NSMutableArray<NSURL *> *dirs = [NSMutableArray new];
-    if (cacheDir) [dirs addObject:cacheDir];
-    if (docsDir) [dirs addObject:docsDir];
+    if (cacheDir) [dirs addObject:[cacheDir URLByAppendingPathComponent:@"RNFileToolkit"]];
+    if (docsDir) [dirs addObject:[docsDir URLByAppendingPathComponent:@"RNFileToolkit"]];
 
     for (NSURL *dirURL in dirs) {
         NSArray<NSURL *> *files = [[NSFileManager defaultManager]

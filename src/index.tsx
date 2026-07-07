@@ -370,13 +370,24 @@ async function _executeDownload(
   };
 
   try {
-    const result = await (FileToolkitModule as any).download({
+    // Strip JS-only fields — functions cannot be serialized across the native bridge
+    const nativeOpts: any = {
       ...options,
       downloadId,
       background: options.background ?? false,
       headers: options.headers ?? {},
       destination: options.destination ?? 'downloads',
-    });
+    };
+    delete nativeOpts.onProgress;
+    delete nativeOpts.queue;
+    delete nativeOpts.priority;
+    if (nativeOpts.retry) {
+      nativeOpts.retry = {
+        attempts: nativeOpts.retry.attempts,
+        delay: nativeOpts.retry.delay,
+      };
+    }
+    const result = await (FileToolkitModule as any).download(nativeOpts);
     cleanup();
     return result as DownloadResult;
   } catch (error: any) {
@@ -399,13 +410,16 @@ export async function upload(options: UploadOptions): Promise<UploadResult> {
     });
   }
   try {
-    const res = await (FileToolkitModule as any).upload({
+    // Strip onProgress callback — functions cannot be serialized across the native bridge
+    const nativeUploadOpts: any = {
       ...options,
       uploadId,
       fieldName: options.fieldName ?? 'file',
       headers: options.headers ?? {},
       parameters: options.parameters ?? {},
-    });
+    };
+    delete nativeUploadOpts.onProgress;
+    const res = await (FileToolkitModule as any).upload(nativeUploadOpts);
     sub?.remove();
     return { ...res, uploadId } as UploadResult;
   } catch (err: any) {

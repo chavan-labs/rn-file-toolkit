@@ -99,11 +99,17 @@ class FileToolkitModule(private val reactContext: ReactApplicationContext) :
 
   private fun getDestinationFile(fileName: String, destination: String?): File {
     return when (destination) {
-      "cache" -> File(reactContext.cacheDir, fileName)
+      "cache" -> {
+        val dir = File(reactContext.cacheDir, "RNFileToolkit")
+        dir.mkdirs()
+        File(dir, fileName)
+      }
       "documents" -> {
         // getExternalFilesDir can return null if external storage is unavailable
-        val dir = reactContext.getExternalFilesDir(Environment.DIRECTORY_DOCUMENTS)
+        val baseDir = reactContext.getExternalFilesDir(Environment.DIRECTORY_DOCUMENTS)
           ?: reactContext.filesDir
+        val dir = File(baseDir, "RNFileToolkit")
+        dir.mkdirs()
         File(dir, fileName)
       }
       else -> File(
@@ -531,8 +537,11 @@ class FileToolkitModule(private val reactContext: ReactApplicationContext) :
       // Scan all three directories: public downloads, cache, documents
       val dirs = listOfNotNull(
         Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS),
-        reactContext.cacheDir,
-        reactContext.getExternalFilesDir(Environment.DIRECTORY_DOCUMENTS) ?: reactContext.filesDir
+        File(reactContext.cacheDir, "RNFileToolkit"),
+        File(
+          reactContext.getExternalFilesDir(Environment.DIRECTORY_DOCUMENTS) ?: reactContext.filesDir,
+          "RNFileToolkit"
+        )
       )
 
       for (dir in dirs) {
@@ -573,13 +582,16 @@ class FileToolkitModule(private val reactContext: ReactApplicationContext) :
 
   override fun clearCache(promise: Promise) {
     try {
-      // Only clear app-private directories — never touch public Downloads
+      // Only clear the toolkit-owned subdirectory — never touch the app's own files or public Downloads
       val dirs = listOfNotNull(
-        reactContext.cacheDir,
-        reactContext.getExternalFilesDir(Environment.DIRECTORY_DOCUMENTS) ?: reactContext.filesDir
+        File(reactContext.cacheDir, "RNFileToolkit"),
+        File(
+          reactContext.getExternalFilesDir(Environment.DIRECTORY_DOCUMENTS) ?: reactContext.filesDir,
+          "RNFileToolkit"
+        )
       )
       for (dir in dirs) {
-        dir.listFiles()?.forEach { it.delete() }
+        dir.listFiles()?.forEach { it.deleteRecursively() }
       }
       promise.resolve(Arguments.createMap().apply { putBoolean("success", true) })
     } catch (e: Exception) {
