@@ -12,7 +12,7 @@
 
 ---
 
-**rn-file-toolkit** is the modern replacement for legacy file libraries. Download, upload, manage queues, extract archives, and interact with the filesystem—all powered by pure native implementations (Kotlin + Swift) with **zero third-party dependencies**.
+**rn-file-toolkit** is the modern replacement for legacy file libraries. Download, upload, manage queues, extract archives, and interact with the filesystem—all powered by pure native implementations (Kotlin + Objective-C++) with **zero third-party dependencies**.
 
 ⭐ **Star this repo if you find it useful to help others discover it!**
 

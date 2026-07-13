@@ -1,8 +1,10 @@
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+          xmlns:tools="http://schemas.android.com/tools">
   <application>
     <provider
       android:name="androidx.core.content.FileProvider"
-      android:authorities="${applicationId}.fileprovider"
+      android:authorities="${applicationId}.rn_file_toolkit.provider"
+      tools:replace="android:authorities"
       android:exported="false"
       android:grantUriPermissions="true">
       <meta-data

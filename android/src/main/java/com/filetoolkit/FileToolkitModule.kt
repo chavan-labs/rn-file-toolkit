@@ -59,8 +59,9 @@ class FileToolkitModule(private val reactContext: ReactApplicationContext) :
     override fun run() {
       if (bgDownloadIds.isNotEmpty()) {
         pollBackgroundDownloads()
+        bgPollHandler.postDelayed(this, 1500)
       }
-      bgPollHandler.postDelayed(this, 1500)
+      // Stop polling when no background downloads remain
     }
   }
 
@@ -80,6 +81,22 @@ class FileToolkitModule(private val reactContext: ReactApplicationContext) :
     } else {
       reactContext.registerReceiver(downloadReceiver, filter)
     }
+  }
+
+  override fun invalidate() {
+    super.invalidate()
+    try {
+      reactContext.unregisterReceiver(downloadReceiver)
+    } catch (_: Exception) {} // Receiver may not be registered
+    bgPollHandler.removeCallbacks(bgPollRunnable)
+  }
+
+  override fun addListener(eventName: String?) {
+    // No-op - Required by React Native NativeEventEmitter
+  }
+
+  override fun removeListeners(count: Double) {
+    // No-op - Required by React Native NativeEventEmitter
   }
 
   // ─── Helpers ───────────────────────────────────────────────────────────────
@@ -112,10 +129,12 @@ class FileToolkitModule(private val reactContext: ReactApplicationContext) :
         dir.mkdirs()
         File(dir, fileName)
       }
-      else -> File(
-        Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS),
-        fileName
-      )
+      else -> {
+        // Use app-specific downloads directory to avoid scoped storage issues on Android 10+
+        val dir = File(reactContext.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS) ?: reactContext.filesDir, "RNFileToolkit")
+        dir.mkdirs()
+        File(dir, fileName)
+      }
     }
   }
 
@@ -168,7 +187,13 @@ class FileToolkitModule(private val reactContext: ReactApplicationContext) :
     val baseDelay = retryMap?.takeIf { it.hasKey("delay") }?.getInt("delay") ?: 1000
 
     val state = DownloadState(url = urlString, fileName = fileName, isBackground = isBackground)
-    activeDownloads[downloadId] = state
+    // Only add foreground downloads to activeDownloads — the state object is used
+    // exclusively by the foreground pause/cancel logic.  Background downloads are
+    // managed through bgDownloadIds / DownloadManager; adding them here created a
+    // race window where cancelDownload could see the state but not yet the bgId.
+    if (!isBackground) {
+      activeDownloads[downloadId] = state
+    }
 
     if (isBackground) {
       // Use system DownloadManager — survives process death
@@ -183,11 +208,23 @@ class FileToolkitModule(private val reactContext: ReactApplicationContext) :
           if (value is String) addRequestHeader(key, value)
         }
 
-        // Set destination
+        // Set destination — mirror the RNFileToolkit subdirectory used by getDestinationFile
         when (destination) {
-          "cache" -> setDestinationInExternalFilesDir(reactContext, null, fileName) // No specific 'cache' directory in DownloadManager, use files
-          "documents" -> setDestinationInExternalFilesDir(reactContext, Environment.DIRECTORY_DOCUMENTS, fileName)
-          else -> setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, fileName)
+          "cache" -> {
+            val dir = File(reactContext.getExternalFilesDir(null) ?: reactContext.filesDir, "RNFileToolkit")
+            dir.mkdirs()
+            setDestinationUri(android.net.Uri.fromFile(File(dir, fileName)))
+          }
+          "documents" -> {
+            val dir = File(reactContext.getExternalFilesDir(Environment.DIRECTORY_DOCUMENTS) ?: reactContext.filesDir, "RNFileToolkit")
+            dir.mkdirs()
+            setDestinationUri(android.net.Uri.fromFile(File(dir, fileName)))
+          }
+          else -> {
+            val dir = File(reactContext.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS) ?: reactContext.filesDir, "RNFileToolkit")
+            dir.mkdirs()
+            setDestinationUri(android.net.Uri.fromFile(File(dir, fileName)))
+          }
         }
       }
       val bgId = dm.enqueue(request)
@@ -216,6 +253,8 @@ class FileToolkitModule(private val reactContext: ReactApplicationContext) :
         // ── Before retry: emit event + wait with exponential backoff ───────
         if (attempt > 0) {
           state.bytesDownloaded = 0L          // fresh download on retry
+          getDestinationFile(fileName, destination).delete() // Fix #5: Delete corrupted partial file
+
           val delayMs = (baseDelay.toLong() * (1L shl (attempt - 1))).coerceAtMost(30_000L)
           // Bug #5 fix: emit retry event BEFORE the delay so JS callback fires immediately
           val retryEvt = Arguments.createMap().apply {
@@ -225,7 +264,16 @@ class FileToolkitModule(private val reactContext: ReactApplicationContext) :
             putString("error", lastError)
           }
           emit("onDownloadRetry", retryEvt)
-          Thread.sleep(delayMs)
+          // Interruptible retry delay — respects cancel and responds to pause
+          val deadline = System.currentTimeMillis() + delayMs
+          while (System.currentTimeMillis() < deadline) {
+            if (state.cancelled) break
+            Thread.sleep(minOf(deadline - System.currentTimeMillis(), 100L).coerceAtLeast(0L))
+          }
+          // Wait while paused (checked after the retry delay, also respects cancel)
+          while (state.paused && !state.cancelled) {
+            Thread.sleep(100L)
+          }
         }
 
         try {
@@ -349,16 +397,21 @@ class FileToolkitModule(private val reactContext: ReactApplicationContext) :
             }
           }
 
-          foregroundPromises.remove(downloadId)?.resolve(Arguments.createMap().apply {
+          val resolvedPromise = foregroundPromises.remove(downloadId)
+          resolvedPromise?.resolve(Arguments.createMap().apply {
             putBoolean("success", true)
             putString("downloadId", downloadId)
             putString("filePath", destFile.absolutePath)
           })
-          emit("onDownloadComplete", Arguments.createMap().apply {
-            putBoolean("success", true)
-            putString("downloadId", downloadId)
-            putString("filePath", destFile.absolutePath)
-          })
+          // Only emit the event when there is no foreground promise (background-style usage),
+          // matching iOS behaviour where onDownloadComplete fires only for background downloads.
+          if (resolvedPromise == null) {
+            emit("onDownloadComplete", Arguments.createMap().apply {
+              putBoolean("success", true)
+              putString("downloadId", downloadId)
+              putString("filePath", destFile.absolutePath)
+            })
+          }
           break@retryLoop // ✅ success
 
         } catch (e: Exception) {
@@ -401,78 +454,75 @@ class FileToolkitModule(private val reactContext: ReactApplicationContext) :
     val dm = reactContext.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
     val query = DownloadManager.Query()
     val cursor = dm.query(query) ?: return
-    
     val currentBgIds = bgDownloadIds.values.toSet()
-    
-    if (cursor.moveToFirst()) {
-      val descIdx = cursor.getColumnIndex(DownloadManager.COLUMN_DESCRIPTION)
-      val idIdx = cursor.getColumnIndex(DownloadManager.COLUMN_ID)
-      val statusIdx = cursor.getColumnIndex(DownloadManager.COLUMN_STATUS)
-      val totalIdx = cursor.getColumnIndex(DownloadManager.COLUMN_TOTAL_SIZE_BYTES)
-      val currentIdx = cursor.getColumnIndex(DownloadManager.COLUMN_BYTES_DOWNLOADED_SO_FAR)
-      
-      do {
-        val bgId = cursor.getLong(idIdx)
-        if (!currentBgIds.contains(bgId)) continue
-
-        val description = cursor.getString(descIdx) ?: ""
-        if (description.startsWith("rn-file-toolkit-id:")) {
-          val downloadId = description.removePrefix("rn-file-toolkit-id:")
-          val status = cursor.getInt(statusIdx)
-          val total = cursor.getLong(totalIdx)
-          val current = cursor.getLong(currentIdx)
-          
-          if (status == DownloadManager.STATUS_RUNNING || status == DownloadManager.STATUS_PENDING) {
-            val progress = if (total > 0) (current * 100 / total).toInt() else 0
-            val evt = Arguments.createMap().apply {
-              putString("downloadId", downloadId)
-              putInt("progress", progress)
-              putDouble("bytesDownloaded", current.toDouble())
-              putDouble("totalBytes", total.toDouble())
+    cursor.use { c ->
+      if (c.moveToFirst()) {
+        val descIdx = c.getColumnIndex(DownloadManager.COLUMN_DESCRIPTION)
+        val idIdx = c.getColumnIndex(DownloadManager.COLUMN_ID)
+        val statusIdx = c.getColumnIndex(DownloadManager.COLUMN_STATUS)
+        val totalIdx = c.getColumnIndex(DownloadManager.COLUMN_TOTAL_SIZE_BYTES)
+        val currentIdx = c.getColumnIndex(DownloadManager.COLUMN_BYTES_DOWNLOADED_SO_FAR)
+        do {
+          val bgId = c.getLong(idIdx)
+          if (!currentBgIds.contains(bgId)) continue
+          val description = c.getString(descIdx) ?: ""
+          if (description.startsWith("rn-file-toolkit-id:")) {
+            val downloadId = description.removePrefix("rn-file-toolkit-id:")
+            val status = c.getInt(statusIdx)
+            val total = c.getLong(totalIdx)
+            val current = c.getLong(currentIdx)
+            if (status == DownloadManager.STATUS_RUNNING || status == DownloadManager.STATUS_PENDING) {
+              val progress = if (total > 0) (current * 100 / total).toInt() else 0
+              val evt = Arguments.createMap().apply {
+                putString("downloadId", downloadId)
+                putInt("progress", progress)
+                putDouble("bytesDownloaded", current.toDouble())
+                putDouble("totalBytes", total.toDouble())
+              }
+              emit("onDownloadProgress", evt)
             }
-            emit("onDownloadProgress", evt)
           }
-        }
-      } while (cursor.moveToNext())
+        } while (c.moveToNext())
+      }
     }
-    cursor.close()
   }
 
   private fun handleBackgroundDownloadComplete(bgId: Long) {
     val dm = reactContext.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
     val query = DownloadManager.Query().setFilterById(bgId)
     val cursor = dm.query(query) ?: return
-    if (cursor.moveToFirst()) {
-      val descIdx = cursor.getColumnIndex(DownloadManager.COLUMN_DESCRIPTION)
-      val statusIdx = cursor.getColumnIndex(DownloadManager.COLUMN_STATUS)
-      val uriIdx = cursor.getColumnIndex(DownloadManager.COLUMN_LOCAL_URI)
-      val reasonIdx = cursor.getColumnIndex(DownloadManager.COLUMN_REASON)
+    cursor.use {
+      if (it.moveToFirst()) {
+        val descIdx = it.getColumnIndex(DownloadManager.COLUMN_DESCRIPTION)
+        val statusIdx = it.getColumnIndex(DownloadManager.COLUMN_STATUS)
+        val uriIdx = it.getColumnIndex(DownloadManager.COLUMN_LOCAL_URI)
+        val reasonIdx = it.getColumnIndex(DownloadManager.COLUMN_REASON)
 
-      val description = cursor.getString(descIdx) ?: ""
-      if (description.startsWith("rn-file-toolkit-id:")) {
-        val downloadId = description.removePrefix("rn-file-toolkit-id:")
-        val status = cursor.getInt(statusIdx)
-        bgDownloadIds.remove(downloadId) // cleanup
+        val description = it.getString(descIdx) ?: ""
+        if (description.startsWith("rn-file-toolkit-id:")) {
+          val downloadId = description.removePrefix("rn-file-toolkit-id:")
+          val status = it.getInt(statusIdx)
+          bgDownloadIds.remove(downloadId) // cleanup
 
-        if (status == DownloadManager.STATUS_SUCCESSFUL) {
-          val localUri = cursor.getString(uriIdx)
-          val filePath = localUri?.removePrefix("file://") ?: ""
-          emit("onDownloadComplete", Arguments.createMap().apply {
-            putBoolean("success", true)
-            putString("downloadId", downloadId)
-            putString("filePath", filePath)
-          })
-        } else {
-          val reason = cursor.getInt(reasonIdx)
-          emit("onDownloadError", Arguments.createMap().apply {
-            putBoolean("success", false)
-            putString("downloadId", downloadId)
-            putString("error", "DownloadManager failed with reason/code: $reason")
-          })
+          if (status == DownloadManager.STATUS_SUCCESSFUL) {
+            val localUri = it.getString(uriIdx)
+            val filePath = localUri?.removePrefix("file://") ?: ""
+            emit("onDownloadComplete", Arguments.createMap().apply {
+              putBoolean("success", true)
+              putString("downloadId", downloadId)
+              putString("filePath", filePath)
+            })
+          } else {
+            val reason = it.getInt(reasonIdx)
+            emit("onDownloadError", Arguments.createMap().apply {
+              putBoolean("success", false)
+              putString("downloadId", downloadId)
+              putString("error", "DownloadManager failed with reason/code: $reason")
+            })
+          }
         }
       }
     }
-    cursor.close()
   }
 
   // ─── executeDownload (Foreground) ─────────────────────────────────────────────────────────
@@ -534,9 +584,9 @@ class FileToolkitModule(private val reactContext: ReactApplicationContext) :
     try {
       val list = Arguments.createArray()
 
-      // Scan all three directories: public downloads, cache, documents
+      // Scan only toolkit-owned subdirectories to avoid returning files from other apps
       val dirs = listOfNotNull(
-        Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS),
+        File(reactContext.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS) ?: reactContext.filesDir, "RNFileToolkit"),
         File(reactContext.cacheDir, "RNFileToolkit"),
         File(
           reactContext.getExternalFilesDir(Environment.DIRECTORY_DOCUMENTS) ?: reactContext.filesDir,
@@ -760,15 +810,10 @@ class FileToolkitModule(private val reactContext: ReactApplicationContext) :
 
       val renamed = src.renameTo(dst)
       if (!renamed) {
-        if (src.isDirectory) {
-          promise.resolve(Arguments.createMap().apply {
-            putBoolean("success", false)
-            putString("error", "Moving directories is not supported")
-          })
-          return
-        }
-        src.copyTo(dst, overwrite = true)
-        src.delete()
+        // renameTo fails across filesystems for both files and directories.
+        // Fall back to recursive copy + delete, which works in all cases.
+        src.copyRecursively(dst, overwrite = true)
+        src.deleteRecursively()
       }
 
       promise.resolve(Arguments.createMap().apply {
@@ -838,32 +883,33 @@ class FileToolkitModule(private val reactContext: ReactApplicationContext) :
       val cursor = dm.query(query)
       val results = Arguments.createArray()
 
-      if (cursor != null && cursor.moveToFirst()) {
-        val descIdx = cursor.getColumnIndex(DownloadManager.COLUMN_DESCRIPTION)
-        val idIdx = cursor.getColumnIndex(DownloadManager.COLUMN_ID)
-        val statusIdx = cursor.getColumnIndex(DownloadManager.COLUMN_STATUS)
-        val uriIdx = cursor.getColumnIndex(DownloadManager.COLUMN_URI)
-        val totalIdx = cursor.getColumnIndex(DownloadManager.COLUMN_TOTAL_SIZE_BYTES)
-        val currentIdx = cursor.getColumnIndex(DownloadManager.COLUMN_BYTES_DOWNLOADED_SO_FAR)
+      cursor?.use { c ->
+        if (c.moveToFirst()) {
+          val descIdx = c.getColumnIndex(DownloadManager.COLUMN_DESCRIPTION)
+          val idIdx = c.getColumnIndex(DownloadManager.COLUMN_ID)
+          val statusIdx = c.getColumnIndex(DownloadManager.COLUMN_STATUS)
+          val uriIdx = c.getColumnIndex(DownloadManager.COLUMN_URI)
+          val totalIdx = c.getColumnIndex(DownloadManager.COLUMN_TOTAL_SIZE_BYTES)
+          val currentIdx = c.getColumnIndex(DownloadManager.COLUMN_BYTES_DOWNLOADED_SO_FAR)
 
-        do {
-          val description = cursor.getString(descIdx) ?: ""
-          if (description.startsWith("rn-file-toolkit-id:")) {
-            val downloadId = description.removePrefix("rn-file-toolkit-id:")
-            val status = cursor.getInt(statusIdx)
-            val total = cursor.getLong(totalIdx)
-            val current = cursor.getLong(currentIdx)
-            val progress = if (total > 0) (current * 100 / total).toInt() else 0
+          do {
+            val description = c.getString(descIdx) ?: ""
+            if (description.startsWith("rn-file-toolkit-id:")) {
+              val downloadId = description.removePrefix("rn-file-toolkit-id:")
+              val status = c.getInt(statusIdx)
+              val total = c.getLong(totalIdx)
+              val current = c.getLong(currentIdx)
+              val progress = if (total > 0) (current * 100 / total).toInt() else 0
 
-            results.pushMap(Arguments.createMap().apply {
-              putString("downloadId", downloadId)
-              putString("url", cursor.getString(uriIdx))
-              putInt("status", status)
-              putInt("progress", progress)
-            })
-          }
-        } while (cursor.moveToNext())
-        cursor.close()
+              results.pushMap(Arguments.createMap().apply {
+                putString("downloadId", downloadId)
+                putString("url", c.getString(uriIdx))
+                putInt("status", status)
+                putInt("progress", progress)
+              })
+            }
+          } while (c.moveToNext())
+        }
       }
 
       promise.resolve(Arguments.createMap().apply {
@@ -916,12 +962,31 @@ class FileToolkitModule(private val reactContext: ReactApplicationContext) :
         connection.requestMethod = "POST"
         connection.setRequestProperty("Connection", "Keep-Alive")
         connection.setRequestProperty("Content-Type", "multipart/form-data; boundary=$boundary")
-        connection.setChunkedStreamingMode(0)
 
         // Add custom headers
         headersMap?.toHashMap()?.forEach { (key, value) ->
           if (value is String) connection.setRequestProperty(key, value)
         }
+
+        // Pre-calculate the exact body size so we can use fixed-length streaming.
+        // Chunked transfer encoding (the old approach) is rejected by many upload
+        // endpoints (e.g. S3 presigned URLs, Google Cloud Storage) with 411/400.
+        val charset = Charsets.UTF_8
+        var bodySize = 0L
+        paramsMap?.toHashMap()?.forEach { (key, value) ->
+          bodySize += (twoHyphens + boundary + lineEnd).toByteArray(charset).size
+          bodySize += ("Content-Disposition: form-data; name=\"$key\"" + lineEnd).toByteArray(charset).size
+          bodySize += ("Content-Type: text/plain; charset=UTF-8" + lineEnd + lineEnd).toByteArray(charset).size
+          bodySize += (value.toString() + lineEnd).toByteArray(charset).size
+        }
+        bodySize += (twoHyphens + boundary + lineEnd).toByteArray(charset).size
+        bodySize += ("Content-Disposition: form-data; name=\"$fieldName\"; filename=\"${file.name}\"" + lineEnd).toByteArray(charset).size
+        bodySize += ("Content-Type: application/octet-stream" + lineEnd + lineEnd).toByteArray(charset).size
+        bodySize += file.length()
+        bodySize += lineEnd.toByteArray(charset).size
+        bodySize += (twoHyphens + boundary + twoHyphens + lineEnd).toByteArray(charset).size
+
+        connection.setFixedLengthStreamingMode(bodySize)
 
         val output = connection.outputStream
         val writer = output.bufferedWriter()
@@ -969,16 +1034,24 @@ class FileToolkitModule(private val reactContext: ReactApplicationContext) :
           writer.write(lineEnd)
           writer.write(twoHyphens + boundary + twoHyphens + lineEnd)
           writer.flush()
-          writer.close()
         } finally {
+          // Guarantee streams are closed even if an exception is thrown while writing.
+          try { writer.close() } catch (_: Exception) {}
           try { fileInput.close() } catch (_: Exception) {}
         }
 
-        val responseCode = connection.responseCode
-        val responseBody = if (responseCode in 200..299) {
-          connection.inputStream.bufferedReader().use { it.readText() }
-        } else {
-          connection.errorStream?.bufferedReader()?.use { it.readText() } ?: ""
+        val responseCode: Int
+        val responseBody: String
+        try {
+          responseCode = connection.responseCode
+          responseBody = if (responseCode in 200..299) {
+            connection.inputStream.bufferedReader().use { it.readText() }
+          } else {
+            connection.errorStream?.bufferedReader()?.use { it.readText() } ?: ""
+          }
+        } finally {
+          // Guarantee the connection is released even if reading the response throws.
+          try { connection.disconnect() } catch (_: Exception) {}
         }
 
         promise.resolve(Arguments.createMap().apply {
@@ -1076,10 +1149,12 @@ class FileToolkitModule(private val reactContext: ReactApplicationContext) :
 
         connection.connect()
 
-        if (connection.responseCode !in 200..299) {
+        val responseCode = connection.responseCode
+        if (responseCode !in 200..299) {
+          connection.disconnect()
           promise.resolve(Arguments.createMap().apply {
             putBoolean("success", false)
-            putString("error", "HTTP ${connection.responseCode}")
+            putString("error", "HTTP $responseCode")
           })
           return@thread
         }
@@ -1087,8 +1162,28 @@ class FileToolkitModule(private val reactContext: ReactApplicationContext) :
         // Get MIME type from response
         val mimeType = connection.contentType?.split(";")?.get(0)?.trim() ?: "application/octet-stream"
 
-        // Read all bytes
-        val bytes = connection.inputStream.use { it.readBytes() }
+        // Read all bytes — cap at 50 MB to match readFile limit and prevent OOM.
+        val maxBytes = 50L * 1024 * 1024
+        val contentLength = connection.contentLength.toLong()
+        if (contentLength > maxBytes) {
+          connection.disconnect()
+          promise.resolve(Arguments.createMap().apply {
+            putBoolean("success", false)
+            putString("error", "Response exceeds 50 MB limit for urlToBase64")
+          })
+          return@thread
+        }
+        val bytes = connection.inputStream.use { input ->
+          val buf = input.readBytes()
+          if (buf.size > maxBytes) {
+            promise.resolve(Arguments.createMap().apply {
+              putBoolean("success", false)
+              putString("error", "Response exceeds 50 MB limit for urlToBase64")
+            })
+            return@thread
+          }
+          buf
+        }
         
         // Encode to base64
         val base64String = android.util.Base64.encodeToString(bytes, android.util.Base64.NO_WRAP)
@@ -1122,7 +1217,8 @@ class FileToolkitModule(private val reactContext: ReactApplicationContext) :
         return
       }
 
-      val authority = "${reactContext.packageName}.fileprovider"
+      // Use the unique authority registered in AndroidManifest.xml (Fix #17)
+      val authority = "${reactContext.packageName}.rn_file_toolkit.provider"
       val contentUri = FileProvider.getUriForFile(reactContext, authority, file)
 
       val shareIntent = Intent(Intent.ACTION_SEND).apply {
@@ -1170,7 +1266,8 @@ class FileToolkitModule(private val reactContext: ReactApplicationContext) :
         return
       }
 
-      val authority = "${reactContext.packageName}.fileprovider"
+      // Use the unique authority registered in AndroidManifest.xml (Fix #17)
+      val authority = "${reactContext.packageName}.rn_file_toolkit.provider"
       val contentUri = FileProvider.getUriForFile(reactContext, authority, file)
 
       val detectedMimeType = if (mimeType.isNotBlank()) mimeType else getMimeType(filePath)
@@ -1242,8 +1339,10 @@ class FileToolkitModule(private val reactContext: ReactApplicationContext) :
             val canonicalEntry = entryFile.canonicalPath
             if (!canonicalEntry.startsWith(canonicalDest + File.separator) &&
                 canonicalEntry != canonicalDest) {
-              entry = zis.nextEntry
-              continue
+              // Refuse to extract entries that escape the destination directory
+              // (zip-slip attack). Return an error instead of silently skipping
+              // to match iOS behaviour and prevent partial extractions.
+              throw SecurityException("ZIP entry has invalid path: ${entry.name}")
             }
 
             if (entry.isDirectory) {

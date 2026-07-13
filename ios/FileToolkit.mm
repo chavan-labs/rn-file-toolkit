@@ -29,6 +29,9 @@
 @property (nonatomic, strong) NSMutableDictionary *uploadTaskIdMap;    // taskIdentifier → uploadId
 // Strong ref to prevent ARC deallocation during preview
 @property (nonatomic, strong) UIDocumentInteractionController *documentController;
+// Serial queue for thread-safe dictionary access
+@property (nonatomic, strong) dispatch_queue_t syncQueue;
+@property (nonatomic, assign) BOOL hasListeners;
 @end
 
 @implementation FileToolkit
@@ -37,6 +40,7 @@ RCT_EXPORT_MODULE()
 
 - (instancetype)init {
     if (self = [super init]) {
+        self.syncQueue = dispatch_queue_create("com.filetoolkit.syncQueue", DISPATCH_QUEUE_SERIAL);
         self.activePromises  = [NSMutableDictionary new];
         self.downloadOptions = [NSMutableDictionary new];
         self.activeTasks     = [NSMutableDictionary new];
@@ -53,8 +57,9 @@ RCT_EXPORT_MODULE()
         self.fgSession = [NSURLSession sessionWithConfiguration:fgConfig delegate:self delegateQueue:nil];
 
         // Background session (survives app suspension)
+        NSString *bgId = [NSString stringWithFormat:@"%@.filetoolkit.background", NSBundle.mainBundle.bundleIdentifier];
         NSURLSessionConfiguration *bgConfig =
-            [NSURLSessionConfiguration backgroundSessionConfigurationWithIdentifier:@"com.filetoolkit.background"];
+            [NSURLSessionConfiguration backgroundSessionConfigurationWithIdentifier:bgId];
         bgConfig.discretionary = NO;
         bgConfig.sessionSendsLaunchEvents = YES;
         self.bgSession = [NSURLSession sessionWithConfiguration:bgConfig delegate:self delegateQueue:nil];
@@ -64,6 +69,14 @@ RCT_EXPORT_MODULE()
 
 - (NSArray<NSString *> *)supportedEvents {
     return @[@"onDownloadProgress", @"onDownloadComplete", @"onDownloadError", @"onUploadProgress", @"onDownloadRetry"];
+}
+
+- (void)startObserving {
+    self.hasListeners = YES;
+}
+
+- (void)stopObserving {
+    self.hasListeners = NO;
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -102,22 +115,52 @@ RCT_EXPORT_MODULE()
 }
 
 - (NSString *)calculateChecksumForPath:(NSString *)path algorithm:(NSString *)algo {
-    NSData *data = [NSData dataWithContentsOfFile:path];
-    if (!data) return nil;
-    
-    unsigned char digest[CC_SHA256_DIGEST_LENGTH];
+    NSInputStream *inputStream = [NSInputStream inputStreamWithFileAtPath:path];
+    if (!inputStream) return nil;
+    [inputStream open];
+
+    const NSUInteger bufferSize = 65536; // 64KB
+    uint8_t buffer[bufferSize];
+
     if ([algo isEqualToString:@"MD5"]) {
-        CC_MD5(data.bytes, (CC_LONG)data.length, digest);
+        CC_MD5_CTX ctx;
+        CC_MD5_Init(&ctx);
+        while ([inputStream hasBytesAvailable]) {
+            NSInteger bytesRead = [inputStream read:buffer maxLength:bufferSize];
+            if (bytesRead > 0) CC_MD5_Update(&ctx, buffer, (CC_LONG)bytesRead);
+            else break;
+        }
+        [inputStream close];
+        unsigned char digest[CC_MD5_DIGEST_LENGTH];
+        CC_MD5_Final(digest, &ctx);
         NSMutableString *output = [NSMutableString stringWithCapacity:CC_MD5_DIGEST_LENGTH * 2];
         for (int i = 0; i < CC_MD5_DIGEST_LENGTH; i++) [output appendFormat:@"%02x", digest[i]];
         return output;
     } else if ([algo isEqualToString:@"SHA1"]) {
-        CC_SHA1(data.bytes, (CC_LONG)data.length, digest);
+        CC_SHA1_CTX ctx;
+        CC_SHA1_Init(&ctx);
+        while ([inputStream hasBytesAvailable]) {
+            NSInteger bytesRead = [inputStream read:buffer maxLength:bufferSize];
+            if (bytesRead > 0) CC_SHA1_Update(&ctx, buffer, (CC_LONG)bytesRead);
+            else break;
+        }
+        [inputStream close];
+        unsigned char digest[CC_SHA1_DIGEST_LENGTH];
+        CC_SHA1_Final(digest, &ctx);
         NSMutableString *output = [NSMutableString stringWithCapacity:CC_SHA1_DIGEST_LENGTH * 2];
         for (int i = 0; i < CC_SHA1_DIGEST_LENGTH; i++) [output appendFormat:@"%02x", digest[i]];
         return output;
     } else {
-        CC_SHA256(data.bytes, (CC_LONG)data.length, digest);
+        CC_SHA256_CTX ctx;
+        CC_SHA256_Init(&ctx);
+        while ([inputStream hasBytesAvailable]) {
+            NSInteger bytesRead = [inputStream read:buffer maxLength:bufferSize];
+            if (bytesRead > 0) CC_SHA256_Update(&ctx, buffer, (CC_LONG)bytesRead);
+            else break;
+        }
+        [inputStream close];
+        unsigned char digest[CC_SHA256_DIGEST_LENGTH];
+        CC_SHA256_Final(digest, &ctx);
         NSMutableString *output = [NSMutableString stringWithCapacity:CC_SHA256_DIGEST_LENGTH * 2];
         for (int i = 0; i < CC_SHA256_DIGEST_LENGTH; i++) [output appendFormat:@"%02x", digest[i]];
         return output;
@@ -147,6 +190,10 @@ RCT_EXPORT_MODULE()
     BOOL isBackground = [options[@"background"] boolValue];
     NSString *downloadId = options[@"downloadId"] ?: [self generateDownloadId];
     NSURL *url = [NSURL URLWithString:urlString];
+    if (!url) {
+        resolve(@{@"success": @NO, @"error": @"Invalid URL"});
+        return;
+    }
     NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:url];
     
     // Add custom headers
@@ -161,16 +208,20 @@ RCT_EXPORT_MODULE()
     NSURLSessionDownloadTask *task = [session downloadTaskWithRequest:request];
     NSString *taskKey = [NSString stringWithFormat:@"%lu", (unsigned long)task.taskIdentifier];
 
-    self.taskIdMap[taskKey]       = downloadId;
-    self.activeTasks[downloadId]  = task;
-    self.downloadOptions[downloadId] = options;
+    dispatch_sync(self.syncQueue, ^{
+        self.taskIdMap[taskKey]       = downloadId;
+        self.activeTasks[downloadId]  = task;
+        self.downloadOptions[downloadId] = options;
+    });
     task.taskDescription = downloadId;
 
     if (isBackground) {
         // Resolve immediately with the downloadId — result comes via event
         resolve(@{@"success": @YES, @"downloadId": downloadId});
     } else {
-        self.activePromises[downloadId] = @{@"resolve": resolve, @"reject": reject};
+        dispatch_sync(self.syncQueue, ^{
+            self.activePromises[downloadId] = @{@"resolve": resolve, @"reject": reject};
+        });
     }
 
     [task resume];
@@ -179,17 +230,22 @@ RCT_EXPORT_MODULE()
 // ─── pauseDownload ────────────────────────────────────────────────────────────
 
 - (void)pauseDownload:(NSString *)downloadId resolve:(RCTPromiseResolveBlock)resolve reject:(RCTPromiseRejectBlock)reject {
-    NSURLSessionDownloadTask *task = self.activeTasks[downloadId];
+    __block NSURLSessionDownloadTask *task = nil;
+    dispatch_sync(self.syncQueue, ^{
+        task = self.activeTasks[downloadId];
+    });
     if (!task) {
         resolve(@{@"success": @NO, @"error": @"Download not found"});
         return;
     }
 
     [task cancelByProducingResumeData:^(NSData *resumeData) {
-        if (resumeData) {
-            self.resumeDataStore[downloadId] = resumeData;
-        }
-        [self.activeTasks removeObjectForKey:downloadId];
+        dispatch_sync(self.syncQueue, ^{
+            if (resumeData) {
+                self.resumeDataStore[downloadId] = resumeData;
+            }
+            [self.activeTasks removeObjectForKey:downloadId];
+        });
         resolve(@{@"success": @YES});
     }];
 }
@@ -197,22 +253,28 @@ RCT_EXPORT_MODULE()
 // ─── resumeDownload ───────────────────────────────────────────────────────────
 
 - (void)resumeDownload:(NSString *)downloadId resolve:(RCTPromiseResolveBlock)resolve reject:(RCTPromiseRejectBlock)reject {
-    NSData *resumeData = self.resumeDataStore[downloadId];
+    __block NSData *resumeData = nil;
+    __block NSDictionary *options = nil;
+    dispatch_sync(self.syncQueue, ^{
+        resumeData = self.resumeDataStore[downloadId];
+        options = self.downloadOptions[downloadId];
+    });
     if (!resumeData) {
         resolve(@{@"success": @NO, @"error": @"No resume data — download was not paused or was cancelled"});
         return;
     }
 
-    NSDictionary *options = self.downloadOptions[downloadId];
     BOOL isBackground = [options[@"background"] boolValue];
     NSURLSession *session = isBackground ? self.bgSession : self.fgSession;
 
     NSURLSessionDownloadTask *task = [session downloadTaskWithResumeData:resumeData];
     NSString *taskKey = [NSString stringWithFormat:@"%lu", (unsigned long)task.taskIdentifier];
 
-    self.taskIdMap[taskKey]      = downloadId;
-    self.activeTasks[downloadId] = task;
-    [self.resumeDataStore removeObjectForKey:downloadId];
+    dispatch_sync(self.syncQueue, ^{
+        self.taskIdMap[taskKey]      = downloadId;
+        self.activeTasks[downloadId] = task;
+        [self.resumeDataStore removeObjectForKey:downloadId];
+    });
 
     [task resume];
     resolve(@{@"success": @YES});
@@ -221,15 +283,26 @@ RCT_EXPORT_MODULE()
 // ─── cancelDownload ───────────────────────────────────────────────────────────
 
 - (void)cancelDownload:(NSString *)downloadId resolve:(RCTPromiseResolveBlock)resolve reject:(RCTPromiseRejectBlock)reject {
-    NSURLSessionDownloadTask *task = self.activeTasks[downloadId];
+    __block NSURLSessionDownloadTask *task = nil;
+    __block NSDictionary *funcs = nil;
+    dispatch_sync(self.syncQueue, ^{
+        task = self.activeTasks[downloadId];
+        funcs = self.activePromises[downloadId];
+        if (task) {
+            [self.activeTasks removeObjectForKey:downloadId];
+        }
+        [self.resumeDataStore removeObjectForKey:downloadId];
+        [self.activePromises  removeObjectForKey:downloadId];
+        [self.downloadOptions removeObjectForKey:downloadId];
+        [self.retryAttempts   removeObjectForKey:downloadId];
+    });
+    if (funcs) {
+        RCTPromiseResolveBlock dlResolve = funcs[@"resolve"];
+        if (dlResolve) dlResolve(@{@"success": @NO, @"error": @"Cancelled"});
+    }
     if (task) {
         [task cancel];
-        [self.activeTasks removeObjectForKey:downloadId];
     }
-    [self.resumeDataStore removeObjectForKey:downloadId];
-    [self.activePromises  removeObjectForKey:downloadId];
-    [self.downloadOptions removeObjectForKey:downloadId];
-    [self.retryAttempts   removeObjectForKey:downloadId];
     resolve(@{@"success": @YES});
 }
 
@@ -581,17 +654,24 @@ totalBytesExpectedToWrite:(int64_t)totalBytesExpectedToWrite {
     if (totalBytesExpectedToWrite > 0) {
         int progress = (int)((totalBytesWritten * 100) / totalBytesExpectedToWrite);
         NSString *taskKey = [NSString stringWithFormat:@"%lu", (unsigned long)downloadTask.taskIdentifier];
-        NSString *downloadId = self.taskIdMap[taskKey] ?: @"";
         NSString *url = downloadTask.originalRequest.URL.absoluteString ?: @"";
 
-        [self sendEventWithName:@"onDownloadProgress"
-                           body:@{
-                               @"url": url,
-                               @"downloadId": downloadId,
-                               @"progress": @(progress),
-                               @"bytesDownloaded": @(totalBytesWritten),
-                               @"totalBytes": @(totalBytesExpectedToWrite)
-                           }];
+        __weak typeof(self) weakSelf = self;
+        dispatch_async(self.syncQueue, ^{
+            __strong typeof(weakSelf) strongSelf = weakSelf;
+            if (!strongSelf) return;
+            NSString *downloadId = strongSelf.taskIdMap[taskKey];
+            if (!downloadId) return;
+            
+            [strongSelf sendEventWithName:@"onDownloadProgress"
+                               body:@{
+                                   @"url": url,
+                                   @"downloadId": downloadId,
+                                   @"progress": @(progress),
+                                   @"bytesDownloaded": @(totalBytesWritten),
+                                   @"totalBytes": @(totalBytesExpectedToWrite)
+                               }];
+        });
     }
 }
 
@@ -599,10 +679,16 @@ totalBytesExpectedToWrite:(int64_t)totalBytesExpectedToWrite {
       downloadTask:(NSURLSessionDownloadTask *)downloadTask
 didFinishDownloadingToURL:(NSURL *)location {
     NSString *taskKey = [NSString stringWithFormat:@"%lu", (unsigned long)downloadTask.taskIdentifier];
-    NSString *downloadId = self.taskIdMap[taskKey];
+    __block NSString *downloadId = nil;
+    __block NSDictionary *options = nil;
+    dispatch_sync(self.syncQueue, ^{
+        downloadId = self.taskIdMap[taskKey];
+        if (downloadId) {
+            options = self.downloadOptions[downloadId];
+        }
+    });
     if (!downloadId) return;
 
-    NSDictionary *options = self.downloadOptions[downloadId];
     NSString *fileName = [self fileNameFromOptions:options task:downloadTask];
     NSString *destType = options[@"destination"] ?: @"downloads";
     NSURL *destURL = [self destURLForFileName:fileName destination:destType];
@@ -639,24 +725,34 @@ didFinishDownloadingToURL:(NSURL *)location {
         }
     }
 
-    NSDictionary *funcs = self.activePromises[downloadId];
+    __block NSDictionary *funcs = nil;
     BOOL isBackground = [options[@"background"] boolValue];
+    dispatch_sync(self.syncQueue, ^{
+        funcs = self.activePromises[downloadId];
+    });
 
     if (funcs && !isBackground) {
         // Foreground: resolve the promise
         RCTPromiseResolveBlock resolve = funcs[@"resolve"];
         resolve(resultDict);
+        // Also emit the error event for foreground failures so global listeners fire
+        // consistently across platforms (mirrors Android behaviour).
+        if (isError) {
+            [self sendEventWithName:@"onDownloadError" body:resultDict];
+        }
     } else {
-        // Background: fire the correct event based on isError flag (Bug #1 fix)
+        // Background: fire the correct event based on isError flag
         NSString *event = isError ? @"onDownloadError" : @"onDownloadComplete";
         [self sendEventWithName:event body:resultDict];
     }
 
-    [self.activePromises  removeObjectForKey:downloadId];
-    [self.downloadOptions removeObjectForKey:downloadId];
-    [self.activeTasks     removeObjectForKey:downloadId];
-    [self.taskIdMap       removeObjectForKey:taskKey];
-    [self.retryAttempts   removeObjectForKey:downloadId];
+    dispatch_sync(self.syncQueue, ^{
+        [self.activePromises  removeObjectForKey:downloadId];
+        [self.downloadOptions removeObjectForKey:downloadId];
+        [self.activeTasks     removeObjectForKey:downloadId];
+        [self.taskIdMap       removeObjectForKey:taskKey];
+        [self.retryAttempts   removeObjectForKey:downloadId];
+    });
 }
 
 - (void)URLSession:(NSURLSession *)session
@@ -664,12 +760,20 @@ didFinishDownloadingToURL:(NSURL *)location {
 didCompleteWithError:(NSError *)error {
     NSString *taskKey = [NSString stringWithFormat:@"%lu", (unsigned long)task.taskIdentifier];
 
-    // ── Upload task completion ─────────────────────────────────────────────
-    NSString *uploadId = self.uploadTaskIdMap[taskKey];
+    // ── Upload task completion ─────────────────────────────────────────────────
+    __block NSString *uploadId = nil;
+    __block NSDictionary *uploadFuncs = nil;
+    __block NSData *uploadRespData = nil;
+    dispatch_sync(self.syncQueue, ^{
+        uploadId = self.uploadTaskIdMap[taskKey];
+        if (uploadId) {
+            uploadFuncs = self.uploadPromises[uploadId];
+            uploadRespData = self.uploadResponseData[uploadId];
+        }
+    });
     if (uploadId) {
-        NSDictionary *funcs = self.uploadPromises[uploadId];
-        RCTPromiseResolveBlock uploadResolve = funcs[@"resolve"];
-        NSString *tempFile = funcs[@"tempFile"];
+        RCTPromiseResolveBlock uploadResolve = uploadFuncs[@"resolve"];
+        NSString *tempFile = uploadFuncs[@"tempFile"];
 
         if (tempFile) {
             [[NSFileManager defaultManager] removeItemAtPath:tempFile error:nil];
@@ -679,7 +783,7 @@ didCompleteWithError:(NSError *)error {
             if (uploadResolve) uploadResolve(@{@"success": @NO, @"error": error.localizedDescription, @"uploadId": uploadId});
         } else {
             NSHTTPURLResponse *httpResponse = (NSHTTPURLResponse *)task.response;
-            NSData *responseData = self.uploadResponseData[uploadId] ?: [NSData data];
+            NSData *responseData = uploadRespData ?: [NSData data];
             NSString *respString = [[NSString alloc] initWithData:responseData encoding:NSUTF8StringEncoding] ?: @"";
 
             if (uploadResolve) uploadResolve(@{
@@ -690,45 +794,66 @@ didCompleteWithError:(NSError *)error {
             });
         }
 
-        [self.uploadPromises removeObjectForKey:uploadId];
-        [self.uploadUrls removeObjectForKey:uploadId];
-        [self.uploadResponseData removeObjectForKey:uploadId];
-        [self.uploadTaskIdMap removeObjectForKey:taskKey];
-        return;
+        dispatch_sync(self.syncQueue, ^{
+            // Guard against double-resolution in upload
+            if (self.uploadPromises[uploadId]) {
+                [self.uploadPromises removeObjectForKey:uploadId];
+                [self.uploadUrls removeObjectForKey:uploadId];
+                [self.uploadResponseData removeObjectForKey:uploadId];
+                [self.uploadTaskIdMap removeObjectForKey:taskKey];
+            } else {
+                uploadId = nil; // Already resolved
+            }
+        });
+        if (!uploadId) return;
     }
 
     // ── Download task error handling ───────────────────────────────────────
     if (!error) return;
-    // Ignore cancellation
-    if (error.code == NSURLErrorCancelled) return;
+    // Ignore cancellation — but still clean up taskIdMap to prevent memory leak
+    if (error.code == NSURLErrorCancelled) {
+        dispatch_sync(self.syncQueue, ^{
+            [self.taskIdMap removeObjectForKey:taskKey];
+        });
+        return;
+    }
 
-    NSString *downloadId = self.taskIdMap[taskKey];
+    __block NSString *downloadId = nil;
+    __block NSDictionary *options = nil;
+    __block NSInteger currentAttempt = 0;
+    dispatch_sync(self.syncQueue, ^{
+        downloadId = self.taskIdMap[taskKey];
+        if (downloadId) {
+            options = self.downloadOptions[downloadId];
+            currentAttempt = [self.retryAttempts[downloadId] integerValue];
+        }
+    });
     if (!downloadId) return;
 
-    NSDictionary *options = self.downloadOptions[downloadId];
     BOOL isBackground = [options[@"background"] boolValue];
 
-    // ── Retry logic ────────────────────────────────────────────────────────
+    // ── Retry logic ────────────────────────────────────────────────────
     NSDictionary *retryConfig = options[@"retry"];
     NSInteger maxAttempts = retryConfig ? [retryConfig[@"attempts"] integerValue] : 0;
     NSInteger baseDelay   = retryConfig ? ([retryConfig[@"delay"] integerValue] ?: 1000) : 1000;
-    NSInteger currentAttempt = [self.retryAttempts[downloadId] integerValue];
 
     // Remove old task mapping — will be replaced on retry
-    [self.taskIdMap  removeObjectForKey:taskKey];
-    [self.activeTasks removeObjectForKey:downloadId];
+    dispatch_sync(self.syncQueue, ^{
+        [self.taskIdMap  removeObjectForKey:taskKey];
+        [self.activeTasks removeObjectForKey:downloadId];
+    });
 
     if (currentAttempt < maxAttempts) {
         // Schedule a retry
         NSInteger nextAttempt = currentAttempt + 1;
-        self.retryAttempts[downloadId] = @(nextAttempt);
+        dispatch_sync(self.syncQueue, ^{
+            self.retryAttempts[downloadId] = @(nextAttempt);
+        });
 
-        // Bug #4 fix: avoid integer overflow — cap shift operand, then apply MIN
         NSInteger shiftBits = currentAttempt < 15 ? currentAttempt : 15;
         NSInteger delayMs = MIN(baseDelay * (1 << shiftBits), (NSInteger)30000);
 
         // Emit retry event so JS onRetry callback is called
-        // Bug #3 fix: include the error description that triggered this retry
         [self sendEventWithName:@"onDownloadRetry" body:@{
             @"downloadId": downloadId,
             @"url": options[@"url"] ?: @"",
@@ -736,16 +861,14 @@ didCompleteWithError:(NSError *)error {
             @"error": error.localizedDescription ?: @""
         }];
 
-        // Bug #2 fix: use __weak self to avoid retain cycle and crash on dealloc during delay
         __weak typeof(self) weakSelf = self;
         dispatch_after(
             dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delayMs * NSEC_PER_MSEC)),
             dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0),
             ^{
                 __strong typeof(weakSelf) strongSelf = weakSelf;
-                if (!strongSelf) return; // module deallocated during delay — bail safely
+                if (!strongSelf) return;
 
-                // Recreate task with same options & downloadId
                 NSString *urlString = options[@"url"];
                 if (!urlString) return;
                 NSURL *url = [NSURL URLWithString:urlString];
@@ -761,8 +884,10 @@ didCompleteWithError:(NSError *)error {
                 NSURLSessionDownloadTask *newTask = [sess downloadTaskWithRequest:request];
                 NSString *newTaskKey = [NSString stringWithFormat:@"%lu",
                                         (unsigned long)newTask.taskIdentifier];
-                strongSelf.taskIdMap[newTaskKey]      = downloadId;
-                strongSelf.activeTasks[downloadId]   = newTask;
+                dispatch_sync(strongSelf.syncQueue, ^{
+                    strongSelf.taskIdMap[newTaskKey]      = downloadId;
+                    strongSelf.activeTasks[downloadId]   = newTask;
+                });
                 newTask.taskDescription              = downloadId;
                 [newTask resume];
             }
@@ -770,21 +895,25 @@ didCompleteWithError:(NSError *)error {
         return; // Don't resolve promise yet — retry is in flight
     }
 
-    // ── No more retries — normal error path ────────────────────────────────
-    [self.retryAttempts removeObjectForKey:downloadId];
-
+    // ── No more retries — normal error path ──────────────────────────────
     NSDictionary *errDict = @{@"success": @NO, @"downloadId": downloadId, @"error": error.localizedDescription};
 
-    NSDictionary *funcs = self.activePromises[downloadId];
+    __block NSDictionary *funcs = nil;
+    dispatch_sync(self.syncQueue, ^{
+        [self.retryAttempts removeObjectForKey:downloadId];
+        funcs = self.activePromises[downloadId];
+    });
+    // Always emit the event so global onDownloadError listeners fire on both platforms.
+    [self sendEventWithName:@"onDownloadError" body:errDict];
     if (funcs && !isBackground) {
         RCTPromiseResolveBlock resolve = funcs[@"resolve"];
         resolve(errDict);
-    } else {
-        [self sendEventWithName:@"onDownloadError" body:errDict];
     }
 
-    [self.activePromises  removeObjectForKey:downloadId];
-    [self.downloadOptions removeObjectForKey:downloadId];
+    dispatch_sync(self.syncQueue, ^{
+        [self.activePromises  removeObjectForKey:downloadId];
+        [self.downloadOptions removeObjectForKey:downloadId];
+    });
 }
 
 // ─── Upload progress delegate ────────────────────────────────────────────────
@@ -794,15 +923,22 @@ didCompleteWithError:(NSError *)error {
    didSendBodyData:(int64_t)bytesSent
     totalBytesSent:(int64_t)totalBytesSent
 totalBytesExpectedToSend:(int64_t)totalBytesExpectedToSend {
-    NSString *taskKey = [NSString stringWithFormat:@"%lu", (unsigned long)task.taskIdentifier];
-    NSString *uploadId = self.uploadTaskIdMap[taskKey];
-    if (!uploadId) return;
-
-    NSString *url = self.uploadUrls[uploadId] ?: @"";
     if (totalBytesExpectedToSend > 0) {
+        NSString *taskKey = [NSString stringWithFormat:@"%lu", (unsigned long)task.taskIdentifier];
         int progress = (int)((totalBytesSent * 100) / totalBytesExpectedToSend);
-        [self sendEventWithName:@"onUploadProgress"
-                           body:@{@"url": url, @"uploadId": uploadId, @"progress": @(progress)}];
+        
+        __weak typeof(self) weakSelf = self;
+        dispatch_async(self.syncQueue, ^{
+            __strong typeof(weakSelf) strongSelf = weakSelf;
+            if (!strongSelf) return;
+            
+            NSString *uploadId = strongSelf.uploadTaskIdMap[taskKey];
+            if (uploadId) {
+                NSString *url = strongSelf.uploadUrls[uploadId] ?: @"";
+                [strongSelf sendEventWithName:@"onUploadProgress"
+                                   body:@{@"url": url, @"uploadId": uploadId, @"progress": @(progress)}];
+            }
+        });
     }
 }
 
@@ -812,15 +948,20 @@ totalBytesExpectedToSend:(int64_t)totalBytesExpectedToSend {
           dataTask:(NSURLSessionDataTask *)dataTask
     didReceiveData:(NSData *)data {
     NSString *taskKey = [NSString stringWithFormat:@"%lu", (unsigned long)dataTask.taskIdentifier];
-    NSString *uploadId = self.uploadTaskIdMap[taskKey];
+    __block NSString *uploadId = nil;
+    dispatch_sync(self.syncQueue, ^{
+        uploadId = self.uploadTaskIdMap[taskKey];
+    });
     if (!uploadId) return;
 
-    NSMutableData *responseData = self.uploadResponseData[uploadId];
-    if (!responseData) {
-        responseData = [NSMutableData new];
-        self.uploadResponseData[uploadId] = responseData;
-    }
-    [responseData appendData:data];
+    dispatch_sync(self.syncQueue, ^{
+        NSMutableData *responseData = self.uploadResponseData[uploadId];
+        if (!responseData) {
+            responseData = [NSMutableData new];
+            self.uploadResponseData[uploadId] = responseData;
+        }
+        [responseData appendData:data];
+    });
 }
 
 // ─── TurboModule ──────────────────────────────────────────────────────────────
@@ -913,23 +1054,24 @@ totalBytesExpectedToSend:(int64_t)totalBytesExpectedToSend {
     NSURLSessionUploadTask *task = [self.fgSession uploadTaskWithRequest:request fromFile:tempFileURL];
     NSString *taskKey = [NSString stringWithFormat:@"%lu", (unsigned long)task.taskIdentifier];
 
-    self.uploadTaskIdMap[taskKey] = uploadId;
-    self.uploadPromises[uploadId] = @{
-        @"resolve": resolve, 
-        @"reject": reject, 
-        @"tempFile": tempFilePath
-    };
-    self.uploadUrls[uploadId] = urlString;
+    dispatch_sync(self.syncQueue, ^{
+        self.uploadTaskIdMap[taskKey] = uploadId;
+        self.uploadPromises[uploadId] = @{
+            @"resolve": resolve, 
+            @"reject": reject, 
+            @"tempFile": tempFilePath
+        };
+        self.uploadUrls[uploadId] = urlString;
+    });
 
     [task resume];
 }
 
 // ─── saveBase64AsFile ─────────────────────────────────────────────────────────
 
-RCT_REMAP_METHOD(saveBase64AsFile,
-                 base64Options:(NSDictionary *)options
-                 saveResolver:(RCTPromiseResolveBlock)resolve
-                 saveRejecter:(RCTPromiseRejectBlock)reject)
+RCT_EXPORT_METHOD(saveBase64AsFile:(NSDictionary *)options
+                  resolve:(RCTPromiseResolveBlock)resolve
+                  reject:(RCTPromiseRejectBlock)reject)
 {
     NSString *base64String = options[@"base64Data"];
     if (!base64String || base64String.length == 0) {
@@ -968,10 +1110,9 @@ RCT_REMAP_METHOD(saveBase64AsFile,
 
 // ─── urlToBase64 ──────────────────────────────────────────────────────────────
 
-RCT_REMAP_METHOD(urlToBase64,
-                 urlOptions:(NSDictionary *)options
-                 urlResolver:(RCTPromiseResolveBlock)resolve
-                 urlRejecter:(RCTPromiseRejectBlock)reject)
+RCT_EXPORT_METHOD(urlToBase64:(NSDictionary *)options
+                  resolve:(RCTPromiseResolveBlock)resolve
+                  reject:(RCTPromiseRejectBlock)reject)
 {
     NSString *urlString = options[@"url"];
     if (!urlString || urlString.length == 0) {
@@ -996,7 +1137,10 @@ RCT_REMAP_METHOD(urlToBase64,
         }
     }
     
-    NSURLSessionDataTask *task = [[NSURLSession sharedSession] dataTaskWithRequest:request completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+    // Create ephemeral session instead of using sharedSession
+    NSURLSessionConfiguration *config = [NSURLSessionConfiguration ephemeralSessionConfiguration];
+    NSURLSession *session = [NSURLSession sessionWithConfiguration:config];
+    NSURLSessionDataTask *task = [session dataTaskWithRequest:request completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
         if (error) {
             resolve(@{@"success": @NO, @"error": error.localizedDescription});
             return;
@@ -1031,13 +1175,35 @@ RCT_REMAP_METHOD(urlToBase64,
     [task resume];
 }
 
+// ─── topMostViewController (works with both AppDelegate-window and SceneDelegate) ─────
+
+- (UIViewController *)topMostViewController {
+    UIWindow *window = nil;
+    if (@available(iOS 13.0, *)) {
+        for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
+            if (scene.activationState == UISceneActivationStateForegroundActive &&
+                [scene isKindOfClass:[UIWindowScene class]]) {
+                window = ((UIWindowScene *)scene).windows.firstObject;
+                break;
+            }
+        }
+    }
+    if (!window) {
+        window = [UIApplication sharedApplication].delegate.window;
+    }
+    UIViewController *rootVC = window.rootViewController;
+    while (rootVC.presentedViewController) {
+        rootVC = rootVC.presentedViewController;
+    }
+    return rootVC;
+}
+
 // ─── shareFile ────────────────────────────────────────────────────────────────
 
-RCT_REMAP_METHOD(shareFile,
-                 shareFilePath:(NSString *)filePath
-                 shareOptions:(NSDictionary *)options
-                 shareResolver:(RCTPromiseResolveBlock)resolve
-                 shareRejecter:(RCTPromiseRejectBlock)reject)
+RCT_EXPORT_METHOD(shareFile:(NSString *)filePath
+                  options:(NSDictionary *)options
+                  resolve:(RCTPromiseResolveBlock)resolve
+                  reject:(RCTPromiseRejectBlock)reject)
 {
     if (!filePath || filePath.length == 0) {
         resolve(@{@"success": @NO, @"error": @"File path is required"});
@@ -1052,11 +1218,10 @@ RCT_REMAP_METHOD(shareFile,
     NSURL *fileURL = [NSURL fileURLWithPath:filePath];
     
     dispatch_async(dispatch_get_main_queue(), ^{
-        UIViewController *rootViewController = [UIApplication sharedApplication].delegate.window.rootViewController;
-        
-        // Find the topmost view controller
-        while (rootViewController.presentedViewController) {
-            rootViewController = rootViewController.presentedViewController;
+        UIViewController *rootViewController = [self topMostViewController];
+        if (!rootViewController) {
+            resolve(@{@"success": @NO, @"error": @"No visible view controller found"});
+            return;
         }
         
         NSArray *itemsToShare = @[fileURL];
@@ -1085,11 +1250,10 @@ RCT_REMAP_METHOD(shareFile,
 
 // ─── openFile ─────────────────────────────────────────────────────────────────
 
-RCT_REMAP_METHOD(openFile,
-                 openFilePath:(NSString *)filePath
-                 mimeType:(NSString *)mimeType
-                 openResolver:(RCTPromiseResolveBlock)resolve
-                 openRejecter:(RCTPromiseRejectBlock)reject)
+RCT_EXPORT_METHOD(openFile:(NSString *)filePath
+                  mimeType:(NSString *)mimeType
+                  resolve:(RCTPromiseResolveBlock)resolve
+                  reject:(RCTPromiseRejectBlock)reject)
 {
     if (!filePath || filePath.length == 0) {
         resolve(@{@"success": @NO, @"error": @"File path is required"});
@@ -1104,11 +1268,10 @@ RCT_REMAP_METHOD(openFile,
     NSURL *fileURL = [NSURL fileURLWithPath:filePath];
     
     dispatch_async(dispatch_get_main_queue(), ^{
-        UIViewController *rootViewController = [UIApplication sharedApplication].delegate.window.rootViewController;
-        
-        // Find the topmost view controller
-        while (rootViewController.presentedViewController) {
-            rootViewController = rootViewController.presentedViewController;
+        UIViewController *rootViewController = [self topMostViewController];
+        if (!rootViewController) {
+            resolve(@{@"success": @NO, @"error": @"No visible view controller found"});
+            return;
         }
         
         // Use UIDocumentInteractionController for opening files
@@ -1136,11 +1299,7 @@ RCT_REMAP_METHOD(openFile,
 
 // UIDocumentInteractionControllerDelegate method
 - (UIViewController *)documentInteractionControllerViewControllerForPreview:(UIDocumentInteractionController *)controller {
-    UIViewController *rootViewController = [UIApplication sharedApplication].delegate.window.rootViewController;
-    while (rootViewController.presentedViewController) {
-        rootViewController = rootViewController.presentedViewController;
-    }
-    return rootViewController;
+    return [self topMostViewController];
 }
 
 // ─── Unzip ────────────────────────────────────────────────────────────────────
@@ -1276,12 +1435,31 @@ RCT_EXPORT_METHOD(unzip:(NSString *)sourcePath
         if (method == 0) {
             // Store (no compression)
             NSData *fileData = [NSData dataWithBytes:compData length:compSize];
+            // Verify CRC32 before writing
+            uint32_t expectedCRC = CFSwapInt32LittleToHost(crc32val);
+            uLong actualCRC = crc32(0L, (const Bytef *)fileData.bytes, (uInt)fileData.length);
+            if ((uint32_t)actualCRC != expectedCRC) {
+                if (error) *error = [NSError errorWithDomain:@"RNFileToolkit" code:-3
+                    userInfo:@{NSLocalizedDescriptionKey: [NSString stringWithFormat:@"CRC32 mismatch for entry: %@", fileName]}];
+                return NO;
+            }
             if (![fileData writeToFile:destPath options:NSDataWritingAtomic error:error]) {
                 return NO;
             }
         } else if (method == 8) {
             // Deflate — use zlib inflate with raw deflate stream
-            NSMutableData *output = [NSMutableData dataWithLength:uncompSize > 0 ? uncompSize : 65536];
+            // Guard against maliciously crafted entries claiming huge uncompressed sizes.
+        // Cap at 512 MB — large enough for legitimate files, small enough to be safe.
+        const uint32_t kMaxUncompSize = 512u * 1024u * 1024u;
+        if (uncompSize > kMaxUncompSize) {
+            if (error) {
+                *error = [NSError errorWithDomain:@"RNFileToolkit" code:-4
+                    userInfo:@{NSLocalizedDescriptionKey:
+                        [NSString stringWithFormat:@"ZIP entry uncompressed size (%u bytes) exceeds limit", uncompSize]}];
+            }
+            return NO;
+        }
+        NSMutableData *output = [NSMutableData dataWithLength:uncompSize > 0 ? uncompSize : 65536];
             z_stream strm;
             memset(&strm, 0, sizeof(strm));
             strm.next_in  = (Bytef *)compData;
@@ -1323,6 +1501,14 @@ RCT_EXPORT_METHOD(unzip:(NSString *)sourcePath
                 output = result;
             }
 
+            // Verify CRC32 of decompressed data before writing
+            uint32_t expectedCRC = CFSwapInt32LittleToHost(crc32val);
+            uLong actualCRC = crc32(0L, (const Bytef *)output.bytes, (uInt)output.length);
+            if ((uint32_t)actualCRC != expectedCRC) {
+                if (error) *error = [NSError errorWithDomain:@"RNFileToolkit" code:-3
+                    userInfo:@{NSLocalizedDescriptionKey: [NSString stringWithFormat:@"CRC32 mismatch for entry: %@", fileName]}];
+                return NO;
+            }
             if (![output writeToFile:destPath options:NSDataWritingAtomic error:error]) {
                 return NO;
             }
@@ -1746,10 +1932,9 @@ RCT_EXPORT_METHOD(zip:(NSString *)sourcePath
 
 // ─── saveToMediaStore ─────────────────────────────────────────────────────
 
-RCT_REMAP_METHOD(saveToMediaStore,
-                 mediaStoreOptions:(NSDictionary *)options
-                 mediaStoreResolver:(RCTPromiseResolveBlock)resolve
-                 mediaStoreRejecter:(RCTPromiseRejectBlock)reject)
+RCT_EXPORT_METHOD(saveToMediaStore:(NSDictionary *)options
+                  resolve:(RCTPromiseResolveBlock)resolve
+                  reject:(RCTPromiseRejectBlock)reject)
 {
     NSString *filePath = options[@"filePath"];
     if (!filePath || filePath.length == 0) {
@@ -1766,21 +1951,27 @@ RCT_REMAP_METHOD(saveToMediaStore,
 
     if ([mediaType isEqualToString:@"image"] || [mediaType isEqualToString:@"video"]) {
         // Use Photos framework for images and videos
-        PHPhotoLibrary *photoLibrary = [PHPhotoLibrary sharedPhotoLibrary];
-
-        [photoLibrary performChanges:^{
-            NSURL *fileURL = [NSURL fileURLWithPath:filePath];
-            if ([mediaType isEqualToString:@"image"]) {
-                [PHAssetChangeRequest creationRequestForAssetFromImageAtFileURL:fileURL];
-            } else {
-                [PHAssetChangeRequest creationRequestForAssetFromVideoAtFileURL:fileURL];
+        [PHPhotoLibrary requestAuthorization:^(PHAuthorizationStatus status) {
+            if (status != PHAuthorizationStatusAuthorized && status != PHAuthorizationStatusLimited) {
+                resolve(@{@"success": @NO, @"error": @"Photo library access denied"});
+                return;
             }
-        } completionHandler:^(BOOL success, NSError *error) {
-            if (success) {
-                resolve(@{@"success": @YES, @"uri": filePath});
-            } else {
-                resolve(@{@"success": @NO, @"error": error.localizedDescription ?: @"Failed to save to Photos"});
-            }
+            
+            PHPhotoLibrary *photoLibrary = [PHPhotoLibrary sharedPhotoLibrary];
+            [photoLibrary performChanges:^{
+                NSURL *fileURL = [NSURL fileURLWithPath:filePath];
+                if ([mediaType isEqualToString:@"image"]) {
+                    [PHAssetChangeRequest creationRequestForAssetFromImageAtFileURL:fileURL];
+                } else {
+                    [PHAssetChangeRequest creationRequestForAssetFromVideoAtFileURL:fileURL];
+                }
+            } completionHandler:^(BOOL success, NSError *error) {
+                if (success) {
+                    resolve(@{@"success": @YES, @"uri": filePath});
+                } else {
+                    resolve(@{@"success": @NO, @"error": error.localizedDescription ?: @"Failed to save to Photos"});
+                }
+            }];
         }];
     } else {
         // For audio/download types, copy to Documents directory (iOS has no shared media store for these)

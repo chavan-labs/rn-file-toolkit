@@ -1,9 +1,16 @@
-import { useState, useCallback, useRef } from 'react';
+import { useState, useCallback, useRef, useEffect } from 'react';
 import { NativeEventEmitter, NativeModules } from 'react-native';
 import FileToolkitSpec from './NativeFileToolkit';
 
 const FileToolkitModule = NativeModules.FileToolkit || FileToolkitSpec;
-const eventEmitter = new NativeEventEmitter(FileToolkitModule);
+
+let _eventEmitter: NativeEventEmitter | null = null;
+function getEventEmitter(): NativeEventEmitter {
+  if (!_eventEmitter) {
+    _eventEmitter = new NativeEventEmitter(FileToolkitModule);
+  }
+  return _eventEmitter;
+}
 
 export interface ProgressInfo {
   percent: number;
@@ -19,7 +26,9 @@ export interface DownloadOptions {
   background?: boolean;
   headers?: Record<string, string>;
   destination?: 'downloads' | 'cache' | 'documents';
+  /** Notification title shown during background download. @platform Android */
   notificationTitle?: string;
+  /** Notification description shown during background download. @platform Android */
   notificationDescription?: string;
   checksum?: {
     hash: string;
@@ -282,11 +291,27 @@ class DownloadQueue {
 const _globalQueue = new DownloadQueue();
 
 function _generateId(): string {
-  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
-    const r = Math.floor(Math.random() * 16);
-    const v = c === 'x' ? r : (r % 4) + 8;
-    return v.toString(16);
-  });
+  // Use crypto.getRandomValues (available on Hermes since RN 0.73) for collision resistance
+  if (
+    typeof globalThis.crypto !== 'undefined' &&
+    typeof globalThis.crypto.getRandomValues === 'function'
+  ) {
+    const bytes = new Uint8Array(16);
+    globalThis.crypto.getRandomValues(bytes);
+    bytes[6] = (bytes[6]! & 0x0f) | 0x40; // version 4
+    bytes[8] = (bytes[8]! & 0x3f) | 0x80; // variant 1
+    const hex = Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join(
+      ''
+    );
+    return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(
+      12,
+      16
+    )}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+  }
+  // Fallback for older Hermes: timestamp + random suffix for uniqueness
+  return `${Date.now().toString(36)}-${Math.random()
+    .toString(36)
+    .slice(2, 10)}`;
 }
 
 export function setQueueOptions(options: QueueOptions): void {
@@ -309,7 +334,7 @@ async function _executeDownload(
   let _smoothedSpeedBps: number = 0;
 
   if (options.onProgress) {
-    progressSubscription = eventEmitter.addListener(
+    progressSubscription = getEventEmitter().addListener(
       'onDownloadProgress',
       (event: any) => {
         const matchesId = event.downloadId === knownDownloadId;
@@ -352,7 +377,7 @@ async function _executeDownload(
   }
 
   if (options.retry?.onRetry) {
-    retrySubscription = eventEmitter.addListener(
+    retrySubscription = getEventEmitter().addListener(
       'onDownloadRetry',
       (event: any) => {
         const matchesId = event.downloadId === knownDownloadId;
@@ -378,12 +403,14 @@ async function _executeDownload(
       headers: options.headers ?? {},
       destination: options.destination ?? 'downloads',
     };
+    // Strip JS-only fields — functions cannot be serialized across the native bridge
     delete nativeOpts.onProgress;
     delete nativeOpts.queue;
     delete nativeOpts.priority;
     if (nativeOpts.retry) {
+      // Reconstruct retry without the onRetry callback to prevent function leak
       nativeOpts.retry = {
-        attempts: nativeOpts.retry.attempts,
+        attempts: nativeOpts.retry.attempts ?? 0,
         delay: nativeOpts.retry.delay,
       };
     }
@@ -405,7 +432,7 @@ export async function upload(options: UploadOptions): Promise<UploadResult> {
   let sub: any = null;
   const uploadId = options.uploadId || _generateId();
   if (options.onProgress) {
-    sub = eventEmitter.addListener('onUploadProgress', (e: any) => {
+    sub = getEventEmitter().addListener('onUploadProgress', (e: any) => {
       if (e.uploadId === uploadId) options.onProgress!(e.progress);
     });
   }
@@ -476,7 +503,20 @@ export async function clearCache(): Promise<ActionResult> {
   }
 }
 
-export async function getBackgroundDownloads(): Promise<any> {
+export interface BackgroundDownloadInfo {
+  downloadId: string;
+  url: string;
+  status: number;
+  progress: number;
+}
+
+export interface BackgroundDownloadsResult {
+  success: boolean;
+  downloads?: BackgroundDownloadInfo[];
+  error?: string;
+}
+
+export async function getBackgroundDownloads(): Promise<BackgroundDownloadsResult> {
   try {
     return await (FileToolkitModule as any).getBackgroundDownloads();
   } catch (err: any) {
@@ -575,7 +615,11 @@ export async function getCookies(domain: string): Promise<CookiesResult> {
   }
 }
 
-export async function clearCookies(domain: string = ''): Promise<ActionResult> {
+export async function clearAllCookies(): Promise<ActionResult> {
+  return clearCookies('');
+}
+
+export async function clearCookies(domain: string): Promise<ActionResult> {
   try {
     return await (FileToolkitModule as any).clearCookies(domain);
   } catch (err: any) {
@@ -640,6 +684,14 @@ async function _sessionClearAll(): Promise<ActionResult> {
     : { success: true };
 }
 
+/**
+ * Session management API for grouping downloaded files into named sessions.
+ *
+ * @remarks
+ * Sessions are stored in JS memory only — they do **not** persist across app
+ * restarts or React Native hot-reloads. Use sessions for temporary grouping
+ * within a single app lifecycle (e.g., clearing temp files on user logout).
+ */
 export const session: SessionApi = {
   add: _sessionAdd,
   get: _sessionGet,
@@ -650,8 +702,21 @@ export const session: SessionApi = {
 export const cookies = {
   get: getCookies,
   clear: clearCookies,
+  clearAll: clearAllCookies,
 };
 
+/**
+ * File system API — POSIX-style operations.
+ *
+ * @remarks
+ * All `fs.*` methods **throw** on failure (via exceptions), unlike top-level
+ * helpers such as `deleteFile()` which return `{ success: false }`.
+ *
+ * To avoid IDE auto-import conflicts with Node's built-in `fs`, consider:
+ * ```ts
+ * import { fs as fileSystem } from 'rn-file-toolkit';
+ * ```
+ */
 export const fs: FsApi = {
   exists,
   stat,
@@ -661,7 +726,8 @@ export const fs: FsApi = {
   copyFile,
   moveFile,
   deleteFile: async (p) => {
-    _ensure(await deleteFile(p), 'DEL_ERROR');
+    const res = await (FileToolkitModule as any).deleteFile(p);
+    _ensure(res, 'DEL_ERROR');
   },
   mkdir,
   ls,
@@ -669,20 +735,66 @@ export const fs: FsApi = {
   hash,
 };
 
-export function onDownloadComplete(cb: any) {
-  const s = eventEmitter.addListener('onDownloadComplete', cb);
+export interface DownloadCompleteEvent {
+  success: boolean;
+  downloadId: string;
+  filePath?: string;
+  error?: string;
+}
+
+export interface DownloadErrorEvent {
+  success: boolean;
+  downloadId: string;
+  error: string;
+}
+
+export interface UploadProgressEvent {
+  url: string;
+  uploadId: string;
+  progress: number;
+}
+
+export interface DownloadRetryEvent {
+  downloadId: string;
+  url: string;
+  attempt: number;
+  error: string;
+}
+
+export function onDownloadComplete(
+  cb: (event: DownloadCompleteEvent) => void
+): () => void {
+  const s = getEventEmitter().addListener(
+    'onDownloadComplete',
+    cb as (event: any) => void
+  );
   return () => s.remove();
 }
-export function onDownloadError(cb: any) {
-  const s = eventEmitter.addListener('onDownloadError', cb);
+export function onDownloadError(
+  cb: (event: DownloadErrorEvent) => void
+): () => void {
+  const s = getEventEmitter().addListener(
+    'onDownloadError',
+    cb as (event: any) => void
+  );
   return () => s.remove();
 }
-export function onUploadProgress(cb: any) {
-  const s = eventEmitter.addListener('onUploadProgress', cb);
+export function onUploadProgress(
+  cb: (event: UploadProgressEvent) => void
+): () => void {
+  const s = getEventEmitter().addListener(
+    'onUploadProgress',
+    cb as (event: any) => void
+  );
   return () => s.remove();
 }
-export function onDownloadRetry(cb: any) {
-  const s = eventEmitter.addListener('onDownloadRetry', cb);
+export function onDownloadRetry(
+  cb: (event: DownloadRetryEvent) => void
+): () => void {
+  const s = getEventEmitter().addListener(
+    'onDownloadRetry',
+    cb as (event: any) => void
+  );
   return () => s.remove();
 }
 
@@ -753,19 +865,25 @@ export interface ZipResult {
   error?: string;
 }
 
-export async function unzip(s: string, d: string): Promise<UnzipResult> {
+export async function unzip(
+  sourcePath: string,
+  destDir: string
+): Promise<UnzipResult> {
   try {
-    return await (FileToolkitModule as any).unzip(s, d);
-  } catch {
-    return { success: false, error: 'UNZIP_ERROR' };
+    return await (FileToolkitModule as any).unzip(sourcePath, destDir);
+  } catch (err: any) {
+    return { success: false, error: err?.message || 'UNZIP_ERROR' };
   }
 }
 
-export async function zip(s: string, d: string): Promise<ZipResult> {
+export async function zip(
+  sourcePath: string,
+  destPath: string
+): Promise<ZipResult> {
   try {
-    return await (FileToolkitModule as any).zip(s, d);
-  } catch {
-    return { success: false, error: 'ZIP_ERROR' };
+    return await (FileToolkitModule as any).zip(sourcePath, destPath);
+  } catch (err: any) {
+    return { success: false, error: err?.message || 'ZIP_ERROR' };
   }
 }
 
@@ -780,14 +898,34 @@ export interface UseDownloadReturn {
   downloadId: string | null;
 }
 
+/**
+ * React hook for managing a single download with progress, pause/resume, and cancel.
+ *
+ * @remarks
+ * The `start` callback is memoised with an empty dependency array but uses a
+ * ref internally to always read the **latest** `onProgress` callback you pass,
+ * so you do not need to memoise your options object.
+ */
 export function useDownload(): UseDownloadReturn {
   const [status, setStatus] = useState<any>('idle');
   const [progress, setProgress] = useState<ProgressInfo | null>(null);
   const [result, setResult] = useState<DownloadResult | null>(null);
   const [downloadId, setDownloadId] = useState<string | null>(null);
   const downloadIdRef = useRef<string | null>(null);
+  const latestOptsRef = useRef<DownloadOptions | null>(null);
+
+  // Cancel any in-flight download when the component unmounts to prevent
+  // native event listeners from calling setState on an unmounted component.
+  useEffect(() => {
+    return () => {
+      if (downloadIdRef.current) {
+        cancelDownload(downloadIdRef.current);
+      }
+    };
+  }, []);
 
   const start = useCallback(async (opts: DownloadOptions) => {
+    latestOptsRef.current = opts;
     const id = opts.downloadId || _generateId();
     setStatus('downloading');
     setProgress(null);
@@ -799,7 +937,8 @@ export function useDownload(): UseDownloadReturn {
       downloadId: id,
       onProgress: (p) => {
         setProgress(p);
-        opts.onProgress?.(p);
+        // Always call the latest onProgress — avoids stale-closure issues
+        latestOptsRef.current?.onProgress?.(p);
       },
     });
     setResult(res);
@@ -815,14 +954,14 @@ export function useDownload(): UseDownloadReturn {
 
   const pause = useCallback(async () => {
     if (downloadIdRef.current) {
-      await pauseDownload(downloadIdRef.current);
-      setStatus('paused');
+      const res = await pauseDownload(downloadIdRef.current);
+      if (res.success) setStatus('paused');
     }
   }, []);
   const resume = useCallback(async () => {
     if (downloadIdRef.current) {
-      await resumeDownload(downloadIdRef.current);
-      setStatus('downloading');
+      const res = await resumeDownload(downloadIdRef.current);
+      if (res.success) setStatus('downloading');
     }
   }, []);
   const cancel = useCallback(async () => {
@@ -839,6 +978,20 @@ export function useDownload(): UseDownloadReturn {
   return { start, pause, resume, cancel, status, progress, result, downloadId };
 }
 
+/**
+ * Default export — provides all APIs as a single namespace.
+ *
+ * **For optimal tree-shaking, prefer named imports:**
+ * ```ts
+ * import { download, upload, fs } from 'rn-file-toolkit';
+ * ```
+ *
+ * **Error handling patterns:**
+ * - Top-level functions (`download`, `upload`, `deleteFile`, etc.) return
+ *   `{ success: boolean; error?: string }` and **never throw**.
+ * - `fs.*` methods **throw** on failure via exceptions.
+ * - `useDownload()` sets `status` to `'error'` on failure.
+ */
 export default {
   download,
   upload,
@@ -872,6 +1025,7 @@ export default {
   hash,
   getCookies,
   clearCookies,
+  clearAllCookies,
   saveToMediaStore,
   fs,
   cookies,

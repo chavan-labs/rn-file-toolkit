@@ -13,18 +13,37 @@ const pkg = require('./package.json');
 const withFileToolkitPermissions = (config) => {
   // 1. Android: Add internet and storage permissions
   config = withAndroidManifest(config, (modConfig) => {
+    const manifest = modConfig.modResults.manifest;
+
+    // Ensure uses-permission array exists
+    if (!manifest['uses-permission']) {
+      manifest['uses-permission'] = [];
+    }
+
+    // INTERNET — no maxSdkVersion needed
     AndroidConfig.Permissions.addPermission(
       modConfig.modResults,
       'android.permission.INTERNET'
     );
-    AndroidConfig.Permissions.addPermission(
-      modConfig.modResults,
-      'android.permission.WRITE_EXTERNAL_STORAGE'
-    );
-    AndroidConfig.Permissions.addPermission(
-      modConfig.modResults,
-      'android.permission.READ_EXTERNAL_STORAGE'
-    );
+
+    // Storage permissions — only needed on API ≤ 32 (deprecated on Android 13+)
+    const addPermissionWithMaxSdk = (name, maxSdk) => {
+      const exists = manifest['uses-permission'].some(
+        (p) => p.$?.['android:name'] === name
+      );
+      if (!exists) {
+        manifest['uses-permission'].push({
+          $: {
+            'android:name': name,
+            'android:maxSdkVersion': String(maxSdk),
+          },
+        });
+      }
+    };
+
+    addPermissionWithMaxSdk('android.permission.WRITE_EXTERNAL_STORAGE', 32);
+    addPermissionWithMaxSdk('android.permission.READ_EXTERNAL_STORAGE', 32);
+
     return modConfig;
   });
 
@@ -36,6 +55,13 @@ const withFileToolkitPermissions = (config) => {
     if (!modConfig.modResults.UIBackgroundModes.includes('fetch')) {
       modConfig.modResults.UIBackgroundModes.push('fetch');
     }
+
+    // Photo Library write permission for saveToMediaStore
+    if (!modConfig.modResults.NSPhotoLibraryAddUsageDescription) {
+      modConfig.modResults.NSPhotoLibraryAddUsageDescription =
+        'Allow $(PRODUCT_NAME) to save downloaded media to your Photo Library';
+    }
+
     return modConfig;
   });
 

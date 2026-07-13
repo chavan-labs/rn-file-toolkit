@@ -30,6 +30,10 @@ export interface Spec extends TurboModule {
   getCookies(domain: string): Promise<Object>;
   clearCookies(domain: string): Promise<Object>;
   saveToMediaStore(options: Object): Promise<Object>;
+
+  // Event emitter support
+  addListener(eventName: string): void;
+  removeListeners(count: number): void;
 }
 
 export default TurboModuleRegistry.getEnforcing<Spec>('FileToolkit');
