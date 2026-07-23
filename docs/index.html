@@ -1,39 +1,935 @@
 <!DOCTYPE html>
-<html lang="en">
-  <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta name="description" content="rn-file-toolkit documentation" />
-    <title>rn-file-toolkit docs</title>
-    <link
-      rel="stylesheet"
-      href="https://cdn.jsdelivr.net/npm/docsify@4/lib/themes/vue.css"
-    />
+<html lang="en" class="scroll-smooth">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    
+    <!-- ==================== SEO & INDEXING ==================== -->
+    <title>rn-file-toolkit | Ultimate Native File Manager for React Native</title>
+    <meta name="description" content="The ultimate native file management toolkit for React Native & Expo. Features background downloads, resumable uploads, filesystem operations, queues, zip/unzip, and media utilities with zero third-party dependencies.">
+    <meta name="keywords" content="react-native, expo, ios, android, download, downloader, file-toolkit, file-download, background-download, download-manager, file-upload, file-manager, filesystem, zip, unzip, turbo-module">
+    <meta name="author" content="Rohit Chavan (chavan-labs)">
+    <meta name="robots" content="index, follow"> <!-- Explicitly tells Google to index -->
+    <link rel="canonical" href="https://chavan-labs.github.io/rn-file-toolkit/">
+    
+    <!-- Open Graph / Social Media -->
+    <meta property="og:title" content="rn-file-toolkit for React Native">
+    <meta property="og:description" content="Download, upload, manage queues, extract archives, and interact with the filesystem with zero third-party dependencies.">
+    <meta property="og:type" content="website">
+    <meta property="og:url" content="https://chavan-labs.github.io/rn-file-toolkit/">
+    <meta property="og:site_name" content="rn-file-toolkit Documentation">
+    
+    <!-- Twitter -->
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="rn-file-toolkit | Native File Manager for React Native">
+    <meta name="twitter:description" content="The ultimate native file management toolkit for React Native. Background downloads, queues, zip/unzip, and more.">
+    
+    <!-- ==================== FONTS & STYLES ==================== -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=Fira+Code:wght@400;500&display=swap" rel="stylesheet">
+    
+    <!-- PrismJS for Syntax Highlighting -->
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism-tomorrow.min.css" rel="stylesheet" />
+
     <style>
-      :root {
-        --theme-color: #2563eb;
-      }
-      .markdown-section {
-        max-width: 920px;
-      }
-      .app-name-link img {
-        max-height: 40px;
-      }
+        :root {
+            /* Color Palette */
+            --bg-color: #0d1117;
+            --bg-secondary: #161b22;
+            --bg-glass: rgba(13, 17, 23, 0.7);
+            --text-primary: #c9d1d9;
+            --text-secondary: #8b949e;
+            --accent-primary: #58a6ff;
+            --accent-hover: #3182ce;
+            --border-color: #30363d;
+            --code-bg: #1e1e1e;
+            --success-color: #2ea043;
+            
+            /* Typography */
+            --font-sans: 'Inter', system-ui, -apple-system, sans-serif;
+            --font-mono: 'Fira Code', monospace;
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            font-family: var(--font-sans);
+            background-color: var(--bg-color);
+            color: var(--text-primary);
+            line-height: 1.6;
+            -webkit-font-smoothing: antialiased;
+        }
+
+        /* Navbar (Glassmorphism) */
+        .top-nav {
+            position: fixed;
+            top: 0;
+            width: 100%;
+            background: var(--bg-glass);
+            backdrop-filter: blur(12px);
+            -webkit-backdrop-filter: blur(12px);
+            border-bottom: 1px solid var(--border-color);
+            z-index: 1000;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 1rem 2rem;
+            transition: all 0.3s ease;
+        }
+
+        .top-nav .logo {
+            font-size: 1.25rem;
+            font-weight: 700;
+            color: #fff;
+            text-decoration: none;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        .top-nav .nav-links {
+            display: flex;
+            gap: 1.5rem;
+        }
+
+        .top-nav .nav-links a {
+            color: var(--text-secondary);
+            text-decoration: none;
+            font-weight: 500;
+            transition: color 0.2s;
+        }
+
+        .top-nav .nav-links a:hover {
+            color: #fff;
+        }
+
+        /* Layout */
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 80px 20px 40px; /* Offset for sticky nav */
+            display: grid;
+            grid-template-columns: 250px 1fr;
+            gap: 2rem;
+        }
+
+        /* Sidebar */
+        aside {
+            position: sticky;
+            top: 100px;
+            height: calc(100vh - 120px);
+            overflow-y: auto;
+            padding-right: 1rem;
+        }
+
+        aside h3 {
+            color: #fff;
+            font-size: 0.875rem;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            margin-bottom: 1rem;
+            margin-top: 2rem;
+        }
+
+        aside h3:first-child {
+            margin-top: 0;
+        }
+
+        aside ul {
+            list-style: none;
+        }
+
+        aside ul li {
+            margin-bottom: 0.5rem;
+        }
+
+        aside ul li a {
+            color: var(--text-secondary);
+            text-decoration: none;
+            font-size: 0.95rem;
+            transition: color 0.2s;
+            display: block;
+            padding: 0.25rem 0;
+        }
+
+        aside ul li a:hover {
+            color: var(--accent-primary);
+        }
+
+        /* Main Content */
+        main {
+            min-width: 0; /* Prevent overflow in grid */
+        }
+
+        /* Hero Section */
+        .hero {
+            text-align: center;
+            padding: 4rem 0;
+            border-bottom: 1px solid var(--border-color);
+            margin-bottom: 3rem;
+            background: radial-gradient(circle at top, #1f2937 0%, var(--bg-color) 60%);
+            border-radius: 12px;
+        }
+
+        .hero h1 {
+            font-size: 3.5rem;
+            font-weight: 800;
+            color: #fff;
+            margin-bottom: 1rem;
+            letter-spacing: -0.02em;
+            background: linear-gradient(to right, #58a6ff, #10b981);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+
+        .hero p {
+            font-size: 1.25rem;
+            color: var(--text-secondary);
+            max-width: 600px;
+            margin: 0 auto 2rem;
+        }
+
+        .badges {
+            display: flex;
+            justify-content: center;
+            flex-wrap: wrap;
+            gap: 0.5rem;
+            margin-bottom: 2rem;
+        }
+
+        .badges img {
+            height: 28px;
+        }
+
+        .btn {
+            display: inline-block;
+            padding: 0.75rem 1.5rem;
+            font-size: 1rem;
+            font-weight: 600;
+            border-radius: 8px;
+            text-decoration: none;
+            transition: transform 0.2s, box-shadow 0.2s;
+        }
+
+        .btn-primary {
+            background-color: var(--accent-primary);
+            color: var(--bg-color);
+        }
+
+        .btn-primary:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(88, 166, 255, 0.4);
+            color: var(--bg-color);
+        }
+
+        .btn-secondary {
+            background-color: var(--bg-secondary);
+            color: #fff;
+            border: 1px solid var(--border-color);
+            margin-left: 1rem;
+        }
+
+        .btn-secondary:hover {
+            border-color: var(--accent-primary);
+        }
+
+        /* Content Typography & Elements */
+        h2 {
+            font-size: 2rem;
+            color: #fff;
+            margin: 2.5rem 0 1rem;
+            padding-bottom: 0.5rem;
+            border-bottom: 1px solid var(--border-color);
+        }
+
+        h3 {
+            font-size: 1.5rem;
+            color: #e6edf3;
+            margin: 2rem 0 0.75rem;
+        }
+        
+        h4 {
+            font-size: 1.15rem;
+            color: #e6edf3;
+            margin: 1.5rem 0 0.5rem;
+        }
+
+        p {
+            margin-bottom: 1.25rem;
+        }
+        
+        ul, ol {
+            margin-bottom: 1.25rem;
+            padding-left: 1.5rem;
+        }
+        
+        li {
+            margin-bottom: 0.5rem;
+        }
+        
+        blockquote {
+            border-left: 4px solid var(--accent-primary);
+            background: rgba(88, 166, 255, 0.1);
+            padding: 1rem;
+            border-radius: 0 8px 8px 0;
+            margin: 1.5rem 0;
+        }
+
+        /* Feature Cards */
+        .features-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 1.5rem;
+            margin: 2rem 0;
+        }
+
+        .feature-card {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            padding: 1.5rem;
+            transition: transform 0.2s, border-color 0.2s;
+        }
+
+        .feature-card:hover {
+            transform: translateY(-5px);
+            border-color: var(--accent-primary);
+        }
+
+        .feature-icon {
+            font-size: 2rem;
+            margin-bottom: 1rem;
+            display: block;
+        }
+
+        .feature-card h4 {
+            color: #fff;
+            font-size: 1.1rem;
+            margin-bottom: 0.5rem;
+        }
+
+        /* Code Blocks */
+        pre[class*="language-"] {
+            background: var(--code-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            padding: 1.25rem;
+            margin: 1.5rem 0;
+            overflow-x: auto;
+            font-family: var(--font-mono);
+            font-size: 0.9rem;
+            box-shadow: inset 0 2px 4px rgba(0,0,0,0.2);
+        }
+
+        code[class*="language-"], 
+        :not(pre) > code {
+            font-family: var(--font-mono);
+            font-size: 0.9em;
+        }
+
+        :not(pre) > code {
+            background: rgba(110, 118, 129, 0.4);
+            padding: 0.2em 0.4em;
+            border-radius: 6px;
+            color: #fff;
+        }
+
+        /* Tables */
+        .table-wrapper {
+            overflow-x: auto;
+            margin: 2rem 0;
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+        }
+        
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 0.95rem;
+        }
+
+        th, td {
+            padding: 0.75rem 1rem;
+            text-align: left;
+            border-bottom: 1px solid var(--border-color);
+        }
+
+        th {
+            background-color: var(--bg-secondary);
+            color: #fff;
+            font-weight: 600;
+        }
+
+        tr:hover {
+            background-color: rgba(255, 255, 255, 0.03);
+        }
+
+        /* Responsive */
+        @media (max-width: 860px) {
+            .container {
+                grid-template-columns: 1fr;
+            }
+            aside {
+                display: none; /* Hide sidebar on mobile */
+            }
+            .hero h1 {
+                font-size: 2.5rem;
+            }
+        }
     </style>
-  </head>
-  <body>
-    <div id="app">Loading docs…</div>
-    <script>
-      window.$docsify = {
-        name: 'rn-file-toolkit',
-        repo: 'https://github.com/chavan-labs/rn-file-toolkit',
-        loadSidebar: true,
-        auto2top: true,
-        subMaxLevel: 2,
-        search: 'auto',
-      };
-    </script>
-    <script src="https://cdn.jsdelivr.net/npm/docsify@4"></script>
-    <script src="https://cdn.jsdelivr.net/npm/docsify/lib/plugins/search.min.js"></script>
-  </body>
+</head>
+<body>
+
+    <!-- Navigation -->
+    <nav class="top-nav">
+        <a href="#" class="logo">
+             rn-file-toolkit
+        </a>
+        <div class="nav-links">
+            <a href="https://github.com/chavan-labs/rn-file-toolkit">GitHub</a>
+            <a href="https://www.npmjs.com/package/rn-file-toolkit">npm</a>
+        </div>
+    </nav>
+
+    <div class="container">
+        <!-- Sidebar Navigation -->
+        <aside>
+            <nav aria-label="Table of contents">
+                <h3>Getting Started</h3>
+                <ul>
+                    <li><a href="#introduction">Introduction</a></li>
+                    <li><a href="#installation">Installation</a></li>
+                    <li><a href="#quick-start">Quick Start</a></li>
+                </ul>
+
+                <h3>Core APIs</h3>
+                <ul>
+                    <li><a href="#background-downloads">Downloads</a></li>
+                    <li><a href="#download-controls">Controls</a></li>
+                    <li><a href="#multipart-uploads">Uploads</a></li>
+                    <li><a href="#queue-management">Queue Management</a></li>
+                    <li><a href="#file-system">File System (FS)</a></li>
+                    <li><a href="#zip-unzip">Zip & Unzip</a></li>
+                    <li><a href="#cache-management">Cache Management</a></li>
+                </ul>
+                
+                <h3>Utilities</h3>
+                <ul>
+                    <li><a href="#media-utilities">Media & Sharing</a></li>
+                    <li><a href="#disk-space">Disk Space</a></li>
+                    <li><a href="#file-appending">File Appending</a></li>
+                    <li><a href="#file-hashing">File Hashing</a></li>
+                    <li><a href="#session-management">Sessions</a></li>
+                    <li><a href="#cookie-management">Cookies</a></li>
+                    <li><a href="#mediastore">MediaStore / Photos</a></li>
+                    <li><a href="#event-listeners">Event Listeners</a></li>
+                </ul>
+                
+                <h3>Reference</h3>
+                <ul>
+                    <li><a href="#api-reference">API Reference</a></li>
+                    <li><a href="#expo-support">Expo Support</a></li>
+                    <li><a href="#comparison">Comparison</a></li>
+                </ul>
+            </nav>
+        </aside>
+
+        <!-- Main Content -->
+        <main>
+            <!-- Hero Section -->
+            <section class="hero" id="introduction">
+                <h1>rn-file-toolkit</h1>
+                <p>The ultimate, unified native file management toolkit for React Native & Expo.</p>
+                
+                <div class="badges">
+                    <img src="https://img.shields.io/npm/v/rn-file-toolkit.svg?style=for-the-badge&color=2ea043" alt="npm version">
+                    <img src="https://img.shields.io/npm/dt/rn-file-toolkit.svg?style=for-the-badge" alt="npm downloads">
+                    <img src="https://img.shields.io/badge/TypeScript-Ready-blue.svg?style=for-the-badge&logo=typescript" alt="TypeScript">
+                </div>
+
+                <div>
+                    <a href="#installation" class="btn btn-primary">Get Started</a>
+                    <a href="https://github.com/chavan-labs/rn-file-toolkit" target="_blank" class="btn btn-secondary">View on GitHub</a>
+                </div>
+            </section>
+
+            <!-- Features Grid -->
+            <section id="features">
+                <h2>Why rn-file-toolkit?</h2>
+                <p>Most React Native file solutions are fragmented or lightly maintained. <strong>rn-file-toolkit</strong> gives you a unified, TurboModule-compatible API utilizing OS-native managers for reliable operations.</p>
+                
+                <div class="features-grid">
+                    <div class="feature-card">
+                        <span class="feature-icon"></span>
+                        <h4>React Hooks Ready</h4>
+                        <p>Built-in state management with <code>useDownload</code> for progress, speeds, and ETA.</p>
+                    </div>
+                    <div class="feature-card">
+                        <span class="feature-icon"></span>
+                        <h4>Background Persistence</h4>
+                        <p>Downloads and uploads survive app suspension with automatic re-attachment.</p>
+                    </div>
+                    <div class="feature-card">
+                        <span class="feature-icon"></span>
+                        <h4>Smart Queueing</h4>
+                        <p>Cap concurrency and set priorities globally without touching native code.</p>
+                    </div>
+                    <div class="feature-card">
+                        <span class="feature-icon"></span>
+                        <h4>Zero-Dependency Zip</h4>
+                        <p>Compress and extract using native <code>java.util.zip</code> and iOS <code>zlib</code>.</p>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Installation -->
+            <section id="installation">
+                <h2>Installation</h2>
+                <p>Install the library using your preferred package manager:</p>
+<pre><code class="language-bash"># npm
+npm install rn-file-toolkit
+
+# yarn
+yarn add rn-file-toolkit
+
+# pnpm
+pnpm add rn-file-toolkit</code></pre>
+                <p><em>(Optional) If you are not using Expo or an auto-linking setup, run <code>pod install</code> in your <code>ios</code> directory.</em></p>
+            </section>
+
+            <!-- Quick Start -->
+            <section id="quick-start">
+                <h2>Quick Start: useDownload</h2>
+                <p>The easiest way to manage a download inside a React component. Get status, rich progress (with speed & ETA), and full controls instantly.</p>
+<pre><code class="language-tsx">import React from 'react';
+import { View, Text, Button } from 'react-native';
+import { useDownload } from 'rn-file-toolkit';
+
+export default function DownloadScreen() {
+  const { start, pause, resume, cancel, status, progress, result } = useDownload();
+
+  return (
+    &lt;View style={{ padding: 20 }}&gt;
+      &lt;Button
+        title="Start Download"
+        onPress={() =&gt;
+          start({
+            url: 'https://example.com/large-video.mp4',
+            destination: 'documents',
+          })
+        }
+      /&gt;
+
+      {status === 'downloading' &amp;&amp; progress &amp;&amp; (
+        &lt;View style={{ marginTop: 20 }}&gt;
+          &lt;Text&gt;Progress: {progress.percent.toFixed(1)}%&lt;/Text&gt;
+          &lt;Text&gt;Speed: {(progress.speedBps / 1024 / 1024).toFixed(2)} MB/s&lt;/Text&gt;
+          &lt;Text&gt;ETA: {progress.etaSeconds.toFixed(0)} seconds&lt;/Text&gt;
+          
+          &lt;View style={{ flexDirection: 'row', gap: 10, marginTop: 10 }}&gt;
+            &lt;Button title="Pause" onPress={pause} /&gt;
+            &lt;Button title="Cancel" onPress={cancel} color="red" /&gt;
+          &lt;/View&gt;
+        &lt;/View&gt;
+      )}
+
+      {status === 'done' &amp;&amp; &lt;Text style={{ color: 'green' }}&gt;Saved: {result?.filePath}&lt;/Text&gt;}
+      {status === 'error' &amp;&amp; &lt;Text style={{ color: 'red' }}&gt;Error: {result?.error}&lt;/Text&gt;}
+    &lt;/View&gt;
+  );
+}</code></pre>
+            </section>
+
+            <!-- Background Downloads -->
+            <section id="background-downloads">
+                <h2>Background Downloads</h2>
+                <p>For programmatic, queue-aware background downloads outside of React components.</p>
+<pre><code class="language-typescript">import { download } from 'rn-file-toolkit';
+
+const result = await download({
+  url: 'https://example.com/file.pdf',
+  fileName: 'report.pdf', // Optional custom filename
+  destination: 'documents', // 'downloads' | 'cache' | 'documents'
+  background: true, // Survive app suspension
+  headers: { Authorization: 'Bearer token' },
+  queue: true, // Join the managed queue
+  priority: 'high', // 'high' | 'normal'
+  downloadId: 'my-unique-id', // Optional custom ID for tracking
+  notificationTitle: 'Downloading report…', // Android notification
+  notificationDescription: 'Please wait',
+  checksum: { hash: 'abc123...', algorithm: 'sha256' }, // Verify integrity
+  retry: {
+    attempts: 3,
+    delay: 1000,
+    onRetry: (attempt, error) => console.warn(`Retry #${attempt}: ${error}`),
+  },
+  onProgress: (p) => console.log(`${p.percent.toFixed(1)}% downloaded`),
+});
+
+console.log(result.filePath); // Path to the downloaded file</code></pre>
+            </section>
+            
+            <!-- Download Controls -->
+            <section id="download-controls">
+                <h2>Download Controls</h2>
+                <p>Pause, resume, or cancel any active download by its ID—works both inside and outside React components.</p>
+<pre><code class="language-typescript">import {
+  download,
+  pauseDownload,
+  resumeDownload,
+  cancelDownload,
+} from 'rn-file-toolkit';
+
+// Start a download with a known ID
+const result = download({
+  url: 'https://example.com/large-video.mp4',
+  downloadId: 'video-1',
+  destination: 'documents',
+});
+
+// Later… pause, resume, or cancel by ID
+await pauseDownload('video-1');
+await resumeDownload('video-1');
+await cancelDownload('video-1');</code></pre>
+            </section>
+            
+            <!-- Multipart Uploads -->
+            <section id="multipart-uploads">
+                <h2>Multipart Uploads</h2>
+                <p>Robust, memory-efficient multipart file uploading for large media or documents.</p>
+<pre><code class="language-typescript">import { upload } from 'rn-file-toolkit';
+
+const result = await upload({
+  url: 'https://api.example.com/v1/upload',
+  filePath: '/path/to/local/image.jpg',
+  fieldName: 'file',
+  headers: { Authorization: 'Bearer token' },
+  parameters: { userId: '123', folder: 'avatars' },
+  uploadId: 'upload-1', // Optional custom ID for tracking
+  onProgress: (percent) => console.log(`Uploading: ${percent}%`),
+});
+
+console.log(result.status); // HTTP status code
+console.log(result.data); // Server response body</code></pre>
+            </section>
+            
+            <!-- Queue Management -->
+            <section id="queue-management">
+                <h2>Queue Management</h2>
+                <p>Control download concurrency globally and inspect the queue state.</p>
+<pre><code class="language-typescript">import { setQueueOptions, getQueueStatus, getBackgroundDownloads } from 'rn-file-toolkit';
+
+// Set the maximum number of simultaneous downloads
+setQueueOptions({ maxConcurrent: 3 });
+
+// Inspect the queue at any time
+const status = getQueueStatus();
+console.log(status.active); // Currently downloading
+console.log(status.pending); // Waiting in queue
+console.log(status.maxConcurrent); // Concurrency cap
+
+// Retrieve all background downloads currently running
+const active = await getBackgroundDownloads();
+console.log(active); // Array of background download descriptors</code></pre>
+            </section>
+
+            <!-- File System -->
+            <section id="file-system">
+                <h2>File System (FS)</h2>
+                <p>Perform native filesystem operations securely. Available via the namespaced <code>fs</code> object.</p>
+<pre><code class="language-typescript">import { fs } from 'rn-file-toolkit';
+
+// Check & Inspect
+const exists = await fs.exists('/path/to/data.json');
+const stats = await fs.stat('/path/to/data.json'); // { path, name, size, modified, isDir }
+
+// Read & Write
+await fs.writeFile('/path/to/data.txt', 'Hello World', 'utf8');
+const content = await fs.readFile('/path/to/data.txt', 'utf8');
+
+// Manage Folders & Files
+await fs.mkdir('/path/to/new_folder');
+const files = await fs.ls('/path/to/new_folder');
+await fs.copyFile('/path/src.txt', '/path/dest.txt');
+await fs.moveFile('/path/old.txt', '/path/new.txt');
+await fs.deleteFile('/path/unwanted.txt');</code></pre>
+            </section>
+            
+            <!-- Zip & Unzip -->
+            <section id="zip-unzip">
+                <h2>Zip & Unzip Archives</h2>
+                <p>Compress and extract archives directly on the device using native <code>java.util.zip</code> (Android) and <code>zlib</code> (iOS).</p>
+<pre><code class="language-typescript">import { unzip, zip } from 'rn-file-toolkit';
+
+// Extract a downloaded zip
+const unzipResult = await unzip('/path/to/bundle.zip', '/path/to/extract-folder');
+console.log(unzipResult.files); // List of extracted file paths
+
+// Compress user data before uploading
+const zipResult = await zip('/path/to/user-data-folder', '/path/to/backup.zip');
+console.log(zipResult.zipPath); // Path to the created archive</code></pre>
+            </section>
+            
+            <!-- Cache Management -->
+            <section id="cache-management">
+                <h2>Cache Management</h2>
+                <p>Inspect and clear files stored in the cache directory.</p>
+<pre><code class="language-typescript">import { getCachedFiles, clearCache } from 'rn-file-toolkit';
+
+// List all cached files with metadata
+const cache = await getCachedFiles();
+cache.files?.forEach((f) => {
+  console.log(f.fileName, f.filePath, f.size, f.modifiedAt);
+});
+
+// Wipe the entire cache directory
+await clearCache();</code></pre>
+            </section>
+            
+            <!-- Media & Utilities -->
+            <section id="media-utilities">
+                <h2>Media & Utilities</h2>
+                <p>Helpful tools for sharing, opening, and encoding files.</p>
+<pre><code class="language-typescript">import { saveBase64AsFile, urlToBase64, shareFile, openFile } from 'rn-file-toolkit';
+
+// Base64 to File (accepts raw base64 or data URIs)
+await saveBase64AsFile({
+  base64Data: 'data:image/png;base64,...',
+  destination: 'documents',
+  fileName: 'image.png',
+});
+
+// URL to Base64 (great for caching small images)
+const b64 = await urlToBase64({
+  url: 'https://example.com/icon.png',
+  headers: { Authorization: 'Bearer token' }, // Optional
+});
+console.log(b64.dataUri); // Ready-to-use data URI string
+
+// Native Share Sheet
+await shareFile({
+  filePath: '/path/to/report.pdf',
+  title: 'Share report',
+  subject: 'Monthly report',
+});
+
+// Open with default system app
+await openFile({
+  filePath: '/path/to/report.pdf',
+  mimeType: 'application/pdf',
+});</code></pre>
+            </section>
+            
+            <!-- Disk Space -->
+            <section id="disk-space">
+                <h2>Disk Space</h2>
+                <p>Check available and total device storage.</p>
+<pre><code class="language-typescript">import { df } from 'rn-file-toolkit';
+
+const space = await df();
+if (space.success) {
+  console.log(`Free: ${(space.freeBytes! / 1024 / 1024 / 1024).toFixed(2)} GB`);
+  console.log(`Total: ${(space.totalBytes! / 1024 / 1024 / 1024).toFixed(2)} GB`);
+}</code></pre>
+            </section>
+            
+            <!-- File Appending -->
+            <section id="file-appending">
+                <h2>File Appending</h2>
+                <p>Append data to the end of a file without overwriting existing content.</p>
+<pre><code class="language-typescript">import { appendFile } from 'rn-file-toolkit';
+
+// Append a log line
+await appendFile('/path/to/log.txt', 'New log entry\n');
+
+// Append base64 data
+await appendFile('/path/to/data.bin', base64String, 'base64');</code></pre>
+            </section>
+            
+            <!-- File Hashing -->
+            <section id="file-hashing">
+                <h2>File Hashing</h2>
+                <p>Compute the MD5, SHA-1, or SHA-256 hash of any file on disk.</p>
+<pre><code class="language-typescript">import { hash } from 'rn-file-toolkit';
+
+const result = await hash('/path/to/file.zip', 'sha256');
+if (result.success) {
+  console.log('SHA-256:', result.hash);
+}</code></pre>
+            </section>
+            
+            <!-- Session Management -->
+            <section id="session-management">
+                <h2>Session Management</h2>
+                <p>Group downloaded files into sessions for batch cleanup. Useful for temporary workflows.</p>
+<pre><code class="language-typescript">import { session, download } from 'rn-file-toolkit';
+
+// Download files and track them in a session
+const result = await download({ url: 'https://example.com/tmp1.pdf', destination: 'cache' });
+if (result.filePath) session.add('my-workflow', result.filePath);
+
+// List session files
+console.log(session.get('my-workflow')); // ['/path/to/tmp1.pdf']
+
+// Clean up everything when done
+await session.clear('my-workflow');</code></pre>
+            </section>
+            
+            <!-- Cookie Management -->
+            <section id="cookie-management">
+                <h2>Cookie Management</h2>
+                <p>Read and clear HTTP cookies from the platform's shared cookie store.</p>
+<pre><code class="language-typescript">import { getCookies, clearCookies } from 'rn-file-toolkit';
+
+// Get cookies for a domain
+const result = await getCookies('example.com');
+result.cookies?.forEach((c) => {
+  console.log(`${c.name}=${c.value} (domain: ${c.domain})`);
+});
+
+// Clear cookies for a specific domain
+await clearCookies('example.com');
+
+// Clear ALL cookies
+await clearCookies();</code></pre>
+            </section>
+
+            <!-- MediaStore -->
+            <section id="mediastore">
+                <h2>MediaStore / Photos Library</h2>
+                <p>Save files directly to the device's shared media gallery (Photos on iOS, MediaStore on Android).</p>
+<pre><code class="language-typescript">import { saveToMediaStore } from 'rn-file-toolkit';
+
+const result = await saveToMediaStore({
+  filePath: '/path/to/photo.jpg',
+  mediaType: 'image',
+  album: 'MyApp',  // Optional album/subfolder
+});
+console.log(result.uri); // content://... (Android) or file path (iOS)</code></pre>
+                <blockquote>
+                    <strong>Note:</strong> iOS requires <code>NSPhotoLibraryAddUsageDescription</code> in your Info.plist for image/video saves.
+                </blockquote>
+            </section>
+            
+            <!-- Event Listeners -->
+            <section id="event-listeners">
+                <h2>Event Listeners</h2>
+                <p>Subscribe to global download and upload lifecycle events. Each listener returns an unsubscribe function.</p>
+<pre><code class="language-typescript">import { onDownloadComplete, onDownloadError, onDownloadRetry, onUploadProgress } from 'rn-file-toolkit';
+
+// Subscribe
+const unsub1 = onDownloadComplete((event) => console.log('Done:', event));
+const unsub2 = onDownloadError((event) => console.error('Failed:', event));
+const unsub3 = onDownloadRetry((event) => console.warn(`Retry #${event.attempt}`));
+const unsub4 = onUploadProgress((event) => console.log(`Upload ${event.progress}%`));
+
+// Clean up
+unsub1();
+unsub2();
+unsub3();
+unsub4();</code></pre>
+            </section>
+
+            <!-- API Reference -->
+            <section id="api-reference">
+                <h2>API Reference</h2>
+                <div class="table-wrapper">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Interface</th>
+                                <th>Description</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td><code>DownloadOptions</code></td>
+                                <td>Full configuration for downloading a file (url, priority, background, etc.).</td>
+                            </tr>
+                            <tr>
+                                <td><code>UploadOptions</code></td>
+                                <td>Configuration for multipart uploads.</td>
+                            </tr>
+                            <tr>
+                                <td><code>ProgressInfo</code></td>
+                                <td>Rich real-time download progress payload (percent, speed, eta).</td>
+                            </tr>
+                            <tr>
+                                <td><code>DownloadResult</code></td>
+                                <td>Result returned after a download completes.</td>
+                            </tr>
+                            <tr>
+                                <td><code>FsApi</code></td>
+                                <td>Namespaced filesystem API containing stat, read, write, etc.</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </section>
+
+            <!-- Expo Support -->
+            <section id="expo-support">
+                <h2>Expo Support</h2>
+                <p><strong>rn-file-toolkit</strong> works seamlessly with Expo custom development clients (EAS Build / <code>npx expo run:android</code> / <code>npx expo run:ios</code>). Since it contains native code, it is not compatible with Expo Go.</p>
+                <p>An Expo config plugin is included automatically. No extra configuration is needed in your <code>app.json</code> unless you want to customize permissions.</p>
+            </section>
+
+            <!-- Comparison Table -->
+            <section id="comparison">
+                <h2>How does it compare?</h2>
+                <div class="table-wrapper">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Feature</th>
+                                <th><code>rn-file-toolkit</code></th>
+                                <th><code>react-native-fs</code> / <code>rn-fetch-blob</code></th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td><strong>Background Persistence</strong></td>
+                                <td>Yes</td>
+                                <td>Spotty / Legacy</td>
+                            </tr>
+                            <tr>
+                                <td><strong>Smart Queueing & Concurrency</strong></td>
+                                <td>Built-in</td>
+                                <td>Write your own</td>
+                            </tr>
+                            <tr>
+                                <td><strong>React Hooks (<code>useDownload</code>)</strong></td>
+                                <td>Out-of-the-box</td>
+                                <td>Manual</td>
+                            </tr>
+                            <tr>
+                                <td><strong>Auto-Retries & Resumption</strong></td>
+                                <td>Yes</td>
+                                <td>Manual</td>
+                            </tr>
+                            <tr>
+                                <td><strong>Expo Support</strong></td>
+                                <td>Seamless (Custom Dev Client)</td>
+                                <td>Requires heavy config</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </section>
+        </main>
+    </div>
+
+    <!-- PrismJS for syntax highlighting execution -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-typescript.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-jsx.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-tsx.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-bash.min.js"></script>
+
+</body>
 </html>
