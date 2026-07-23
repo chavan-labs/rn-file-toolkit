@@ -462,6 +462,7 @@ class FileToolkitModule(private val reactContext: ReactApplicationContext) :
         val statusIdx = c.getColumnIndex(DownloadManager.COLUMN_STATUS)
         val totalIdx = c.getColumnIndex(DownloadManager.COLUMN_TOTAL_SIZE_BYTES)
         val currentIdx = c.getColumnIndex(DownloadManager.COLUMN_BYTES_DOWNLOADED_SO_FAR)
+        val uriIdx = c.getColumnIndex(DownloadManager.COLUMN_URI)
         do {
           val bgId = c.getLong(idIdx)
           if (!currentBgIds.contains(bgId)) continue
@@ -473,7 +474,9 @@ class FileToolkitModule(private val reactContext: ReactApplicationContext) :
             val current = c.getLong(currentIdx)
             if (status == DownloadManager.STATUS_RUNNING || status == DownloadManager.STATUS_PENDING) {
               val progress = if (total > 0) (current * 100 / total).toInt() else 0
+              val uriString = c.getString(uriIdx) ?: ""
               val evt = Arguments.createMap().apply {
+                putString("url", uriString)
                 putString("downloadId", downloadId)
                 putInt("progress", progress)
                 putDouble("bytesDownloaded", current.toDouble())

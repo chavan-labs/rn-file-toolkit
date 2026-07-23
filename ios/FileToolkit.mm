@@ -240,13 +240,24 @@ RCT_EXPORT_MODULE()
     }
 
     [task cancelByProducingResumeData:^(NSData *resumeData) {
+        __block RCTPromiseResolveBlock originalResolve = nil;
         dispatch_sync(self.syncQueue, ^{
             if (resumeData) {
                 self.resumeDataStore[downloadId] = resumeData;
+            } else {
+                NSDictionary *funcs = self.activePromises[downloadId];
+                if (funcs) {
+                    originalResolve = funcs[@"resolve"];
+                }
+                [self.activePromises removeObjectForKey:downloadId];
+                [self.downloadOptions removeObjectForKey:downloadId];
             }
             [self.activeTasks removeObjectForKey:downloadId];
         });
-        resolve(@{@"success": @YES});
+        if (originalResolve) {
+            originalResolve(@{@"success": @NO, @"error": @"Download could not be paused and was cancelled"});
+        }
+        resolve(@{@"success": resumeData ? @YES : @NO});
     }];
 }
 
@@ -663,14 +674,16 @@ totalBytesExpectedToWrite:(int64_t)totalBytesExpectedToWrite {
             NSString *downloadId = strongSelf.taskIdMap[taskKey];
             if (!downloadId) return;
             
-            [strongSelf sendEventWithName:@"onDownloadProgress"
-                               body:@{
-                                   @"url": url,
-                                   @"downloadId": downloadId,
-                                   @"progress": @(progress),
-                                   @"bytesDownloaded": @(totalBytesWritten),
-                                   @"totalBytes": @(totalBytesExpectedToWrite)
-                               }];
+            if (strongSelf.hasListeners) {
+                [strongSelf sendEventWithName:@"onDownloadProgress"
+                                   body:@{
+                                       @"url": url,
+                                       @"downloadId": downloadId,
+                                       @"progress": @(progress),
+                                       @"bytesDownloaded": @(totalBytesWritten),
+                                       @"totalBytes": @(totalBytesExpectedToWrite)
+                                   }];
+            }
         });
     }
 }
@@ -737,13 +750,15 @@ didFinishDownloadingToURL:(NSURL *)location {
         resolve(resultDict);
         // Also emit the error event for foreground failures so global listeners fire
         // consistently across platforms (mirrors Android behaviour).
-        if (isError) {
+        if (isError && self.hasListeners) {
             [self sendEventWithName:@"onDownloadError" body:resultDict];
         }
     } else {
         // Background: fire the correct event based on isError flag
         NSString *event = isError ? @"onDownloadError" : @"onDownloadComplete";
-        [self sendEventWithName:event body:resultDict];
+        if (self.hasListeners) {
+            [self sendEventWithName:event body:resultDict];
+        }
     }
 
     dispatch_sync(self.syncQueue, ^{
@@ -854,12 +869,14 @@ didCompleteWithError:(NSError *)error {
         NSInteger delayMs = MIN(baseDelay * (1 << shiftBits), (NSInteger)30000);
 
         // Emit retry event so JS onRetry callback is called
-        [self sendEventWithName:@"onDownloadRetry" body:@{
-            @"downloadId": downloadId,
-            @"url": options[@"url"] ?: @"",
-            @"attempt": @(nextAttempt),
-            @"error": error.localizedDescription ?: @""
-        }];
+        if (self.hasListeners) {
+            [self sendEventWithName:@"onDownloadRetry" body:@{
+                @"downloadId": downloadId,
+                @"url": options[@"url"] ?: @"",
+                @"attempt": @(nextAttempt),
+                @"error": error.localizedDescription ?: @""
+            }];
+        }
 
         __weak typeof(self) weakSelf = self;
         dispatch_after(
@@ -904,7 +921,9 @@ didCompleteWithError:(NSError *)error {
         funcs = self.activePromises[downloadId];
     });
     // Always emit the event so global onDownloadError listeners fire on both platforms.
-    [self sendEventWithName:@"onDownloadError" body:errDict];
+    if (self.hasListeners) {
+        [self sendEventWithName:@"onDownloadError" body:errDict];
+    }
     if (funcs && !isBackground) {
         RCTPromiseResolveBlock resolve = funcs[@"resolve"];
         resolve(errDict);
@@ -935,8 +954,10 @@ totalBytesExpectedToSend:(int64_t)totalBytesExpectedToSend {
             NSString *uploadId = strongSelf.uploadTaskIdMap[taskKey];
             if (uploadId) {
                 NSString *url = strongSelf.uploadUrls[uploadId] ?: @"";
-                [strongSelf sendEventWithName:@"onUploadProgress"
-                                   body:@{@"url": url, @"uploadId": uploadId, @"progress": @(progress)}];
+                if (strongSelf.hasListeners) {
+                    [strongSelf sendEventWithName:@"onUploadProgress"
+                                       body:@{@"url": url, @"uploadId": uploadId, @"progress": @(progress)}];
+                }
             }
         });
     }
@@ -1173,6 +1194,7 @@ RCT_EXPORT_METHOD(urlToBase64:(NSDictionary *)options
     }];
     
     [task resume];
+    [session finishTasksAndInvalidate];
 }
 
 // ─── topMostViewController (works with both AppDelegate-window and SceneDelegate) ─────
@@ -1374,6 +1396,7 @@ RCT_EXPORT_METHOD(unzip:(NSString *)sourcePath
         memcpy(&sig, bytes + offset, 4);
         if (sig != 0x04034b50) break; // no more local headers
 
+        uint16_t flags         = 0; memcpy(&flags,         bytes + offset + 6,  2);
         uint16_t method        = 0; memcpy(&method,        bytes + offset + 8,  2);
         uint32_t crc32val      = 0; memcpy(&crc32val,      bytes + offset + 14, 4);
         uint32_t compSize      = 0; memcpy(&compSize,      bytes + offset + 18, 4);
@@ -1382,11 +1405,14 @@ RCT_EXPORT_METHOD(unzip:(NSString *)sourcePath
         uint16_t extraFieldLen = 0; memcpy(&extraFieldLen, bytes + offset + 28, 2);
 
         // Little-endian on all platforms
+        flags         = CFSwapInt16LittleToHost(flags);
         method        = CFSwapInt16LittleToHost(method);
         compSize      = CFSwapInt32LittleToHost(compSize);
         uncompSize    = CFSwapInt32LittleToHost(uncompSize);
         fileNameLen   = CFSwapInt16LittleToHost(fileNameLen);
         extraFieldLen = CFSwapInt16LittleToHost(extraFieldLen);
+
+        BOOL hasDataDescriptor = (flags & (1 << 3)) != 0;
 
         offset += 30;
         if (offset + fileNameLen > length) break;
@@ -1399,7 +1425,8 @@ RCT_EXPORT_METHOD(unzip:(NSString *)sourcePath
                                                           encoding:NSISOLatin1StringEncoding];
         offset += fileNameLen + extraFieldLen;
 
-        if (!fileName || offset + compSize > length) {
+        if (!fileName) break; // corrupt ZIP
+        if (!hasDataDescriptor && offset + compSize > length) {
             offset += compSize;
             continue;
         }
@@ -1433,6 +1460,11 @@ RCT_EXPORT_METHOD(unzip:(NSString *)sourcePath
         const uint8_t *compData = bytes + offset;
 
         if (method == 0) {
+            if (hasDataDescriptor) {
+                if (error) *error = [NSError errorWithDomain:@"RNFileToolkit" code:-5
+                    userInfo:@{NSLocalizedDescriptionKey: @"STORE method with Data Descriptor not supported"}];
+                return NO;
+            }
             // Store (no compression)
             NSData *fileData = [NSData dataWithBytes:compData length:compSize];
             // Verify CRC32 before writing
@@ -1463,7 +1495,7 @@ RCT_EXPORT_METHOD(unzip:(NSString *)sourcePath
             z_stream strm;
             memset(&strm, 0, sizeof(strm));
             strm.next_in  = (Bytef *)compData;
-            strm.avail_in = (uInt)compSize;
+            strm.avail_in = hasDataDescriptor ? (uInt)(length - offset) : (uInt)compSize;
 
             // inflateInit2 with -15 for raw deflate (no zlib wrapper)
             if (inflateInit2(&strm, -15) != Z_OK) {
@@ -1499,6 +1531,19 @@ RCT_EXPORT_METHOD(unzip:(NSString *)sourcePath
                 } while (ret != Z_STREAM_END);
                 inflateEnd(&strm);
                 output = result;
+            }
+
+            if (hasDataDescriptor) {
+                uint32_t actualCompSize = (uint32_t)strm.total_in;
+                uint32_t ddSig = 0;
+                if (offset + actualCompSize + 4 <= length) {
+                    memcpy(&ddSig, bytes + offset + actualCompSize, 4);
+                }
+                NSUInteger ddOffset = offset + actualCompSize + (ddSig == 0x08074b50 ? 4 : 0);
+                if (ddOffset + 12 <= length) {
+                    memcpy(&crc32val, bytes + ddOffset, 4);
+                }
+                compSize = actualCompSize + (ddSig == 0x08074b50 ? 16 : 12);
             }
 
             // Verify CRC32 of decompressed data before writing

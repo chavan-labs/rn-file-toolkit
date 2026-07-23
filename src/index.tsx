@@ -804,7 +804,7 @@ export async function saveBase64AsFile(
   try {
     let { base64Data, fileName, destination } = opts;
     if (base64Data.startsWith('data:')) {
-      const m = base64Data.match(/^data:([^;]+);base64,(.+)$/);
+      const m = base64Data.match(/^data:([^;]+(?:;[^;]+)*);base64,(.+)$/s);
       if (m && m[2]) {
         base64Data = m[2];
         if (!fileName && m[1])
