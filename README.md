@@ -21,6 +21,7 @@
 - [Why rn-file-toolkit?](#-why-rn-file-toolkit)
 - [Why not Expo FileSystem?](#-why-not-expo-filesystem)
 - [Documentation Website](#-documentation-website)
+- [Migrating from rn-downloader](#️-migrating-from-rn-downloader)
 - [Installation](#-installation)
 - [Quick Start: `useDownload`](#-quick-start-usedownload)
 - [Core APIs](#-core-apis)
@@ -72,16 +73,16 @@ We built **rn-file-toolkit** because we were tired of stitching together multipl
 
 Here's how it stacks up against the crowd:
 
-| Feature | `rn-file-toolkit` | `react-native-fs` & `rn-fetch-blob` | `expo-file-system` |
-| :--- | :---: | :---: | :---: |
-| **Background Persistence** | ✅ Yes | ⚠️ Spotty / Legacy | ✅ Yes |
-| **Smart Queueing & Concurrency** | ✅ Built-in | ❌ Write your own | ❌ Write your own |
-| **React Hooks (`useDownload`)** | ✅ Out-of-the-box | ❌ Manual | ❌ Manual |
-| **Auto-Retries & Resumption** | ✅ Yes | ❌ Manual | ⚠️ Basic resume only |
-| **Multipart Uploads** | ✅ Yes (Memory efficient) | ⚠️ Basic support | ✅ Yes |
-| **Expo Support (Custom Dev Client)**| ✅ Seamless | ❌ Requires heavy config | ✅ Seamless |
-| **Zero 3rd-party Dependencies** | ✅ Yes | ❌ Varies | ✅ Yes |
-| **Active Maintenance** | ✅ Yes | ❌ Largely unmaintained | ✅ Yes |
+| Feature                              |     `rn-file-toolkit`     | `react-native-fs` & `rn-fetch-blob` |  `expo-file-system`  |
+| :----------------------------------- | :-----------------------: | :---------------------------------: | :------------------: |
+| **Background Persistence**           |          ✅ Yes           |         ⚠️ Spotty / Legacy          |        ✅ Yes        |
+| **Smart Queueing & Concurrency**     |        ✅ Built-in        |          ❌ Write your own          |  ❌ Write your own   |
+| **React Hooks (`useDownload`)**      |     ✅ Out-of-the-box     |              ❌ Manual              |      ❌ Manual       |
+| **Auto-Retries & Resumption**        |          ✅ Yes           |              ❌ Manual              | ⚠️ Basic resume only |
+| **Multipart Uploads**                | ✅ Yes (Memory efficient) |          ⚠️ Basic support           |        ✅ Yes        |
+| **Expo Support (Custom Dev Client)** |        ✅ Seamless        |      ❌ Requires heavy config       |     ✅ Seamless      |
+| **Zero 3rd-party Dependencies**      |          ✅ Yes           |              ❌ Varies              |        ✅ Yes        |
+| **Active Maintenance**               |          ✅ Yes           |       ❌ Largely unmaintained       |        ✅ Yes        |
 
 We hook directly into OS-level managers (`URLSession` on iOS, `DownloadManager` on Android) to provide maximum reliability, battery efficiency, and zero headaches.
 
@@ -92,6 +93,97 @@ We hook directly into OS-level managers (`URLSession` on iOS, `DownloadManager` 
 Full docs are hosted on GitHub Pages:
 
 https://chavan-labs.github.io/rn-file-toolkit/
+
+---
+
+## ⬆️ Migrating from rn-downloader
+
+> **rn-downloader** has been officially rebranded to **rn-file-toolkit**. The new package is a drop-in replacement for all existing download functionality and adds a full suite of new capabilities: a rich Filesystem API, native Zip/Unzip, managed queues, multipart uploads, base64 utilities, native sharing, and more.
+
+Migration takes less than 5 minutes. Follow the steps below.
+
+### Step 1 — Uninstall the old package
+
+```bash
+# npm
+npm uninstall rn-downloader
+
+# yarn
+yarn remove rn-downloader
+
+# pnpm
+pnpm remove rn-downloader
+```
+
+### Step 2 — Install the new package
+
+```bash
+# npm
+npm install rn-file-toolkit
+
+# yarn
+yarn add rn-file-toolkit
+
+# pnpm
+pnpm add rn-file-toolkit
+```
+
+_(Optional) If you are not using Expo or an auto-linking setup, run `pod install` in your `ios` directory._
+
+### Step 3 — Update your imports
+
+Replace every occurrence of `rn-downloader` with `rn-file-toolkit` across your codebase. All previously exported names are preserved.
+
+```diff
+- import { download } from 'rn-downloader';
++ import { download } from 'rn-file-toolkit';
+
+- import { pauseDownload, resumeDownload, cancelDownload } from 'rn-downloader';
++ import { pauseDownload, resumeDownload, cancelDownload } from 'rn-file-toolkit';
+
+- import { useDownload } from 'rn-downloader';
++ import { useDownload } from 'rn-file-toolkit';
+```
+
+That's it — **no other code changes are required**. Every API signature from `rn-downloader` is 100% compatible.
+
+### API Compatibility Table
+
+All `rn-downloader` exports map directly to `rn-file-toolkit`:
+
+| `rn-downloader` export   | `rn-file-toolkit` export | Notes               |
+| :----------------------- | :----------------------- | :------------------ |
+| `download`               | `download`               | Identical signature |
+| `pauseDownload`          | `pauseDownload`          | Identical signature |
+| `resumeDownload`         | `resumeDownload`         | Identical signature |
+| `cancelDownload`         | `cancelDownload`         | Identical signature |
+| `useDownload`            | `useDownload`            | Identical signature |
+| `onDownloadComplete`     | `onDownloadComplete`     | Identical signature |
+| `onDownloadError`        | `onDownloadError`        | Identical signature |
+| `onDownloadRetry`        | `onDownloadRetry`        | Identical signature |
+| `setQueueOptions`        | `setQueueOptions`        | Identical signature |
+| `getQueueStatus`         | `getQueueStatus`         | Identical signature |
+| `getBackgroundDownloads` | `getBackgroundDownloads` | Identical signature |
+
+### What's new after migration?
+
+Once you've migrated, you get access to everything new in `rn-file-toolkit` at no extra cost:
+
+| Feature                            | Description                                                                                                                   |
+| :--------------------------------- | :---------------------------------------------------------------------------------------------------------------------------- |
+| 📂 **Full Filesystem API**         | `readFile`, `writeFile`, `copyFile`, `moveFile`, `deleteFile`, `mkdir`, `ls`, `stat`, `exists` — all native, no dependencies. |
+| 📦 **Native Zip & Unzip**          | Compress and extract archives using `java.util.zip` (Android) and `zlib` (iOS) — zero third-party libs.                       |
+| 📤 **Multipart Uploads**           | Memory-efficient `upload()` with progress tracking and a custom `uploadId`.                                                   |
+| 🔗 **Base64 & Data URI**           | `urlToBase64()` and `saveBase64AsFile()` for encoding/decoding without extra packages.                                        |
+| 📤 **Native Sharing & Opening**    | `shareFile()` triggers the OS share sheet; `openFile()` opens any file in its default app.                                    |
+| 🍪 **Cookie Management**           | Read and clear HTTP cookies from the platform's shared cookie store.                                                          |
+| 📸 **MediaStore / Photos Library** | Save files directly to the device gallery or Downloads folder.                                                                |
+| 💾 **Disk Space**                  | `df()` returns free and total bytes for the device storage.                                                                   |
+| 🗂️ **Session Management**          | Group files into named sessions for easy batch cleanup.                                                                       |
+
+### Need help?
+
+If you run into any issues during migration, please [open an issue](https://github.com/chavan-labs/rn-file-toolkit/issues) on the new GitHub repository.
 
 ---
 
@@ -293,8 +385,19 @@ await fs.deleteFile('/path/unwanted.txt');
 ```
 
 > **Tip:** You can also import each FS method individually:
+>
 > ```typescript
-> import { exists, stat, readFile, writeFile, copyFile, moveFile, deleteFile, mkdir, ls } from 'rn-file-toolkit';
+> import {
+>   exists,
+>   stat,
+>   readFile,
+>   writeFile,
+>   copyFile,
+>   moveFile,
+>   deleteFile,
+>   mkdir,
+>   ls,
+> } from 'rn-file-toolkit';
 > ```
 
 ### Zip & Unzip Archives
@@ -305,7 +408,10 @@ Compress and extract archives directly on the device using native `java.util.zip
 import { unzip, zip } from 'rn-file-toolkit';
 
 // Extract a downloaded zip
-const unzipResult = await unzip('/path/to/bundle.zip', '/path/to/extract-folder');
+const unzipResult = await unzip(
+  '/path/to/bundle.zip',
+  '/path/to/extract-folder'
+);
 console.log(unzipResult.files); // List of extracted file paths
 
 // Compress user data before uploading
@@ -421,7 +527,9 @@ import { df } from 'rn-file-toolkit';
 const space = await df();
 if (space.success) {
   console.log(`Free: ${(space.freeBytes! / 1024 / 1024 / 1024).toFixed(2)} GB`);
-  console.log(`Total: ${(space.totalBytes! / 1024 / 1024 / 1024).toFixed(2)} GB`);
+  console.log(
+    `Total: ${(space.totalBytes! / 1024 / 1024 / 1024).toFixed(2)} GB`
+  );
 }
 ```
 
@@ -460,10 +568,16 @@ Group downloaded files into sessions for batch cleanup. Useful for temporary fil
 import { session, download } from 'rn-file-toolkit';
 
 // Download files and track them in a session
-const result = await download({ url: 'https://example.com/tmp1.pdf', destination: 'cache' });
+const result = await download({
+  url: 'https://example.com/tmp1.pdf',
+  destination: 'cache',
+});
 if (result.filePath) session.add('my-workflow', result.filePath);
 
-const result2 = await download({ url: 'https://example.com/tmp2.pdf', destination: 'cache' });
+const result2 = await download({
+  url: 'https://example.com/tmp2.pdf',
+  destination: 'cache',
+});
 if (result2.filePath) session.add('my-workflow', result2.filePath);
 
 // List session files
@@ -507,7 +621,7 @@ import { saveToMediaStore } from 'rn-file-toolkit';
 const result = await saveToMediaStore({
   filePath: '/path/to/photo.jpg',
   mediaType: 'image',
-  album: 'MyApp',  // Optional album/subfolder
+  album: 'MyApp', // Optional album/subfolder
 });
 console.log(result.uri); // content://... (Android) or file path (iOS)
 
@@ -532,87 +646,87 @@ await saveToMediaStore({
 
 ### Types & Interfaces
 
-| Interface | Key Properties | Description |
-| :--- | :--- | :--- |
-| `DownloadOptions` | `url`, `fileName`, `destination`, `background`, `headers`, `queue`, `priority`, `downloadId`, `checksum`, `retry`, `onProgress`, `notificationTitle`, `notificationDescription` | Full configuration for downloading a file. |
-| `UploadOptions` | `url`, `filePath`, `fieldName`, `headers`, `parameters`, `uploadId`, `onProgress` | Configuration for multipart uploads. |
-| `ProgressInfo` | `percent`, `bytesDownloaded`, `totalBytes`, `speedBps`, `etaSeconds` | Rich real-time download progress payload. |
-| `DownloadResult` | `success`, `filePath`, `downloadId`, `error` | Result returned after a download completes. |
-| `UploadResult` | `success`, `status`, `data`, `uploadId`, `error` | Result returned after an upload completes. |
-| `ActionResult` | `success`, `error` | Generic result for actions like pause/resume/cancel. |
-| `UseDownloadReturn` | `start`, `pause`, `resume`, `cancel`, `status`, `progress`, `result`, `downloadId` | Hook state and control methods. |
-| `FsApi` | `exists`, `stat`, `readFile`, `writeFile`, `appendFile`, `copyFile`, `moveFile`, `deleteFile`, `mkdir`, `ls`, `df`, `hash` | Namespaced filesystem API. |
-| `FsStat` | `path`, `name`, `size`, `modified`, `isDir` | Output of the filesystem `stat` method. |
-| `FsEncoding` | `'utf8'` \| `'base64'` | Encoding used for read/write operations. |
-| `QueueOptions` | `maxConcurrent` | Configuration for the download queue. |
-| `QueueStatus` | `active`, `pending`, `maxConcurrent` | Snapshot of the current queue state. |
-| `CachedFile` | `fileName`, `filePath`, `size`, `modifiedAt` | Metadata for a single cached file. |
-| `CacheResult` | `success`, `files`, `error` | Result of `getCachedFiles()`. |
-| `SaveBase64Options` | `base64Data`, `fileName`, `destination` | Options for saving a base64 string to a file. |
-| `SaveBase64Result` | `success`, `filePath`, `error` | Result of `saveBase64AsFile()`. |
-| `UrlToBase64Options` | `url`, `headers` | Options for converting a URL to base64. |
-| `UrlToBase64Result` | `success`, `base64`, `mimeType`, `dataUri`, `error` | Result of `urlToBase64()`. |
-| `ShareFileOptions` | `filePath`, `title`, `subject` | Options for the native share sheet. |
-| `OpenFileOptions` | `filePath`, `mimeType` | Options for opening a file with the system default app. |
-| `UnzipResult` | `success`, `destDir`, `files`, `error` | Result of `unzip()`. |
-| `ZipResult` | `success`, `zipPath`, `error` | Result of `zip()`. |
+| Interface            | Key Properties                                                                                                                                                                  | Description                                             |
+| :------------------- | :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | :------------------------------------------------------ |
+| `DownloadOptions`    | `url`, `fileName`, `destination`, `background`, `headers`, `queue`, `priority`, `downloadId`, `checksum`, `retry`, `onProgress`, `notificationTitle`, `notificationDescription` | Full configuration for downloading a file.              |
+| `UploadOptions`      | `url`, `filePath`, `fieldName`, `headers`, `parameters`, `uploadId`, `onProgress`                                                                                               | Configuration for multipart uploads.                    |
+| `ProgressInfo`       | `percent`, `bytesDownloaded`, `totalBytes`, `speedBps`, `etaSeconds`                                                                                                            | Rich real-time download progress payload.               |
+| `DownloadResult`     | `success`, `filePath`, `downloadId`, `error`                                                                                                                                    | Result returned after a download completes.             |
+| `UploadResult`       | `success`, `status`, `data`, `uploadId`, `error`                                                                                                                                | Result returned after an upload completes.              |
+| `ActionResult`       | `success`, `error`                                                                                                                                                              | Generic result for actions like pause/resume/cancel.    |
+| `UseDownloadReturn`  | `start`, `pause`, `resume`, `cancel`, `status`, `progress`, `result`, `downloadId`                                                                                              | Hook state and control methods.                         |
+| `FsApi`              | `exists`, `stat`, `readFile`, `writeFile`, `appendFile`, `copyFile`, `moveFile`, `deleteFile`, `mkdir`, `ls`, `df`, `hash`                                                      | Namespaced filesystem API.                              |
+| `FsStat`             | `path`, `name`, `size`, `modified`, `isDir`                                                                                                                                     | Output of the filesystem `stat` method.                 |
+| `FsEncoding`         | `'utf8'` \| `'base64'`                                                                                                                                                          | Encoding used for read/write operations.                |
+| `QueueOptions`       | `maxConcurrent`                                                                                                                                                                 | Configuration for the download queue.                   |
+| `QueueStatus`        | `active`, `pending`, `maxConcurrent`                                                                                                                                            | Snapshot of the current queue state.                    |
+| `CachedFile`         | `fileName`, `filePath`, `size`, `modifiedAt`                                                                                                                                    | Metadata for a single cached file.                      |
+| `CacheResult`        | `success`, `files`, `error`                                                                                                                                                     | Result of `getCachedFiles()`.                           |
+| `SaveBase64Options`  | `base64Data`, `fileName`, `destination`                                                                                                                                         | Options for saving a base64 string to a file.           |
+| `SaveBase64Result`   | `success`, `filePath`, `error`                                                                                                                                                  | Result of `saveBase64AsFile()`.                         |
+| `UrlToBase64Options` | `url`, `headers`                                                                                                                                                                | Options for converting a URL to base64.                 |
+| `UrlToBase64Result`  | `success`, `base64`, `mimeType`, `dataUri`, `error`                                                                                                                             | Result of `urlToBase64()`.                              |
+| `ShareFileOptions`   | `filePath`, `title`, `subject`                                                                                                                                                  | Options for the native share sheet.                     |
+| `OpenFileOptions`    | `filePath`, `mimeType`                                                                                                                                                          | Options for opening a file with the system default app. |
+| `UnzipResult`        | `success`, `destDir`, `files`, `error`                                                                                                                                          | Result of `unzip()`.                                    |
+| `ZipResult`          | `success`, `zipPath`, `error`                                                                                                                                                   | Result of `zip()`.                                      |
 
 ### Exported Functions
 
-| Function | Signature | Description |
-| :--- | :--- | :--- |
-| `download` | `(options: DownloadOptions) => Promise<DownloadResult>` | Download a file (supports queue, background, retries). |
-| `upload` | `(options: UploadOptions) => Promise<UploadResult>` | Multipart upload a file. |
-| `pauseDownload` | `(id: string) => Promise<ActionResult>` | Pause an active download by ID. |
-| `resumeDownload` | `(id: string) => Promise<ActionResult>` | Resume a paused download by ID. |
-| `cancelDownload` | `(id: string) => Promise<ActionResult>` | Cancel a download by ID. |
-| `setQueueOptions` | `(options: QueueOptions) => void` | Set global queue concurrency. |
-| `getQueueStatus` | `() => QueueStatus` | Get current queue state (active/pending counts). |
-| `getBackgroundDownloads` | `() => Promise<any>` | Retrieve active background download descriptors. |
-| `getCachedFiles` | `() => Promise<CacheResult>` | List all files in the cache directory. |
-| `clearCache` | `() => Promise<ActionResult>` | Delete all cached files. |
-| `deleteFile` | `(path: string) => Promise<ActionResult>` | Delete a single file by path. |
-| `exists` | `(path: string) => Promise<boolean>` | Check if a file or directory exists. |
-| `stat` | `(path: string) => Promise<FsStat>` | Get metadata for a file or directory. |
-| `readFile` | `(path: string, encoding?: FsEncoding) => Promise<string>` | Read file contents as a string. |
-| `writeFile` | `(path: string, data: string, encoding?: FsEncoding) => Promise<void>` | Write a string to a file. |
-| `copyFile` | `(from: string, to: string) => Promise<void>` | Copy a file. |
-| `moveFile` | `(from: string, to: string) => Promise<void>` | Move or rename a file. |
-| `mkdir` | `(path: string) => Promise<void>` | Create a directory (recursive). |
-| `ls` | `(path: string) => Promise<string[]>` | List directory contents. |
-| `unzip` | `(src: string, dest: string) => Promise<UnzipResult>` | Extract a zip archive. |
-| `zip` | `(src: string, dest: string) => Promise<ZipResult>` | Compress a folder into a zip archive. |
-| `saveBase64AsFile` | `(options: SaveBase64Options) => Promise<SaveBase64Result>` | Save a base64 string as a file. |
-| `urlToBase64` | `(options: UrlToBase64Options) => Promise<UrlToBase64Result>` | Fetch a URL and return its content as base64. |
-| `shareFile` | `(options: ShareFileOptions) => Promise<ShareFileResult>` | Open the native share sheet for a file. |
-| `openFile` | `(options: OpenFileOptions) => Promise<OpenFileResult>` | Open a file with the system default app. |
-| `onDownloadComplete` | `(cb) => () => void` | Subscribe to download completion events. |
-| `onDownloadError` | `(cb) => () => void` | Subscribe to download error events. |
-| `onDownloadRetry` | `(cb) => () => void` | Subscribe to download retry events. |
-| `onUploadProgress` | `(cb) => () => void` | Subscribe to upload progress events. |
-| `useDownload` | `() => UseDownloadReturn` | React hook for managing a download with state. |
-| `df` | `() => Promise<DiskSpaceResult>` | Get free and total device disk space. |
-| `appendFile` | `(path: string, data: string, encoding?: FsEncoding) => Promise<void>` | Append data to a file. |
-| `hash` | `(path: string, algorithm?: HashAlgorithm) => Promise<HashResult>` | Compute a file's hash digest. |
-| `getCookies` | `(domain: string) => Promise<CookiesResult>` | Get cookies for a domain. |
-| `clearCookies` | `(domain?: string) => Promise<ActionResult>` | Clear cookies (domain or all). |
-| `saveToMediaStore` | `(options: MediaStoreOptions) => Promise<MediaStoreResult>` | Save file to shared media store. |
-| `fs` | `FsApi` | Namespaced object grouping all filesystem methods (includes `df`, `appendFile`, `hash`). |
-| `cookies` | `{ get, clear }` | Namespaced cookie management. |
-| `session` | `SessionApi` | Namespaced session management. |
+| Function                 | Signature                                                              | Description                                                                              |
+| :----------------------- | :--------------------------------------------------------------------- | :--------------------------------------------------------------------------------------- |
+| `download`               | `(options: DownloadOptions) => Promise<DownloadResult>`                | Download a file (supports queue, background, retries).                                   |
+| `upload`                 | `(options: UploadOptions) => Promise<UploadResult>`                    | Multipart upload a file.                                                                 |
+| `pauseDownload`          | `(id: string) => Promise<ActionResult>`                                | Pause an active download by ID.                                                          |
+| `resumeDownload`         | `(id: string) => Promise<ActionResult>`                                | Resume a paused download by ID.                                                          |
+| `cancelDownload`         | `(id: string) => Promise<ActionResult>`                                | Cancel a download by ID.                                                                 |
+| `setQueueOptions`        | `(options: QueueOptions) => void`                                      | Set global queue concurrency.                                                            |
+| `getQueueStatus`         | `() => QueueStatus`                                                    | Get current queue state (active/pending counts).                                         |
+| `getBackgroundDownloads` | `() => Promise<any>`                                                   | Retrieve active background download descriptors.                                         |
+| `getCachedFiles`         | `() => Promise<CacheResult>`                                           | List all files in the cache directory.                                                   |
+| `clearCache`             | `() => Promise<ActionResult>`                                          | Delete all cached files.                                                                 |
+| `deleteFile`             | `(path: string) => Promise<ActionResult>`                              | Delete a single file by path.                                                            |
+| `exists`                 | `(path: string) => Promise<boolean>`                                   | Check if a file or directory exists.                                                     |
+| `stat`                   | `(path: string) => Promise<FsStat>`                                    | Get metadata for a file or directory.                                                    |
+| `readFile`               | `(path: string, encoding?: FsEncoding) => Promise<string>`             | Read file contents as a string.                                                          |
+| `writeFile`              | `(path: string, data: string, encoding?: FsEncoding) => Promise<void>` | Write a string to a file.                                                                |
+| `copyFile`               | `(from: string, to: string) => Promise<void>`                          | Copy a file.                                                                             |
+| `moveFile`               | `(from: string, to: string) => Promise<void>`                          | Move or rename a file.                                                                   |
+| `mkdir`                  | `(path: string) => Promise<void>`                                      | Create a directory (recursive).                                                          |
+| `ls`                     | `(path: string) => Promise<string[]>`                                  | List directory contents.                                                                 |
+| `unzip`                  | `(src: string, dest: string) => Promise<UnzipResult>`                  | Extract a zip archive.                                                                   |
+| `zip`                    | `(src: string, dest: string) => Promise<ZipResult>`                    | Compress a folder into a zip archive.                                                    |
+| `saveBase64AsFile`       | `(options: SaveBase64Options) => Promise<SaveBase64Result>`            | Save a base64 string as a file.                                                          |
+| `urlToBase64`            | `(options: UrlToBase64Options) => Promise<UrlToBase64Result>`          | Fetch a URL and return its content as base64.                                            |
+| `shareFile`              | `(options: ShareFileOptions) => Promise<ShareFileResult>`              | Open the native share sheet for a file.                                                  |
+| `openFile`               | `(options: OpenFileOptions) => Promise<OpenFileResult>`                | Open a file with the system default app.                                                 |
+| `onDownloadComplete`     | `(cb) => () => void`                                                   | Subscribe to download completion events.                                                 |
+| `onDownloadError`        | `(cb) => () => void`                                                   | Subscribe to download error events.                                                      |
+| `onDownloadRetry`        | `(cb) => () => void`                                                   | Subscribe to download retry events.                                                      |
+| `onUploadProgress`       | `(cb) => () => void`                                                   | Subscribe to upload progress events.                                                     |
+| `useDownload`            | `() => UseDownloadReturn`                                              | React hook for managing a download with state.                                           |
+| `df`                     | `() => Promise<DiskSpaceResult>`                                       | Get free and total device disk space.                                                    |
+| `appendFile`             | `(path: string, data: string, encoding?: FsEncoding) => Promise<void>` | Append data to a file.                                                                   |
+| `hash`                   | `(path: string, algorithm?: HashAlgorithm) => Promise<HashResult>`     | Compute a file's hash digest.                                                            |
+| `getCookies`             | `(domain: string) => Promise<CookiesResult>`                           | Get cookies for a domain.                                                                |
+| `clearCookies`           | `(domain?: string) => Promise<ActionResult>`                           | Clear cookies (domain or all).                                                           |
+| `saveToMediaStore`       | `(options: MediaStoreOptions) => Promise<MediaStoreResult>`            | Save file to shared media store.                                                         |
+| `fs`                     | `FsApi`                                                                | Namespaced object grouping all filesystem methods (includes `df`, `appendFile`, `hash`). |
+| `cookies`                | `{ get, clear }`                                                       | Namespaced cookie management.                                                            |
+| `session`                | `SessionApi`                                                           | Namespaced session management.                                                           |
 
 ### New Types & Interfaces
 
-| Interface | Key Properties | Description |
-| :--- | :--- | :--- |
-| `DiskSpaceResult` | `success`, `freeBytes`, `totalBytes`, `error` | Result of `df()`. |
-| `HashAlgorithm` | `'md5'` \| `'sha1'` \| `'sha256'` | Algorithm for file hashing. |
-| `HashResult` | `success`, `hash`, `error` | Result of `hash()`. |
-| `Cookie` | `name`, `value`, `domain`, `path`, `expiresDate`, `isSecure`, `isHTTPOnly` | A single cookie entry. |
-| `CookiesResult` | `success`, `cookies`, `error` | Result of `getCookies()`. |
-| `MediaStoreOptions` | `filePath`, `mediaType`, `album` | Options for saving to the media store. |
-| `MediaStoreResult` | `success`, `uri`, `error` | Result of `saveToMediaStore()`. |
-| `SessionApi` | `add`, `get`, `clear`, `clearAll` | Session management methods. |
+| Interface           | Key Properties                                                             | Description                            |
+| :------------------ | :------------------------------------------------------------------------- | :------------------------------------- |
+| `DiskSpaceResult`   | `success`, `freeBytes`, `totalBytes`, `error`                              | Result of `df()`.                      |
+| `HashAlgorithm`     | `'md5'` \| `'sha1'` \| `'sha256'`                                          | Algorithm for file hashing.            |
+| `HashResult`        | `success`, `hash`, `error`                                                 | Result of `hash()`.                    |
+| `Cookie`            | `name`, `value`, `domain`, `path`, `expiresDate`, `isSecure`, `isHTTPOnly` | A single cookie entry.                 |
+| `CookiesResult`     | `success`, `cookies`, `error`                                              | Result of `getCookies()`.              |
+| `MediaStoreOptions` | `filePath`, `mediaType`, `album`                                           | Options for saving to the media store. |
+| `MediaStoreResult`  | `success`, `uri`, `error`                                                  | Result of `saveToMediaStore()`.        |
+| `SessionApi`        | `add`, `get`, `clear`, `clearAll`                                          | Session management methods.            |
 
 ---
 
