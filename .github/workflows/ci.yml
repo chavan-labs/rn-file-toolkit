@@ -81,7 +81,7 @@ jobs:
         uses: ./.github/actions/setup
 
       - name: Cache turborepo for Android
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ${{ env.TURBO_CACHE_DIR }}
           key: >
@@ -120,7 +120,7 @@ jobs:
 
       - name: Cache Gradle
         if: env.turbo_cache_hit != '1'
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.gradle/wrapper
@@ -160,7 +160,7 @@ jobs:
         uses: ./.github/actions/setup
 
       - name: Cache turborepo for iOS
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ${{ env.TURBO_CACHE_DIR }}
           key: >
@@ -194,7 +194,7 @@ jobs:
       - name: Cache CocoaPods
         id: cocoapods-cache
         if: env.turbo_cache_hit != '1'
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             example/ios/Pods
@@ -211,7 +211,7 @@ jobs:
 
       - name: Cache Xcode DerivedData
         if: env.turbo_cache_hit != '1'
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/Library/Developer/Xcode/DerivedData
