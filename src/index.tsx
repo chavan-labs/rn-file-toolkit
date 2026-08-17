@@ -1,8 +1,40 @@
 import { useState, useCallback, useRef, useEffect } from 'react';
-import { NativeEventEmitter, NativeModules } from 'react-native';
+import { NativeEventEmitter, NativeModules, Platform } from 'react-native';
 import FileToolkitSpec from './NativeFileToolkit';
 
-const FileToolkitModule = NativeModules.FileToolkit || FileToolkitSpec;
+const LINKING_ERROR =
+  `The native module for 'rn-file-toolkit' could not be found.\n\n` +
+  Platform.select({
+    ios: "• Run 'cd ios && pod install' (or 'npx pod-install') and rebuild the app.\n",
+    android: '• Rebuild the app so the Android module is compiled in.\n',
+    default: '',
+  }) +
+  '• Rebuild after installing — a JS-only reload (Fast Refresh) is not enough.\n' +
+  '• This package contains native code, so it does not work in Expo Go. Use a development build.\n' +
+  '• On web / Node (SSR, tests) the native module is unavailable; guard your calls or mock the module.';
+
+/**
+ * The native module, or a proxy that throws an actionable error on first use.
+ *
+ * Importing this package must never throw on its own — bundlers, tests and SSR
+ * all evaluate the module graph without a native runtime attached.
+ */
+const FileToolkitModule: any =
+  FileToolkitSpec ??
+  NativeModules.FileToolkit ??
+  new Proxy(
+    {},
+    {
+      get() {
+        throw new Error(LINKING_ERROR);
+      },
+    }
+  );
+
+/** `true` when the native module is linked and usable on this platform. */
+export const isAvailable: boolean = !!(
+  FileToolkitSpec ?? NativeModules.FileToolkit
+);
 
 let _eventEmitter: NativeEventEmitter | null = null;
 function getEventEmitter(): NativeEventEmitter {
@@ -298,8 +330,10 @@ function _generateId(): string {
   ) {
     const bytes = new Uint8Array(16);
     globalThis.crypto.getRandomValues(bytes);
+    /* eslint-disable no-bitwise -- RFC 4122 requires setting these version/variant bits */
     bytes[6] = (bytes[6]! & 0x0f) | 0x40; // version 4
     bytes[8] = (bytes[8]! & 0x3f) | 0x80; // variant 1
+    /* eslint-enable no-bitwise */
     const hex = Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join(
       ''
     );
@@ -327,6 +361,8 @@ async function _executeDownload(
 ): Promise<DownloadResult> {
   let progressSubscription: any = null;
   let retrySubscription: any = null;
+  let completeSubscription: any = null;
+  let errorSubscription: any = null;
   const downloadId = options.downloadId || _generateId();
   const knownDownloadId: string = downloadId;
   let _lastProgressTs: number | null = null;
@@ -391,7 +427,13 @@ async function _executeDownload(
 
   const cleanup = () => {
     progressSubscription?.remove();
+    progressSubscription = null;
     retrySubscription?.remove();
+    retrySubscription = null;
+    completeSubscription?.remove();
+    completeSubscription = null;
+    errorSubscription?.remove();
+    errorSubscription = null;
   };
 
   try {
@@ -415,7 +457,27 @@ async function _executeDownload(
       };
     }
     const result = await (FileToolkitModule as any).download(nativeOpts);
-    cleanup();
+    // A background download resolves as soon as it is handed to the OS, long
+    // before any bytes arrive. Tearing the listeners down here would silently
+    // swallow every `onProgress` / `onRetry` callback, so keep them alive until
+    // the terminal event for this download id arrives.
+    const stillRunning =
+      !!nativeOpts.background && !!result?.success && !result?.filePath;
+    if (stillRunning && (progressSubscription || retrySubscription)) {
+      const finish = (event: any) => {
+        if (event?.downloadId === knownDownloadId) cleanup();
+      };
+      completeSubscription = getEventEmitter().addListener(
+        'onDownloadComplete',
+        finish
+      );
+      errorSubscription = getEventEmitter().addListener(
+        'onDownloadError',
+        finish
+      );
+    } else {
+      cleanup();
+    }
     return result as DownloadResult;
   } catch (error: any) {
     cleanup();
@@ -619,7 +681,7 @@ export async function clearAllCookies(): Promise<ActionResult> {
   return clearCookies('');
 }
 
-export async function clearCookies(domain: string): Promise<ActionResult> {
+export async function clearCookies(domain: string = ''): Promise<ActionResult> {
   try {
     return await (FileToolkitModule as any).clearCookies(domain);
   } catch (err: any) {
@@ -942,13 +1004,14 @@ export function useDownload(): UseDownloadReturn {
       },
     });
     setResult(res);
-    setStatus(
-      !!opts.background && !!res.success && !!res.downloadId && !res.filePath
-        ? 'downloading'
-        : res.success
-        ? 'done'
-        : 'error'
-    );
+    const stillRunning =
+      !!opts.background && !!res.success && !!res.downloadId && !res.filePath;
+    setStatus(stillRunning ? 'downloading' : res.success ? 'done' : 'error');
+    // The download has settled — forget the id so that unmounting the component
+    // does not fire a pointless `cancelDownload` against a finished download.
+    if (!stillRunning && downloadIdRef.current === id) {
+      downloadIdRef.current = null;
+    }
     return res;
   }, []);
 
@@ -993,6 +1056,7 @@ export function useDownload(): UseDownloadReturn {
  * - `useDownload()` sets `status` to `'error'` on failure.
  */
 export default {
+  isAvailable,
   download,
   upload,
   pauseDownload,

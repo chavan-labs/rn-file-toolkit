@@ -2,9 +2,14 @@ import { download, setQueueOptions, getQueueStatus, session } from '../index';
 import type { DownloadOptions } from '../index';
 import { NativeModules } from 'react-native';
 
+/** Emits a native event to every listener registered through the mock emitter. */
+declare const __emitNative: (event: string, payload: any) => void;
+/** Number of listeners currently registered for an event. */
+declare const __listenerCount: (event: string) => number;
+
 // Mock the native module
 jest.mock('react-native', () => {
-  let callbacks: Record<string, Function[]> = {};
+  const callbacks: Record<string, Function[]> = {};
 
   const mockFileToolkit = {
     download: jest.fn().mockImplementation((opts) => {
@@ -20,18 +25,30 @@ jest.mock('react-native', () => {
     deleteFile: jest.fn().mockResolvedValue({ success: true }),
   };
 
+  (global as any).__emitNative = (event: string, payload: any) => {
+    (callbacks[event] ?? []).slice().forEach((cb) => cb(payload));
+  };
+  (global as any).__listenerCount = (event: string) =>
+    (callbacks[event] ?? []).length;
+
   return {
+    Platform: { OS: 'ios', select: (spec: any) => spec.ios ?? spec.default },
     NativeModules: {
       FileToolkit: mockFileToolkit,
     },
     TurboModuleRegistry: {
+      get: jest.fn().mockReturnValue(mockFileToolkit),
       getEnforcing: jest.fn().mockReturnValue(mockFileToolkit),
     },
     NativeEventEmitter: jest.fn().mockImplementation(() => ({
-      addListener: jest.fn((event, cb) => {
+      addListener: jest.fn((event: string, cb: Function) => {
         if (!callbacks[event]) callbacks[event] = [];
         callbacks[event].push(cb);
-        return { remove: jest.fn() };
+        return {
+          remove: jest.fn(() => {
+            callbacks[event] = (callbacks[event] ?? []).filter((c) => c !== cb);
+          }),
+        };
       }),
       removeAllListeners: jest.fn(),
     })),
@@ -125,6 +142,49 @@ describe('rn-file-toolkit JS Logic', () => {
       expect(FileToolkit.download).toHaveBeenCalledTimes(2);
       const call1Args = FileToolkit.download.mock.calls[0][0];
       expect(call1Args.downloadId).toBeDefined();
+    });
+  });
+
+  describe('progress listeners', () => {
+    it('keeps onProgress alive after a background download is handed to the OS', async () => {
+      FileToolkit.download.mockImplementationOnce((opts: any) =>
+        // Background downloads resolve immediately, with no filePath yet.
+        Promise.resolve({ success: true, downloadId: opts.downloadId })
+      );
+
+      const seen: number[] = [];
+      const res = await download({
+        url: 'http://test.com/big.zip',
+        background: true,
+        downloadId: 'bg-1',
+        onProgress: (info) => seen.push(info.percent),
+      });
+      expect(res.success).toBe(true);
+
+      __emitNative('onDownloadProgress', {
+        downloadId: 'bg-1',
+        progress: 42,
+        bytesDownloaded: 42,
+        totalBytes: 100,
+      });
+      expect(seen).toEqual([42]);
+
+      // The terminal event tears the listeners back down.
+      __emitNative('onDownloadComplete', {
+        downloadId: 'bg-1',
+        success: true,
+        filePath: '/mock/big.zip',
+      });
+      expect(__listenerCount('onDownloadProgress')).toBe(0);
+    });
+
+    it('removes listeners as soon as a foreground download settles', async () => {
+      await download({
+        url: 'http://test.com/small.txt',
+        downloadId: 'fg-1',
+        onProgress: () => {},
+      });
+      expect(__listenerCount('onDownloadProgress')).toBe(0);
     });
   });
 });

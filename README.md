@@ -712,8 +712,9 @@ await saveToMediaStore({
 | `clearCookies`           | `(domain?: string) => Promise<ActionResult>`                           | Clear cookies (domain or all).                                                           |
 | `saveToMediaStore`       | `(options: MediaStoreOptions) => Promise<MediaStoreResult>`            | Save file to shared media store.                                                         |
 | `fs`                     | `FsApi`                                                                | Namespaced object grouping all filesystem methods (includes `df`, `appendFile`, `hash`). |
-| `cookies`                | `{ get, clear }`                                                       | Namespaced cookie management.                                                            |
+| `cookies`                | `{ get, clear, clearAll }`                                             | Namespaced cookie management.                                                            |
 | `session`                | `SessionApi`                                                           | Namespaced session management.                                                           |
+| `isAvailable`            | `boolean`                                                              | `true` when the native module is linked — useful on web, in SSR and in tests.            |
 
 ### New Types & Interfaces
 
@@ -727,6 +728,24 @@ await saveToMediaStore({
 | `MediaStoreOptions` | `filePath`, `mediaType`, `album`                                           | Options for saving to the media store. |
 | `MediaStoreResult`  | `success`, `uri`, `error`                                                  | Result of `saveToMediaStore()`.        |
 | `SessionApi`        | `add`, `get`, `clear`, `clearAll`                                          | Session management methods.            |
+
+---
+
+## ⚠️ Platform Notes
+
+Behaviour that differs between iOS and Android, so you can plan for it up front.
+Each item is expanded in the [troubleshooting guide](https://chavan-labs.github.io/rn-file-toolkit/#/troubleshooting).
+
+| Topic                          | Note                                                                                                                                                     |
+| :----------------------------- | :------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| **Cleartext HTTP**             | Android blocks `http://` by default from API 28. Use `https://`, or opt in via `usesCleartextTraffic`.                                                     |
+| **Pause / resume**             | Foreground downloads only. Android's system `DownloadManager` has no pause API, so `pauseDownload()` returns `success: false` for `background: true`.      |
+| **Background completion (iOS)** | Forward `handleEventsForBackgroundURLSession` from your `AppDelegate` so the app is woken when a transfer finishes while suspended.                       |
+| **`getBackgroundDownloads()`** | `status` is the raw platform value and differs per platform. Use `progress` and the completion events for portable logic.                                  |
+| **`readFile` / `urlToBase64`** | Capped at 50 MB on both platforms to avoid exhausting memory across the bridge.                                                                            |
+| **`saveToMediaStore`**         | Android writes to the shared MediaStore. iOS saves images/videos to the Photo Library and copies other types into Documents (iOS has no shared media store). |
+| **`fs.*` vs top-level**        | `fs.*` methods **throw** on failure; top-level helpers return `{ success: false, error }` and never throw.                                                  |
+| **Sessions**                   | `session.*` is in-memory only and does not survive an app restart or a hot reload.                                                                          |
 
 ---
 

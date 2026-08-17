@@ -36,7 +36,9 @@
 
 @implementation FileToolkit
 
-RCT_EXPORT_MODULE()
+// Names the module explicitly. RCT_EXPORT_MODULE() already synthesises
+// +moduleName, so the class must not define it a second time.
+RCT_EXPORT_MODULE(FileToolkit)
 
 - (instancetype)init {
     if (self = [super init]) {
@@ -67,6 +69,24 @@ RCT_EXPORT_MODULE()
     return self;
 }
 
+/**
+ * Torn down when the React instance goes away (dev reload, bridge restart).
+ *
+ * Both sessions retain this object as their delegate, so without an explicit
+ * invalidation the old module lives forever and keeps pushing events at a dead
+ * bridge. Re-creating a background session with an identifier that is still in
+ * use also throws, which turned every Fast Refresh into a crash.
+ */
+- (void)invalidate {
+    [self.fgSession invalidateAndCancel];
+    // Background transfers are meant to survive; let them finish and just drop
+    // this delegate so the identifier is released for the next instance.
+    [self.bgSession finishTasksAndInvalidate];
+    self.fgSession = nil;
+    self.bgSession = nil;
+    [super invalidate];
+}
+
 - (NSArray<NSString *> *)supportedEvents {
     return @[@"onDownloadProgress", @"onDownloadComplete", @"onDownloadError", @"onUploadProgress", @"onDownloadRetry"];
 }
@@ -85,34 +105,67 @@ RCT_EXPORT_MODULE()
     return [[NSUUID UUID] UUIDString];
 }
 
-- (NSURL *)destURLForFileName:(NSString *)fileName destination:(NSString *)destType {
-    NSSearchPathDirectory dirType = NSDownloadsDirectory;
+/**
+ * Reduces an arbitrary name to a single, safe path segment.
+ *
+ * File names can come from a server (URL path, redirect target) or from caller
+ * input, so `../` sequences must never be able to escape the destination.
+ */
+- (NSString *)sanitizeFileName:(NSString *)name {
+    NSString *base = [name lastPathComponent];
+    base = [base stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    base = [base stringByReplacingOccurrencesOfString:@"/" withString:@"_"];
+    if (base.length == 0 || [base isEqualToString:@"."] || [base isEqualToString:@".."]) {
+        return @"downloaded_file";
+    }
+    if (base.length > 200) {
+        base = [base substringFromIndex:base.length - 200];
+    }
+    return base;
+}
+
+/**
+ * Resolves the directory for a logical destination, creating it if needed.
+ *
+ * `NSDownloadsDirectory` resolves inside the app container on iOS but is *not*
+ * created by the system, and `URLsForDirectory:inDomains:` never creates it
+ * either. Returning that URL unchecked made every default-destination download
+ * fail at the final move with "No such file or directory", so the directory is
+ * always materialised here.
+ */
+- (NSURL *)directoryForDestination:(NSString *)destType {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSURL *dirURL = nil;
+
     if ([destType isEqualToString:@"cache"]) {
-        dirType = NSCachesDirectory;
+        dirURL = [[fm URLsForDirectory:NSCachesDirectory inDomains:NSUserDomainMask].firstObject
+                  URLByAppendingPathComponent:@"RNFileToolkit"];
     } else if ([destType isEqualToString:@"documents"]) {
-        dirType = NSDocumentDirectory;
+        dirURL = [[fm URLsForDirectory:NSDocumentDirectory inDomains:NSUserDomainMask].firstObject
+                  URLByAppendingPathComponent:@"RNFileToolkit"];
+    } else {
+        dirURL = [fm URLsForDirectory:NSDownloadsDirectory inDomains:NSUserDomainMask].firstObject;
+        if (!dirURL) {
+            NSURL *docsDir = [fm URLsForDirectory:NSDocumentDirectory inDomains:NSUserDomainMask].firstObject;
+            dirURL = [docsDir URLByAppendingPathComponent:@"Downloads"];
+        }
     }
 
-    NSURL *dirURL = [[NSFileManager defaultManager]
-        URLsForDirectory:dirType inDomains:NSUserDomainMask].firstObject;
-    
-    // For iOS < 16 some directories might not exist or need subfolders
-    if ([destType isEqualToString:@"downloads"] && !dirURL) {
-        NSURL *docsDir = [[NSFileManager defaultManager]
-            URLsForDirectory:NSDocumentDirectory inDomains:NSUserDomainMask].firstObject;
-        dirURL = [docsDir URLByAppendingPathComponent:@"Downloads"];
-        [[NSFileManager defaultManager] createDirectoryAtURL:dirURL withIntermediateDirectories:YES attributes:nil error:nil];
+    if (dirURL) {
+        [fm createDirectoryAtURL:dirURL withIntermediateDirectories:YES attributes:nil error:nil];
     }
-    
-    // Use a toolkit-owned subdirectory for cache and documents to avoid
-    // conflicts with the app's own files (clearCache only removes this folder)
-    if ([destType isEqualToString:@"cache"] || [destType isEqualToString:@"documents"]) {
-        dirURL = [dirURL URLByAppendingPathComponent:@"RNFileToolkit"];
-        [[NSFileManager defaultManager] createDirectoryAtURL:dirURL withIntermediateDirectories:YES attributes:nil error:nil];
-    }
-    
-    return [dirURL URLByAppendingPathComponent:fileName];
+    return dirURL;
 }
+
+- (NSURL *)destURLForFileName:(NSString *)fileName destination:(NSString *)destType {
+    NSURL *dirURL = [self directoryForDestination:destType];
+    return [dirURL URLByAppendingPathComponent:[self sanitizeFileName:fileName]];
+}
+
+// MD5 and SHA-1 are deliberately offered: they are still what most download
+// manifests publish. They are used for integrity checks only, never for security.
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
 
 - (NSString *)calculateChecksumForPath:(NSString *)path algorithm:(NSString *)algo {
     NSInputStream *inputStream = [NSInputStream inputStreamWithFileAtPath:path];
@@ -167,15 +220,19 @@ RCT_EXPORT_MODULE()
     }
 }
 
+#pragma clang diagnostic pop
+
 - (NSString *)fileNameFromOptions:(NSDictionary *)options task:(NSURLSessionDownloadTask *)task {
     NSString *name = options[@"fileName"];
     if (!name || [name isEqualToString:@""]) {
-        name = task.originalRequest.URL.lastPathComponent;
+        // Prefer the *final* URL so that a redirect to the real asset still yields
+        // a sensible name rather than the name of the redirecting endpoint.
+        name = task.response.URL.lastPathComponent ?: task.originalRequest.URL.lastPathComponent;
     }
     if (!name || [name isEqualToString:@""]) {
         name = @"downloaded_file";
     }
-    return name;
+    return [self sanitizeFileName:name];
 }
 
 // ─── download ─────────────────────────────────────────────────────────────────
@@ -205,6 +262,10 @@ RCT_EXPORT_MODULE()
     }
 
     NSURLSession *session = isBackground ? self.bgSession : self.fgSession;
+    if (!session) {
+        resolve(@{@"success": @NO, @"error": @"Module was invalidated"});
+        return;
+    }
     NSURLSessionDownloadTask *task = [session downloadTaskWithRequest:request];
     NSString *taskKey = [NSString stringWithFormat:@"%lu", (unsigned long)task.taskIdentifier];
 
@@ -700,11 +761,31 @@ didFinishDownloadingToURL:(NSURL *)location {
             options = self.downloadOptions[downloadId];
         }
     });
+    // A background download can finish after the app was terminated and relaunched,
+    // in which case the in-memory maps are empty. The task itself still carries the
+    // id, so recover it instead of dropping the finished file on the floor.
+    if (!downloadId) downloadId = downloadTask.taskDescription;
     if (!downloadId) return;
 
     NSString *fileName = [self fileNameFromOptions:options task:downloadTask];
     NSString *destType = options[@"destination"] ?: @"downloads";
     NSURL *destURL = [self destURLForFileName:fileName destination:destType];
+
+    // NSURLSessionDownloadTask reports 4xx/5xx as a *successful* download whose body
+    // is the error page. Without this check `download()` resolves with success:YES
+    // and an HTML error document saved under the expected file name.
+    NSHTTPURLResponse *httpResponse = [downloadTask.response isKindOfClass:[NSHTTPURLResponse class]]
+        ? (NSHTTPURLResponse *)downloadTask.response : nil;
+    if (httpResponse && (httpResponse.statusCode < 200 || httpResponse.statusCode >= 300)) {
+        [[NSFileManager defaultManager] removeItemAtURL:location error:nil];
+        NSDictionary *statusErr = @{
+            @"success": @NO,
+            @"downloadId": downloadId,
+            @"error": [NSString stringWithFormat:@"SERVER_ERROR: %ld", (long)httpResponse.statusCode]
+        };
+        [self finishDownload:downloadId taskKey:taskKey result:statusErr isError:YES options:options];
+        return;
+    }
 
     NSError *error;
     [[NSFileManager defaultManager] removeItemAtURL:destURL error:nil];
@@ -738,6 +819,15 @@ didFinishDownloadingToURL:(NSURL *)location {
         }
     }
 
+    [self finishDownload:downloadId taskKey:taskKey result:resultDict isError:isError options:options];
+}
+
+/** Settles a finished download: resolves the promise or emits the event, then cleans up. */
+- (void)finishDownload:(NSString *)downloadId
+               taskKey:(NSString *)taskKey
+                result:(NSDictionary *)resultDict
+               isError:(BOOL)isError
+               options:(NSDictionary *)options {
     __block NSDictionary *funcs = nil;
     BOOL isBackground = [options[@"background"] boolValue];
     dispatch_sync(self.syncQueue, ^{
@@ -765,7 +855,7 @@ didFinishDownloadingToURL:(NSURL *)location {
         [self.activePromises  removeObjectForKey:downloadId];
         [self.downloadOptions removeObjectForKey:downloadId];
         [self.activeTasks     removeObjectForKey:downloadId];
-        [self.taskIdMap       removeObjectForKey:taskKey];
+        if (taskKey) [self.taskIdMap removeObjectForKey:taskKey];
         [self.retryAttempts   removeObjectForKey:downloadId];
     });
 }
@@ -843,6 +933,7 @@ didCompleteWithError:(NSError *)error {
             currentAttempt = [self.retryAttempts[downloadId] integerValue];
         }
     });
+    if (!downloadId) downloadId = task.taskDescription;
     if (!downloadId) return;
 
     BOOL isBackground = [options[@"background"] boolValue];
@@ -993,11 +1084,6 @@ totalBytesExpectedToSend:(int64_t)totalBytesExpectedToSend {
     return std::make_shared<facebook::react::NativeFileToolkitSpecJSI>(params);
 }
 
-+ (NSString *)moduleName
-{
-  return @"FileToolkit";
-}
-
 // ─── upload ───────────────────────────────────────────────────────────────────
 
 - (void)upload:(NSDictionary *)options resolve:(RCTPromiseResolveBlock)resolve reject:(RCTPromiseRejectBlock)reject {
@@ -1013,8 +1099,19 @@ totalBytesExpectedToSend:(int64_t)totalBytesExpectedToSend {
     NSDictionary *headers = options[@"headers"];
     NSDictionary *params  = options[@"parameters"];
     
+    NSURL *requestURL = [NSURL URLWithString:urlString];
+    if (!requestURL) {
+        resolve(@{@"success": @NO, @"error": @"Invalid URL"});
+        return;
+    }
+
+    if (![[NSFileManager defaultManager] fileExistsAtPath:filePath]) {
+        resolve(@{@"success": @NO, @"error": [NSString stringWithFormat:@"File not found: %@", filePath]});
+        return;
+    }
+
     NSString *boundary = [NSString stringWithFormat:@"Boundary-%@", [[NSUUID UUID] UUIDString]];
-    NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:urlString]];
+    NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:requestURL];
     [request setHTTPMethod:@"POST"];
     [request setValue:[NSString stringWithFormat:@"multipart/form-data; boundary=%@", boundary] forHTTPHeaderField:@"Content-Type"];
     
@@ -1024,10 +1121,14 @@ totalBytesExpectedToSend:(int64_t)totalBytesExpectedToSend {
         }
     }
 
+    // Assembling the multipart body copies the whole source file, so keep it off
+    // the caller's thread — otherwise a large upload blocks the native module
+    // queue (and with it every other call into this module) until the copy ends.
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
     // Create a temporary file to avoid OutOfMemory crash for large uploads
     NSString *tempFileName = [NSString stringWithFormat:@"upload_%@.tmp", [[NSUUID UUID] UUIDString]];
     NSString *tempFilePath = [NSTemporaryDirectory() stringByAppendingPathComponent:tempFileName];
-    
+
     [[NSFileManager defaultManager] createFileAtPath:tempFilePath contents:nil attributes:nil];
     NSFileHandle *fileHandle = [NSFileHandle fileHandleForWritingAtPath:tempFilePath];
     if (!fileHandle) {
@@ -1071,21 +1172,29 @@ totalBytesExpectedToSend:(int64_t)totalBytesExpectedToSend {
 
     NSURL *tempFileURL = [NSURL fileURLWithPath:tempFilePath];
 
+    NSURLSession *session = self.fgSession;
+    if (!session) {
+        [[NSFileManager defaultManager] removeItemAtPath:tempFilePath error:nil];
+        resolve(@{@"success": @NO, @"error": @"Module was invalidated"});
+        return;
+    }
+
     // Use delegate-based session for upload progress support with fromFile: instead of fromData:
-    NSURLSessionUploadTask *task = [self.fgSession uploadTaskWithRequest:request fromFile:tempFileURL];
+    NSURLSessionUploadTask *task = [session uploadTaskWithRequest:request fromFile:tempFileURL];
     NSString *taskKey = [NSString stringWithFormat:@"%lu", (unsigned long)task.taskIdentifier];
 
     dispatch_sync(self.syncQueue, ^{
         self.uploadTaskIdMap[taskKey] = uploadId;
         self.uploadPromises[uploadId] = @{
-            @"resolve": resolve, 
-            @"reject": reject, 
+            @"resolve": resolve,
+            @"reject": reject,
             @"tempFile": tempFilePath
         };
         self.uploadUrls[uploadId] = urlString;
     });
 
     [task resume];
+    });
 }
 
 // ─── saveBase64AsFile ─────────────────────────────────────────────────────────
@@ -1333,27 +1442,20 @@ RCT_EXPORT_METHOD(unzip:(NSString *)sourcePath
 {
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
         NSFileManager *fm = [NSFileManager defaultManager];
-        NSURL *sourceURL = [NSURL fileURLWithPath:sourcePath];
-        NSURL *destURL   = [NSURL fileURLWithPath:destDir];
+        NSURL *destURL = [NSURL fileURLWithPath:destDir];
+
+        if (![fm fileExistsAtPath:sourcePath]) {
+            resolve(@{@"success": @NO,
+                      @"error": [NSString stringWithFormat:@"Source zip file does not exist: %@", sourcePath]});
+            return;
+        }
 
         // Ensure destination directory exists
         NSError *mkdirErr = nil;
         [fm createDirectoryAtURL:destURL withIntermediateDirectories:YES attributes:nil error:&mkdirErr];
 
-        // Use NSData + manual zip parsing via Foundation's built-in zip support
-        // (available via -[NSFileManager createDirectoryAtPath] + zlib read loop)
-        // We use the C-level zlib (linked via s.libraries = 'z') through minizip-style reading.
-        // Simpler approach: use the Objective-C Archive API available on all iOS versions.
-
-        // Primary path: try SSZipArchive-style pure-C zlib approach
-        // Since we only have zlib (no minizip headers), we'll use NSData + the public
-        // Archive Utility API: ziparchive is not available, but we CAN use:
-        //   -[NSFileWrapper] or the Archive framework (iOS 16+).
-        // Most reliable zero-dependency path: pipe through /usr/bin/unzip subprocess.
-        // On iOS that binary doesn't exist. So we use the ZipFoundation-compatible
-        // pure-Foundation approach using NSInputStream with a known zip local-file header parser.
-
-        // ── Pure-Foundation zip reader (no third-party, no subprocess) ──────────
+        // Pure-Foundation zip reader — zlib is a system library (s.libraries = "z"),
+        // so no third-party archive dependency is needed. See -extractZipData:.
         NSError *readError = nil;
         NSData *zipData = [NSData dataWithContentsOfFile:sourcePath options:NSDataReadingMappedIfSafe error:&readError];
         if (!zipData) {
@@ -1604,6 +1706,9 @@ RCT_EXPORT_METHOD(zip:(NSString *)sourcePath
 
         NSArray<NSString *> *filesToZip;
         NSString *baseDir;
+        // Entry names are prefixed with the source folder name so the archive
+        // expands into `<folder>/…` — matching Android and what `zip -r` produces.
+        NSString *entryPrefix = @"";
         if (isDir) {
             NSDirectoryEnumerator *enumerator = [fm enumeratorAtPath:sourcePath];
             NSMutableArray *files = [NSMutableArray new];
@@ -1613,6 +1718,7 @@ RCT_EXPORT_METHOD(zip:(NSString *)sourcePath
             }
             filesToZip = files;
             baseDir = sourcePath;
+            entryPrefix = [sourcePath lastPathComponent];
         } else {
             filesToZip = @[[sourcePath lastPathComponent]];
             baseDir = [sourcePath stringByDeletingLastPathComponent];
@@ -1623,7 +1729,12 @@ RCT_EXPORT_METHOD(zip:(NSString *)sourcePath
             BOOL entryIsDir = NO;
             [fm fileExistsAtPath:fullPath isDirectory:&entryIsDir];
 
-            NSData *entryNameData = [relativePath dataUsingEncoding:NSUTF8StringEncoding];
+            NSString *entryName = entryPrefix.length > 0
+                ? [entryPrefix stringByAppendingPathComponent:relativePath]
+                : relativePath;
+            // Directory entries must end in "/" or extractors treat them as files.
+            if (entryIsDir) entryName = [entryName stringByAppendingString:@"/"];
+            NSData *entryNameData = [entryName dataUsingEncoding:NSUTF8StringEncoding];
             uint16_t nameLen = (uint16_t)entryNameData.length;
 
             uint32_t localHeaderOffset = (uint32_t)[fh offsetInFile];

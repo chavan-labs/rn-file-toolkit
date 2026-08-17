@@ -1,6 +1,6 @@
 {
   "name": "rn-file-toolkit",
-  "version": "1.0.13",
+  "version": "1.0.14",
   "description": "The ultimate native file management toolkit for React Native. Features background downloads, resumable uploads, filesystem operations, queues, zip/unzip, and media utilities with zero third-party dependencies.",
   "main": "./lib/commonjs/index.js",
   "module": "./lib/module/index.js",
@@ -154,8 +154,11 @@
     "typescript": "^5.9.2"
   },
   "peerDependencies": {
-    "react": "*",
-    "react-native": "*"
+    "react": ">=18.0.0",
+    "react-native": ">=0.74.0"
+  },
+  "engines": {
+    "node": ">=18"
   },
   "workspaces": [
     "example"
@@ -164,7 +167,12 @@
     "source": "src",
     "output": "lib",
     "targets": [
-      "commonjs",
+      [
+        "commonjs",
+        {
+          "esm": true
+        }
+      ],
       [
         "module",
         {

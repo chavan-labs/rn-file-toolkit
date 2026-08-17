@@ -36,4 +36,9 @@ export interface Spec extends TurboModule {
   removeListeners(count: number): void;
 }
 
-export default TurboModuleRegistry.getEnforcing<Spec>('FileToolkit');
+// `get` (not `getEnforcing`) so that merely importing this package cannot throw.
+// `getEnforcing` raises an invariant at *import* time when the native side is not
+// linked (Expo Go, web, a stale build, a missing pod install), which produces an
+// opaque red screen with no hint about the cause. `src/index.tsx` wraps the result
+// in a proxy that throws an actionable message on first use instead.
+export default TurboModuleRegistry.get<Spec>('FileToolkit');

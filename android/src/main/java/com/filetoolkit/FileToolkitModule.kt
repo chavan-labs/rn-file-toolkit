@@ -20,9 +20,9 @@ import com.facebook.react.modules.core.DeviceEventManagerModule
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
-import java.io.RandomAccessFile
 import java.net.HttpURLConnection
 import java.net.URL
+import java.net.URLDecoder
 import java.security.MessageDigest
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
@@ -74,7 +74,43 @@ class FileToolkitModule(private val reactContext: ReactApplicationContext) :
     }
   }
 
+  /**
+   * Persistent DownloadManager id → toolkit downloadId mapping.
+   *
+   * Background downloads outlive the process, so the mapping cannot live only in
+   * memory. It also must not live in the notification description: callers can
+   * override that via `notificationDescription`, which used to silently break
+   * every progress/complete event for the download.
+   */
+  private val bgPrefs by lazy {
+    reactContext.getSharedPreferences("rn_file_toolkit_bg", Context.MODE_PRIVATE)
+  }
+
+  private fun rememberBackgroundDownload(downloadId: String, bgId: Long) {
+    bgDownloadIds[downloadId] = bgId
+    bgPrefs.edit().putString(bgId.toString(), downloadId).apply()
+  }
+
+  private fun forgetBackgroundDownload(downloadId: String, bgId: Long) {
+    bgDownloadIds.remove(downloadId)
+    bgPrefs.edit().remove(bgId.toString()).apply()
+  }
+
+  /** Resolves a DownloadManager id back to the toolkit downloadId, or null. */
+  private fun downloadIdForBgId(bgId: Long): String? {
+    bgDownloadIds.entries.firstOrNull { it.value == bgId }?.let { return it.key }
+    return bgPrefs.getString(bgId.toString(), null)
+  }
+
   init {
+    // Re-adopt downloads started before the process was killed.
+    try {
+      bgPrefs.all.forEach { (key, value) ->
+        val bgId = key.toLongOrNull()
+        if (bgId != null && value is String) bgDownloadIds[value] = bgId
+      }
+    } catch (_: Exception) {}
+
     val filter = IntentFilter(DownloadManager.ACTION_DOWNLOAD_COMPLETE)
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
       reactContext.registerReceiver(downloadReceiver, filter, Context.RECEIVER_EXPORTED)
@@ -89,6 +125,17 @@ class FileToolkitModule(private val reactContext: ReactApplicationContext) :
       reactContext.unregisterReceiver(downloadReceiver)
     } catch (_: Exception) {} // Receiver may not be registered
     bgPollHandler.removeCallbacks(bgPollRunnable)
+    // Stop foreground download threads and settle their promises, otherwise a dev
+    // reload leaves orphaned threads writing files for a bridge that is gone.
+    activeDownloads.values.forEach { it.cancelled = true }
+    activeDownloads.clear()
+    foregroundPromises.keys.toList().forEach { id ->
+      foregroundPromises.remove(id)?.resolve(Arguments.createMap().apply {
+        putBoolean("success", false)
+        putString("downloadId", id)
+        putString("error", "CANCELLED")
+      })
+    }
   }
 
   override fun addListener(eventName: String?) {
@@ -102,40 +149,89 @@ class FileToolkitModule(private val reactContext: ReactApplicationContext) :
   // ─── Helpers ───────────────────────────────────────────────────────────────
 
   private fun emit(event: String, map: com.facebook.react.bridge.WritableMap) {
-    reactContext
-      .getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter::class.java)
-      .emit(event, map)
+    // Downloads run on background threads and can outlive the React instance
+    // (dev reload, activity teardown). Emitting into a dead instance throws and
+    // crashes the app, so bail out instead.
+    if (!reactContext.hasActiveReactInstance()) return
+    try {
+      reactContext
+        .getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter::class.java)
+        .emit(event, map)
+    } catch (_: Exception) {
+      // React instance torn down between the check and the emit — nothing to do.
+    }
+  }
+
+  /**
+   * Reduces an arbitrary name to a single, safe path segment.
+   *
+   * A file name is attacker- or server-controlled (it can come from the URL, a
+   * redirect target or a caller-supplied `fileName`), so `../` sequences and
+   * embedded separators must never be able to escape the destination directory.
+   */
+  private fun sanitizeFileName(name: String): String {
+    // Strip any directory component, then neutralise traversal and separators.
+    val base = name.substringAfterLast('/').substringAfterLast('\\')
+    val cleaned = base.trim()
+    if (cleaned.isBlank() || cleaned == "." || cleaned == "..") return "downloaded_file"
+    // Keep names within the common filesystem limit.
+    return if (cleaned.length > 200) cleaned.takeLast(200) else cleaned
   }
 
   private fun resolveFileName(url: String, hint: String?): String {
-    if (!hint.isNullOrBlank()) return hint
-    var name = url.substringAfterLast("/")
-    if (name.contains("?")) name = name.substringBefore("?")
-    return name.ifBlank { "downloaded_file" }
+    if (!hint.isNullOrBlank()) return sanitizeFileName(hint)
+    var name = url.substringBefore("#").substringBefore("?").substringAfterLast("/")
+    name = try {
+      URLDecoder.decode(name, "UTF-8")
+    } catch (_: Exception) {
+      name
+    }
+    return sanitizeFileName(name)
   }
 
-  private fun getDestinationFile(fileName: String, destination: String?): File {
-    return when (destination) {
-      "cache" -> {
-        val dir = File(reactContext.cacheDir, "RNFileToolkit")
-        dir.mkdirs()
-        File(dir, fileName)
-      }
-      "documents" -> {
-        // getExternalFilesDir can return null if external storage is unavailable
-        val baseDir = reactContext.getExternalFilesDir(Environment.DIRECTORY_DOCUMENTS)
-          ?: reactContext.filesDir
-        val dir = File(baseDir, "RNFileToolkit")
-        dir.mkdirs()
-        File(dir, fileName)
-      }
-      else -> {
-        // Use app-specific downloads directory to avoid scoped storage issues on Android 10+
-        val dir = File(reactContext.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS) ?: reactContext.filesDir, "RNFileToolkit")
-        dir.mkdirs()
-        File(dir, fileName)
-      }
+  /** Resolves the toolkit-owned directory for a logical destination. */
+  private fun getDestinationDir(destination: String?): File {
+    val dir = when (destination) {
+      "cache" -> File(reactContext.cacheDir, "RNFileToolkit")
+      // getExternalFilesDir can return null if external storage is unavailable
+      "documents" -> File(
+        reactContext.getExternalFilesDir(Environment.DIRECTORY_DOCUMENTS) ?: reactContext.filesDir,
+        "RNFileToolkit"
+      )
+      // Use app-specific downloads directory to avoid scoped storage issues on Android 10+
+      else -> File(
+        reactContext.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS) ?: reactContext.filesDir,
+        "RNFileToolkit"
+      )
     }
+    dir.mkdirs()
+    return dir
+  }
+
+  /**
+   * Destination directory for background (DownloadManager) downloads.
+   *
+   * DownloadManager runs in a different process and cannot write to the app's
+   * *internal* cache dir, so "cache" maps to the external cache dir instead.
+   * [getCachedFiles] and [clearCache] scan both so the two paths stay in sync.
+   */
+  private fun getBackgroundDestinationDir(destination: String?): File {
+    if (destination != "cache") return getDestinationDir(destination)
+    val dir = File(reactContext.externalCacheDir ?: reactContext.cacheDir, "RNFileToolkit")
+    dir.mkdirs()
+    return dir
+  }
+
+  /** Every directory the toolkit may write downloads into. */
+  private fun toolkitDirs(): List<File> = listOf(
+    File(reactContext.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS) ?: reactContext.filesDir, "RNFileToolkit"),
+    File(reactContext.cacheDir, "RNFileToolkit"),
+    File(reactContext.externalCacheDir ?: reactContext.cacheDir, "RNFileToolkit"),
+    File(reactContext.getExternalFilesDir(Environment.DIRECTORY_DOCUMENTS) ?: reactContext.filesDir, "RNFileToolkit")
+  ).distinctBy { it.absolutePath }
+
+  private fun getDestinationFile(fileName: String, destination: String?): File {
+    return File(getDestinationDir(destination), sanitizeFileName(fileName))
   }
 
   private fun calculateChecksum(file: File, algorithm: String): String {
@@ -157,6 +253,61 @@ class FileToolkitModule(private val reactContext: ReactApplicationContext) :
     }
     val bytes = digest.digest()
     return bytes.joinToString("") { "%02x".format(it) }
+  }
+
+  /** Connect timeout for every HTTP request this module makes, in milliseconds. */
+  private val connectTimeoutMs = 30_000
+  /** Socket read timeout, in milliseconds. */
+  private val readTimeoutMs = 60_000
+
+  /**
+   * Opens a connected [HttpURLConnection] for a download.
+   *
+   * Handles two things `HttpURLConnection` does not do on its own:
+   * - **Timeouts.** The platform default is *no* timeout, so a stalled server
+   *   leaves the download thread and its JS promise hanging forever.
+   * - **Cross-protocol redirects.** `HttpURLConnection` silently refuses to
+   *   follow http→https (and https→http) redirects, which is exactly what CDNs
+   *   and pre-signed storage URLs use. Without this the caller sees an empty
+   *   file or a 30x "server error".
+   */
+  private fun openDownloadConnection(
+    urlString: String,
+    headersMap: ReadableMap?,
+    resumeFrom: Long
+  ): HttpURLConnection {
+    var currentUrl = URL(urlString)
+    var redirects = 0
+    while (true) {
+      val connection = currentUrl.openConnection() as HttpURLConnection
+      connection.connectTimeout = connectTimeoutMs
+      connection.readTimeout = readTimeoutMs
+      connection.instanceFollowRedirects = true
+      // Ask for an unencoded body: HttpURLConnection transparently gunzips a
+      // gzipped response but still reports the *compressed* Content-Length,
+      // which makes progress percentages run past 100%.
+      connection.setRequestProperty("Accept-Encoding", "identity")
+
+      headersMap?.toHashMap()?.forEach { (key, value) ->
+        if (value is String) connection.setRequestProperty(key, value)
+      }
+      if (resumeFrom > 0) {
+        connection.setRequestProperty("Range", "bytes=$resumeFrom-")
+      }
+      connection.connect()
+
+      val code = connection.responseCode
+      val isRedirect = code == HttpURLConnection.HTTP_MOVED_PERM ||
+        code == HttpURLConnection.HTTP_MOVED_TEMP ||
+        code == HttpURLConnection.HTTP_SEE_OTHER ||
+        code == 307 || code == 308
+      val location = connection.getHeaderField("Location")
+      if (!isRedirect || location == null || redirects >= 5) return connection
+
+      connection.disconnect()
+      currentUrl = URL(currentUrl, location)
+      redirects++
+    }
   }
 
   // ─── download ──────────────────────────────────────────────────────────────
@@ -197,48 +348,43 @@ class FileToolkitModule(private val reactContext: ReactApplicationContext) :
 
     if (isBackground) {
       // Use system DownloadManager — survives process death
-      val dm = reactContext.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
-      val request = DownloadManager.Request(Uri.parse(urlString)).apply {
-        setTitle(notificationTitle ?: fileName)
-        setDescription(notificationDesc ?: "rn-file-toolkit-id:$downloadId")
-        setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
+      try {
+        val dm = reactContext.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
+        val request = DownloadManager.Request(Uri.parse(urlString)).apply {
+          setTitle(notificationTitle ?: fileName)
+          if (notificationDesc != null) setDescription(notificationDesc)
+          setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
 
-        // Add headers
-        headersMap?.toHashMap()?.forEach { (key, value) ->
-          if (value is String) addRequestHeader(key, value)
-        }
+          // Add headers
+          headersMap?.toHashMap()?.forEach { (key, value) ->
+            if (value is String) addRequestHeader(key, value)
+          }
 
-        // Set destination — mirror the RNFileToolkit subdirectory used by getDestinationFile
-        when (destination) {
-          "cache" -> {
-            val dir = File(reactContext.getExternalFilesDir(null) ?: reactContext.filesDir, "RNFileToolkit")
-            dir.mkdirs()
-            setDestinationUri(android.net.Uri.fromFile(File(dir, fileName)))
-          }
-          "documents" -> {
-            val dir = File(reactContext.getExternalFilesDir(Environment.DIRECTORY_DOCUMENTS) ?: reactContext.filesDir, "RNFileToolkit")
-            dir.mkdirs()
-            setDestinationUri(android.net.Uri.fromFile(File(dir, fileName)))
-          }
-          else -> {
-            val dir = File(reactContext.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS) ?: reactContext.filesDir, "RNFileToolkit")
-            dir.mkdirs()
-            setDestinationUri(android.net.Uri.fromFile(File(dir, fileName)))
-          }
+          // Set destination — mirror the RNFileToolkit subdirectory used by getDestinationFile
+          setDestinationUri(Uri.fromFile(File(getBackgroundDestinationDir(destination), fileName)))
         }
+        val bgId = dm.enqueue(request)
+        rememberBackgroundDownload(downloadId, bgId)
+        activeDownloads.remove(downloadId)
+
+        // Start polling if not running
+        bgPollHandler.removeCallbacks(bgPollRunnable)
+        bgPollHandler.post(bgPollRunnable)
+
+        promise.resolve(Arguments.createMap().apply {
+          putBoolean("success", true)
+          putString("downloadId", downloadId)
+        })
+      } catch (e: Exception) {
+        // DownloadManager rejects unsupported schemes (file://, data:) and can be
+        // disabled by the user, both of which throw rather than returning an id.
+        activeDownloads.remove(downloadId)
+        promise.resolve(Arguments.createMap().apply {
+          putBoolean("success", false)
+          putString("downloadId", downloadId)
+          putString("error", e.message ?: "DOWNLOAD_MANAGER_ERROR")
+        })
       }
-      val bgId = dm.enqueue(request)
-      bgDownloadIds[downloadId] = bgId
-      activeDownloads.remove(downloadId)
-
-      // Start polling if not running
-      bgPollHandler.removeCallbacks(bgPollRunnable)
-      bgPollHandler.post(bgPollRunnable)
-
-      promise.resolve(Arguments.createMap().apply {
-        putBoolean("success", true)
-        putString("downloadId", downloadId)
-      })
       return
     }
 
@@ -280,17 +426,7 @@ class FileToolkitModule(private val reactContext: ReactApplicationContext) :
           val resumeFrom = state.bytesDownloaded
           val destFile = getDestinationFile(fileName, destination)
 
-          val url = URL(urlString)
-          val connection = url.openConnection() as HttpURLConnection
-
-          headersMap?.toHashMap()?.forEach { (key, value) ->
-            if (value is String) connection.setRequestProperty(key, value)
-          }
-
-          if (resumeFrom > 0) {
-            connection.setRequestProperty("Range", "bytes=$resumeFrom-")
-          }
-          connection.connect()
+          val connection = openDownloadConnection(urlString, headersMap, resumeFrom)
 
           val responseCode = connection.responseCode
           if (responseCode != HttpURLConnection.HTTP_OK && responseCode != HttpURLConnection.HTTP_PARTIAL) {
@@ -457,7 +593,6 @@ class FileToolkitModule(private val reactContext: ReactApplicationContext) :
     val currentBgIds = bgDownloadIds.values.toSet()
     cursor.use { c ->
       if (c.moveToFirst()) {
-        val descIdx = c.getColumnIndex(DownloadManager.COLUMN_DESCRIPTION)
         val idIdx = c.getColumnIndex(DownloadManager.COLUMN_ID)
         val statusIdx = c.getColumnIndex(DownloadManager.COLUMN_STATUS)
         val totalIdx = c.getColumnIndex(DownloadManager.COLUMN_TOTAL_SIZE_BYTES)
@@ -466,24 +601,21 @@ class FileToolkitModule(private val reactContext: ReactApplicationContext) :
         do {
           val bgId = c.getLong(idIdx)
           if (!currentBgIds.contains(bgId)) continue
-          val description = c.getString(descIdx) ?: ""
-          if (description.startsWith("rn-file-toolkit-id:")) {
-            val downloadId = description.removePrefix("rn-file-toolkit-id:")
-            val status = c.getInt(statusIdx)
-            val total = c.getLong(totalIdx)
-            val current = c.getLong(currentIdx)
-            if (status == DownloadManager.STATUS_RUNNING || status == DownloadManager.STATUS_PENDING) {
-              val progress = if (total > 0) (current * 100 / total).toInt() else 0
-              val uriString = c.getString(uriIdx) ?: ""
-              val evt = Arguments.createMap().apply {
-                putString("url", uriString)
-                putString("downloadId", downloadId)
-                putInt("progress", progress)
-                putDouble("bytesDownloaded", current.toDouble())
-                putDouble("totalBytes", total.toDouble())
-              }
-              emit("onDownloadProgress", evt)
+          val downloadId = downloadIdForBgId(bgId) ?: continue
+          val status = c.getInt(statusIdx)
+          val total = c.getLong(totalIdx)
+          val current = c.getLong(currentIdx)
+          if (status == DownloadManager.STATUS_RUNNING || status == DownloadManager.STATUS_PENDING) {
+            val progress = if (total > 0) (current * 100 / total).toInt() else 0
+            val uriString = c.getString(uriIdx) ?: ""
+            val evt = Arguments.createMap().apply {
+              putString("url", uriString)
+              putString("downloadId", downloadId)
+              putInt("progress", progress)
+              putDouble("bytesDownloaded", current.toDouble())
+              putDouble("totalBytes", total.toDouble())
             }
+            emit("onDownloadProgress", evt)
           }
         } while (c.moveToNext())
       }
@@ -496,33 +628,32 @@ class FileToolkitModule(private val reactContext: ReactApplicationContext) :
     val cursor = dm.query(query) ?: return
     cursor.use {
       if (it.moveToFirst()) {
-        val descIdx = it.getColumnIndex(DownloadManager.COLUMN_DESCRIPTION)
         val statusIdx = it.getColumnIndex(DownloadManager.COLUMN_STATUS)
         val uriIdx = it.getColumnIndex(DownloadManager.COLUMN_LOCAL_URI)
         val reasonIdx = it.getColumnIndex(DownloadManager.COLUMN_REASON)
 
-        val description = it.getString(descIdx) ?: ""
-        if (description.startsWith("rn-file-toolkit-id:")) {
-          val downloadId = description.removePrefix("rn-file-toolkit-id:")
-          val status = it.getInt(statusIdx)
-          bgDownloadIds.remove(downloadId) // cleanup
+        // Not one of ours (another library or the host app enqueued it).
+        val downloadId = downloadIdForBgId(bgId) ?: return
+        val status = it.getInt(statusIdx)
+        forgetBackgroundDownload(downloadId, bgId)
 
-          if (status == DownloadManager.STATUS_SUCCESSFUL) {
-            val localUri = it.getString(uriIdx)
-            val filePath = localUri?.removePrefix("file://") ?: ""
-            emit("onDownloadComplete", Arguments.createMap().apply {
-              putBoolean("success", true)
-              putString("downloadId", downloadId)
-              putString("filePath", filePath)
-            })
-          } else {
-            val reason = it.getInt(reasonIdx)
-            emit("onDownloadError", Arguments.createMap().apply {
-              putBoolean("success", false)
-              putString("downloadId", downloadId)
-              putString("error", "DownloadManager failed with reason/code: $reason")
-            })
-          }
+        if (status == DownloadManager.STATUS_SUCCESSFUL) {
+          val localUri = it.getString(uriIdx)
+          // COLUMN_LOCAL_URI is a percent-encoded file:// URI; Uri.parse().path
+          // decodes it, whereas trimming the scheme leaves "%20" in the path.
+          val filePath = localUri?.let { uri -> Uri.parse(uri).path } ?: ""
+          emit("onDownloadComplete", Arguments.createMap().apply {
+            putBoolean("success", true)
+            putString("downloadId", downloadId)
+            putString("filePath", filePath)
+          })
+        } else {
+          val reason = it.getInt(reasonIdx)
+          emit("onDownloadError", Arguments.createMap().apply {
+            putBoolean("success", false)
+            putString("downloadId", downloadId)
+            putString("error", "DownloadManager failed with reason/code: $reason")
+          })
         }
       }
     }
@@ -533,8 +664,14 @@ class FileToolkitModule(private val reactContext: ReactApplicationContext) :
   override fun pauseDownload(downloadId: String, promise: Promise) {
     val state = activeDownloads[downloadId]
     if (state == null) {
+      val reason = if (bgDownloadIds.containsKey(downloadId)) {
+        // Android's DownloadManager exposes no pause/resume API.
+        "Background downloads cannot be paused on Android. Use background: false to pause/resume, or cancelDownload() to stop it."
+      } else {
+        "Download not found"
+      }
       promise.resolve(Arguments.createMap().apply {
-        putBoolean("success", false); putString("error", "Download not found")
+        putBoolean("success", false); putString("error", reason)
       })
       return
     }
@@ -547,8 +684,13 @@ class FileToolkitModule(private val reactContext: ReactApplicationContext) :
   override fun resumeDownload(downloadId: String, promise: Promise) {
     val state = activeDownloads[downloadId]
     if (state == null) {
+      val reason = if (bgDownloadIds.containsKey(downloadId)) {
+        "Background downloads cannot be paused or resumed on Android; the system keeps them running."
+      } else {
+        "Download not found or already finished"
+      }
       promise.resolve(Arguments.createMap().apply {
-        putBoolean("success", false); putString("error", "Download not found or already finished")
+        putBoolean("success", false); putString("error", reason)
       })
       return
     }
@@ -573,10 +715,13 @@ class FileToolkitModule(private val reactContext: ReactApplicationContext) :
       }
     )
     // Also cancel background DownloadManager downloads
-    val bgId = bgDownloadIds.remove(downloadId)
+    val bgId = bgDownloadIds[downloadId]
     if (bgId != null) {
-      val dm = reactContext.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
-      dm.remove(bgId)
+      forgetBackgroundDownload(downloadId, bgId)
+      try {
+        val dm = reactContext.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
+        dm.remove(bgId)
+      } catch (_: Exception) {}
     }
     promise.resolve(Arguments.createMap().apply { putBoolean("success", true) })
   }
@@ -588,16 +733,7 @@ class FileToolkitModule(private val reactContext: ReactApplicationContext) :
       val list = Arguments.createArray()
 
       // Scan only toolkit-owned subdirectories to avoid returning files from other apps
-      val dirs = listOfNotNull(
-        File(reactContext.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS) ?: reactContext.filesDir, "RNFileToolkit"),
-        File(reactContext.cacheDir, "RNFileToolkit"),
-        File(
-          reactContext.getExternalFilesDir(Environment.DIRECTORY_DOCUMENTS) ?: reactContext.filesDir,
-          "RNFileToolkit"
-        )
-      )
-
-      for (dir in dirs) {
+      for (dir in toolkitDirs()) {
         dir.listFiles()?.forEach { f ->
           if (!f.isFile) return@forEach
           list.pushMap(Arguments.createMap().apply {
@@ -623,26 +759,37 @@ class FileToolkitModule(private val reactContext: ReactApplicationContext) :
   // ─── deleteFile ────────────────────────────────────────────────────────────
 
   override fun deleteFile(filePath: String, promise: Promise) {
-    val file = File(filePath)
-    val deleted = file.delete()
-    promise.resolve(Arguments.createMap().apply {
-      putBoolean("success", deleted)
-      if (!deleted) putString("error", "File not found or could not be deleted")
-    })
+    try {
+      val file = File(filePath)
+      if (!file.exists()) {
+        promise.resolve(Arguments.createMap().apply {
+          putBoolean("success", false)
+          putString("error", "File not found: $filePath")
+        })
+        return
+      }
+      // Match iOS (`removeItemAtPath:`), which removes directories recursively.
+      val deleted = if (file.isDirectory) file.deleteRecursively() else file.delete()
+      promise.resolve(Arguments.createMap().apply {
+        putBoolean("success", deleted)
+        if (!deleted) putString("error", "Could not delete: $filePath")
+      })
+    } catch (e: Throwable) {
+      promise.resolve(Arguments.createMap().apply {
+        putBoolean("success", false)
+        putString("error", e.message ?: "DELETE_FILE_ERROR")
+      })
+    }
   }
 
   // ─── clearCache ────────────────────────────────────────────────────────────
 
   override fun clearCache(promise: Promise) {
     try {
-      // Only clear the toolkit-owned subdirectory — never touch the app's own files or public Downloads
-      val dirs = listOfNotNull(
-        File(reactContext.cacheDir, "RNFileToolkit"),
-        File(
-          reactContext.getExternalFilesDir(Environment.DIRECTORY_DOCUMENTS) ?: reactContext.filesDir,
-          "RNFileToolkit"
-        )
-      )
+      // Only clear the toolkit-owned cache/documents subdirectories — never the
+      // app's own files, and never the downloads directory the user asked for.
+      val downloadsDir = getDestinationDir("downloads").absolutePath
+      val dirs = toolkitDirs().filter { it.absolutePath != downloadsDir }
       for (dir in dirs) {
         dir.listFiles()?.forEach { it.deleteRecursively() }
       }
@@ -888,7 +1035,6 @@ class FileToolkitModule(private val reactContext: ReactApplicationContext) :
 
       cursor?.use { c ->
         if (c.moveToFirst()) {
-          val descIdx = c.getColumnIndex(DownloadManager.COLUMN_DESCRIPTION)
           val idIdx = c.getColumnIndex(DownloadManager.COLUMN_ID)
           val statusIdx = c.getColumnIndex(DownloadManager.COLUMN_STATUS)
           val uriIdx = c.getColumnIndex(DownloadManager.COLUMN_URI)
@@ -896,21 +1042,18 @@ class FileToolkitModule(private val reactContext: ReactApplicationContext) :
           val currentIdx = c.getColumnIndex(DownloadManager.COLUMN_BYTES_DOWNLOADED_SO_FAR)
 
           do {
-            val description = c.getString(descIdx) ?: ""
-            if (description.startsWith("rn-file-toolkit-id:")) {
-              val downloadId = description.removePrefix("rn-file-toolkit-id:")
-              val status = c.getInt(statusIdx)
-              val total = c.getLong(totalIdx)
-              val current = c.getLong(currentIdx)
-              val progress = if (total > 0) (current * 100 / total).toInt() else 0
+            val downloadId = downloadIdForBgId(c.getLong(idIdx)) ?: continue
+            val status = c.getInt(statusIdx)
+            val total = c.getLong(totalIdx)
+            val current = c.getLong(currentIdx)
+            val progress = if (total > 0) (current * 100 / total).toInt() else 0
 
-              results.pushMap(Arguments.createMap().apply {
-                putString("downloadId", downloadId)
-                putString("url", c.getString(uriIdx))
-                putInt("status", status)
-                putInt("progress", progress)
-              })
-            }
+            results.pushMap(Arguments.createMap().apply {
+              putString("downloadId", downloadId)
+              putString("url", c.getString(uriIdx) ?: "")
+              putInt("status", status)
+              putInt("progress", progress)
+            })
           } while (c.moveToNext())
         }
       }
@@ -963,6 +1106,9 @@ class FileToolkitModule(private val reactContext: ReactApplicationContext) :
         connection.doOutput = true
         connection.useCaches = false
         connection.requestMethod = "POST"
+        connection.connectTimeout = connectTimeoutMs
+        // Uploads can legitimately take a long time; only guard against a stalled socket.
+        connection.readTimeout = readTimeoutMs
         connection.setRequestProperty("Connection", "Keep-Alive")
         connection.setRequestProperty("Content-Type", "multipart/form-data; boundary=$boundary")
 
@@ -1523,10 +1669,25 @@ class FileToolkitModule(private val reactContext: ReactApplicationContext) :
 
   // ─── getCookies ───────────────────────────────────────────────────────────
 
+  /**
+   * Android's [android.webkit.CookieManager] keys cookies by URL, not by bare
+   * host: `getCookie("example.com")` always returns null. Callers naturally pass
+   * a domain (that is what the API is named after and what iOS accepts), so
+   * normalise it to a URL here.
+   */
+  private fun cookieUrlFor(domain: String): String {
+    if (domain.isBlank()) return domain
+    return if (domain.startsWith("http://") || domain.startsWith("https://")) {
+      domain
+    } else {
+      "https://${domain.trimStart('.')}"
+    }
+  }
+
   override fun getCookies(domain: String, promise: Promise) {
     try {
       val cookieManager = android.webkit.CookieManager.getInstance()
-      val cookieString = cookieManager.getCookie(domain)
+      val cookieString = cookieManager.getCookie(cookieUrlFor(domain))
 
       val cookiesArray = Arguments.createArray()
 
@@ -1576,14 +1737,15 @@ class FileToolkitModule(private val reactContext: ReactApplicationContext) :
       } else {
         // Android CookieManager does not support per-domain clearing directly.
         // We read cookies for the domain and set each to expired.
-        val cookieString = cookieManager.getCookie(domain)
+        val cookieUrl = cookieUrlFor(domain)
+        val cookieString = cookieManager.getCookie(cookieUrl)
         if (!cookieString.isNullOrBlank()) {
           cookieString.split(";").forEach { pair ->
             val trimmed = pair.trim()
             val eqIndex = trimmed.indexOf("=")
             if (eqIndex > 0) {
               val name = trimmed.substring(0, eqIndex)
-              cookieManager.setCookie(domain, "$name=; Expires=Thu, 01 Jan 1970 00:00:00 GMT")
+              cookieManager.setCookie(cookieUrl, "$name=; Expires=Thu, 01 Jan 1970 00:00:00 GMT")
             }
           }
           cookieManager.flush()

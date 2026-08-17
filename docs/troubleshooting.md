@@ -109,3 +109,71 @@ This is normal behavior. Treat it as a user choice, not an error.
 - ✅ Custom dev client / EAS build: supported
 
 If using Expo, rebuild the native app after installing the package.
+
+## 10) `http://` downloads fail on Android
+
+Android blocks cleartext (non-HTTPS) traffic by default from API 28 onwards. A
+plain `http://` URL fails with `CLEARTEXT communication ... not permitted`.
+
+- **Preferred:** use `https://`.
+- **Bare React Native:** set `android:usesCleartextTraffic="true"` on the
+  `<application>` tag in `android/app/src/main/AndroidManifest.xml`, or ship a
+  network security config that allows only the hosts you need.
+- **Expo:** add [`expo-build-properties`](https://docs.expo.dev/versions/latest/sdk/build-properties/)
+  and set `android.usesCleartextTraffic: true`.
+
+## 11) Pause / resume does not work for background downloads
+
+Pause and resume are only available for **foreground** downloads
+(`background: false`, the default).
+
+- **Android** hands background downloads to the system `DownloadManager`, which
+  exposes no pause/resume API. `pauseDownload()` resolves with
+  `success: false` and an explanatory `error`. Use `cancelDownload()` to stop one.
+- **iOS** can pause background downloads, because `NSURLSession` produces resume
+  data.
+
+## 12) Background downloads on iOS finish only while the app is open
+
+iOS wakes the app to hand over a finished background transfer, but only if the
+app forwards the system's completion handler. Add this to your `AppDelegate`:
+
+```objc
+- (void)application:(UIApplication *)application
+    handleEventsForBackgroundURLSession:(NSString *)identifier
+                      completionHandler:(void (^)(void))completionHandler
+{
+  // Keep the handler and call it once your session delegate reports it is done.
+  self.backgroundSessionCompletionHandler = completionHandler;
+}
+```
+
+Without it the download still completes, but `onDownloadComplete` may not fire
+until the user next opens the app.
+
+## 13) `getBackgroundDownloads()` returns different `status` values per platform
+
+`status` is passed through from the platform and is **not** normalised:
+
+- **Android** — `DownloadManager` status constants (`1` pending, `2` running,
+  `4` paused, `8` successful, `16` failed).
+- **iOS** — `NSURLSessionTask.state` (`0` running, `1` suspended, `2` cancelling,
+  `3` completed).
+
+Use `progress` and the `onDownloadComplete` / `onDownloadError` events for
+portable logic.
+
+## 14) The native module is missing in tests, on web, or during SSR
+
+Importing `rn-file-toolkit` never throws on its own — the error is raised the
+first time you call a method. Check availability before calling:
+
+```ts
+import { isAvailable, download } from 'rn-file-toolkit';
+
+if (isAvailable) {
+  await download({ url });
+}
+```
+
+In Jest, mock the module rather than relying on the real native side.
