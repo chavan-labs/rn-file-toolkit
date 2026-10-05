@@ -13,6 +13,16 @@ const LINKING_ERROR =
   '• This package contains native code, so it does not work in Expo Go. Use a development build.\n' +
   '• On web / Node (SSR, tests) the native module is unavailable; guard your calls or mock the module.';
 
+const OLD_ARCH_ERROR =
+  `'rn-file-toolkit' requires the React Native New Architecture, but this app runs the legacy bridge.\n\n` +
+  '• Enable it (newArchEnabled=true in android/gradle.properties; RCT_NEW_ARCH_ENABLED=1 pod install on iOS) and rebuild.';
+
+const _linkedModule: any = FileToolkitSpec ?? NativeModules.FileToolkit;
+// On the legacy bridge the module is found, but iOS exports only a few of its
+// methods there — so every other call would fail with "is not a function".
+const _isLegacyBridge =
+  _linkedModule != null && typeof _linkedModule.download !== 'function';
+
 /**
  * The native module, or a proxy that throws an actionable error on first use.
  *
@@ -20,33 +30,101 @@ const LINKING_ERROR =
  * all evaluate the module graph without a native runtime attached.
  */
 const FileToolkitModule: any =
-  FileToolkitSpec ??
-  NativeModules.FileToolkit ??
-  new Proxy(
-    {},
-    {
-      get() {
-        throw new Error(LINKING_ERROR);
-      },
-    }
-  );
+  _linkedModule != null && !_isLegacyBridge
+    ? _linkedModule
+    : new Proxy(
+        {},
+        {
+          get() {
+            throw new Error(_isLegacyBridge ? OLD_ARCH_ERROR : LINKING_ERROR);
+          },
+        }
+      );
 
 /** `true` when the native module is linked and usable on this platform. */
-export const isAvailable: boolean = !!(
-  FileToolkitSpec ?? NativeModules.FileToolkit
-);
+export const isAvailable: boolean = _linkedModule != null && !_isLegacyBridge;
+
+type TerminalEventName = 'onDownloadComplete' | 'onDownloadError';
+const TERMINAL_EVENTS: TerminalEventName[] = [
+  'onDownloadComplete',
+  'onDownloadError',
+];
+const MAX_UNHEARD_EVENTS = 100;
+// ponytail: bounded to the most recent 500 ids; an older one is treated as
+// unknown and its result buffered like a download from a previous launch.
+const MAX_OWN_DOWNLOAD_IDS = 500;
+/** Ids of downloads started in this JS session (insertion-ordered). */
+const _ownDownloadIds = new Set<string>();
+const _terminalSubscribers: Record<TerminalEventName, Set<(e: any) => void>> = {
+  onDownloadComplete: new Set(),
+  onDownloadError: new Set(),
+};
+const _unheardTerminalEvents: Record<TerminalEventName, any[]> = {
+  onDownloadComplete: [],
+  onDownloadError: [],
+};
 
 let _eventEmitter: NativeEventEmitter | null = null;
 function getEventEmitter(): NativeEventEmitter {
   if (!_eventEmitter) {
     _eventEmitter = new NativeEventEmitter(FileToolkitModule);
+    // Native holds background results only until *some* listener for the event
+    // name exists, and cannot tell which name a removed listener belonged to.
+    // This relay stays subscribed for the app's lifetime (registered first, so
+    // it runs before per-download watchers) and buffers in JS instead, where
+    // subscribers are counted exactly.
+    for (const name of TERMINAL_EVENTS) {
+      _eventEmitter.addListener(name, (event: any) =>
+        _relayTerminalEvent(name, event)
+      );
+    }
   }
   return _eventEmitter;
 }
 
+function _relayTerminalEvent(name: TerminalEventName, event: any): void {
+  const subscribers = _terminalSubscribers[name];
+  if (subscribers.size > 0) {
+    Array.from(subscribers).forEach((cb) => cb(event));
+    return;
+  }
+  // A download started in this JS session reports through its own promise.
+  if (event?.downloadId && _ownDownloadIds.has(event.downloadId)) return;
+  // e.g. a download that finished while the app was closed — keep it until
+  // the app subscribes.
+  const unheard = _unheardTerminalEvents[name];
+  unheard.push(event);
+  if (unheard.length > MAX_UNHEARD_EVENTS) unheard.shift();
+}
+
+function _subscribeTerminalEvent(
+  name: TerminalEventName,
+  cb: (event: any) => void
+): () => void {
+  getEventEmitter();
+  const subscribers = _terminalSubscribers[name];
+  const entry = (event: any) => cb(event); // unique per subscription
+  subscribers.add(entry);
+  const pending = _unheardTerminalEvents[name].splice(0);
+  if (pending.length > 0) {
+    // Deliver after `subscribe` has returned its unsubscribe function.
+    Promise.resolve().then(() => {
+      for (const event of pending) {
+        if (subscribers.has(entry)) entry(event);
+        else _relayTerminalEvent(name, event);
+      }
+    });
+  }
+  return () => {
+    subscribers.delete(entry);
+  };
+}
+
 export interface ProgressInfo {
+  /** 0–100, or -1 when the server did not send a Content-Length. */
   percent: number;
   bytesDownloaded: number;
+  /** -1 when the server did not send a Content-Length. */
   totalBytes: number;
   speedBps: number;
   etaSeconds: number;
@@ -261,9 +339,24 @@ export interface QueueStatus {
 }
 
 interface QueueItem {
-  options: DownloadOptions;
-  resolve: (result: DownloadResult) => void;
+  options: DownloadOptions & { downloadId: string };
+  resolve: (run: RunningDownload) => void;
   reject: (reason?: any) => void;
+}
+
+/**
+ * `result` is what the native `download()` call resolved with. `settled`
+ * resolves with the final outcome — for a background download that is the
+ * terminal `onDownloadComplete` / `onDownloadError` event (or a JS-side
+ * cancel), which arrives long after `result`.
+ */
+interface RunningDownload {
+  result: DownloadResult;
+  settled: Promise<DownloadResult>;
+}
+
+function _cancelledResult(downloadId: string): DownloadResult {
+  return { success: false, downloadId, error: 'CANCELLED' };
 }
 
 class DownloadQueue {
@@ -286,9 +379,17 @@ class DownloadQueue {
     };
   }
 
-  enqueue(options: DownloadOptions): Promise<DownloadResult> {
-    return new Promise<DownloadResult>((resolve, reject) => {
-      const item: QueueItem = { options, resolve, reject };
+  enqueue(options: DownloadOptions): Promise<RunningDownload> {
+    return new Promise<RunningDownload>((resolve, reject) => {
+      // Assign the id now so a still-queued download can be cancelled by it.
+      const item: QueueItem = {
+        options: {
+          ...options,
+          downloadId: options.downloadId || _generateId(),
+        },
+        resolve,
+        reject,
+      };
       if (options.priority === 'high') {
         this._queue.unshift(item);
       } else {
@@ -298,6 +399,18 @@ class DownloadQueue {
     });
   }
 
+  /** Removes a download that has not started yet. Returns `false` if not queued. */
+  cancel(downloadId: string): boolean {
+    const index = this._queue.findIndex(
+      (item) => item.options.downloadId === downloadId
+    );
+    if (index === -1) return false;
+    const [item] = this._queue.splice(index, 1);
+    const cancelled = _cancelledResult(downloadId);
+    item!.resolve({ result: cancelled, settled: Promise.resolve(cancelled) });
+    return true;
+  }
+
   private _flush(): void {
     while (this._active < this._maxConcurrent && this._queue.length > 0) {
       const item = this._queue.shift()!;
@@ -305,13 +418,18 @@ class DownloadQueue {
       const nativeOptions = { ...item.options };
       delete nativeOptions.queue;
       delete nativeOptions.priority;
-      _executeDownload(nativeOptions)
-        .then((result) => {
-          item.resolve(result);
-        })
-        .catch((err) => {
-          item.reject(err);
-        })
+      // A background download resolves as soon as the OS accepts it, so hold
+      // its slot until it actually finishes — otherwise maxConcurrent is moot.
+      _runDownload(nativeOptions)
+        .then(
+          (run) => {
+            item.resolve(run);
+            return run.settled;
+          },
+          (err) => {
+            item.reject(err);
+          }
+        )
         .finally(() => {
           this._active--;
           this._flush();
@@ -321,6 +439,20 @@ class DownloadQueue {
 }
 
 const _globalQueue = new DownloadQueue();
+
+/**
+ * Accepts `file://` URIs (as returned by pickers, cameras and other libraries)
+ * wherever a filesystem path is expected; native code only understands paths.
+ */
+function _path(p: string): string {
+  if (typeof p !== 'string' || !p.startsWith('file://')) return p;
+  const stripped = p.slice('file://'.length).replace(/^localhost(?=\/)/, '');
+  try {
+    return decodeURIComponent(stripped);
+  } catch {
+    return stripped; // not percent-encoded (e.g. a literal "%" in the name)
+  }
+}
 
 function _generateId(): string {
   // Use crypto.getRandomValues (available on Hermes since RN 0.73) for collision resistance
@@ -356,15 +488,23 @@ export function getQueueStatus(): QueueStatus {
   return _globalQueue.getStatus();
 }
 
-async function _executeDownload(
+/** Settles a running background download from JS (used by `cancelDownload`). */
+const _backgroundWatchers = new Map<string, (r: DownloadResult) => void>();
+
+async function _runDownload(
   options: DownloadOptions
-): Promise<DownloadResult> {
+): Promise<RunningDownload> {
   let progressSubscription: any = null;
   let retrySubscription: any = null;
   let completeSubscription: any = null;
   let errorSubscription: any = null;
   const downloadId = options.downloadId || _generateId();
   const knownDownloadId: string = downloadId;
+  _ownDownloadIds.delete(knownDownloadId); // re-insert as most recent
+  _ownDownloadIds.add(knownDownloadId);
+  if (_ownDownloadIds.size > MAX_OWN_DOWNLOAD_IDS) {
+    _ownDownloadIds.delete(_ownDownloadIds.values().next().value!);
+  }
   let _lastProgressTs: number | null = null;
   let _lastProgressBytes: number = 0;
   let _smoothedSpeedBps: number = 0;
@@ -386,15 +526,18 @@ async function _executeDownload(
             const dtSec = (now - _lastProgressTs) / 1000;
             if (dtSec > 0) {
               const bytesDelta = bytesDownloaded - _lastProgressBytes;
-              if (bytesDelta > 0 && totalBytes > 0) {
+              if (bytesDelta > 0) {
                 const instantSpeed = bytesDelta / dtSec;
                 _smoothedSpeedBps =
                   _smoothedSpeedBps === 0
                     ? instantSpeed
                     : 0.3 * instantSpeed + 0.7 * _smoothedSpeedBps;
                 speedBps = _smoothedSpeedBps;
+                // totalBytes is -1 when the server sent no Content-Length
                 etaSeconds =
-                  speedBps > 0 ? (totalBytes - bytesDownloaded) / speedBps : 0;
+                  speedBps > 0 && totalBytes > 0
+                    ? (totalBytes - bytesDownloaded) / speedBps
+                    : 0;
               }
             }
           }
@@ -436,6 +579,51 @@ async function _executeDownload(
     errorSubscription = null;
   };
 
+  let settle!: (r: DownloadResult) => void;
+  const settled = new Promise<DownloadResult>((resolve) => (settle = resolve));
+  let finished = false;
+  const finish = (r: DownloadResult) => {
+    if (finished) return;
+    finished = true;
+    cleanup();
+    if (_backgroundWatchers.get(knownDownloadId) === finish) {
+      _backgroundWatchers.delete(knownDownloadId);
+    }
+    settle(r);
+  };
+
+  if (options.background) {
+    // Subscribe before starting so a fast terminal event cannot be missed.
+    completeSubscription = getEventEmitter().addListener(
+      'onDownloadComplete',
+      (event: any) => {
+        if (event?.downloadId !== knownDownloadId) return;
+        finish({
+          success: event.success !== false,
+          downloadId: knownDownloadId,
+          filePath: event.filePath,
+          error: event.error,
+        });
+      }
+    );
+    errorSubscription = getEventEmitter().addListener(
+      'onDownloadError',
+      (event: any) => {
+        if (event?.downloadId !== knownDownloadId) return;
+        finish({
+          success: false,
+          downloadId: knownDownloadId,
+          error: event.error || 'UNKNOWN_ERROR',
+        });
+      }
+    );
+    // A second call reusing a running id is rejected by native
+    // (DOWNLOAD_ID_IN_USE); it must not displace the first download's watcher.
+    if (!_backgroundWatchers.has(knownDownloadId)) {
+      _backgroundWatchers.set(knownDownloadId, finish);
+    }
+  }
+
   try {
     // Strip JS-only fields — functions cannot be serialized across the native bridge
     const nativeOpts: any = {
@@ -450,44 +638,44 @@ async function _executeDownload(
     delete nativeOpts.queue;
     delete nativeOpts.priority;
     if (nativeOpts.retry) {
-      // Reconstruct retry without the onRetry callback to prevent function leak
-      nativeOpts.retry = {
-        attempts: nativeOpts.retry.attempts ?? 0,
-        delay: nativeOpts.retry.delay,
-      };
+      // Reconstruct retry without the onRetry callback to prevent function leak.
+      // `delay` is only sent when set: native treats a missing key as the
+      // 1000 ms default, while an explicit 0 means "retry immediately".
+      const { attempts, delay } = nativeOpts.retry;
+      nativeOpts.retry = { attempts: attempts ?? 0 };
+      if (typeof delay === 'number') nativeOpts.retry.delay = delay;
     }
-    const result = await (FileToolkitModule as any).download(nativeOpts);
+    const result: DownloadResult = await (FileToolkitModule as any).download(
+      nativeOpts
+    );
     // A background download resolves as soon as it is handed to the OS, long
     // before any bytes arrive. Tearing the listeners down here would silently
     // swallow every `onProgress` / `onRetry` callback, so keep them alive until
     // the terminal event for this download id arrives.
     const stillRunning =
       !!nativeOpts.background && !!result?.success && !result?.filePath;
-    if (stillRunning && (progressSubscription || retrySubscription)) {
-      const finish = (event: any) => {
-        if (event?.downloadId === knownDownloadId) cleanup();
-      };
-      completeSubscription = getEventEmitter().addListener(
-        'onDownloadComplete',
-        finish
-      );
-      errorSubscription = getEventEmitter().addListener(
-        'onDownloadError',
-        finish
-      );
-    } else {
-      cleanup();
-    }
-    return result as DownloadResult;
+    if (!stillRunning) finish(result);
+    return { result, settled };
   } catch (error: any) {
-    cleanup();
-    return { success: false, error: error?.message || 'UNKNOWN_ERROR' };
+    const failed: DownloadResult = {
+      success: false,
+      downloadId: knownDownloadId,
+      error: error?.message || 'UNKNOWN_ERROR',
+    };
+    finish(failed);
+    return { result: failed, settled };
   }
 }
 
-export function download(options: DownloadOptions): Promise<DownloadResult> {
+function _startDownload(options: DownloadOptions): Promise<RunningDownload> {
   if (options.queue) return _globalQueue.enqueue(options);
-  return _executeDownload(options);
+  return _runDownload(options);
+}
+
+export async function download(
+  options: DownloadOptions
+): Promise<DownloadResult> {
+  return (await _startDownload(options)).result;
 }
 
 export async function upload(options: UploadOptions): Promise<UploadResult> {
@@ -502,6 +690,7 @@ export async function upload(options: UploadOptions): Promise<UploadResult> {
     // Strip onProgress callback — functions cannot be serialized across the native bridge
     const nativeUploadOpts: any = {
       ...options,
+      filePath: _path(options.filePath),
       uploadId,
       fieldName: options.fieldName ?? 'file',
       headers: options.headers ?? {},
@@ -534,8 +723,14 @@ export async function resumeDownload(id: string): Promise<ActionResult> {
 }
 
 export async function cancelDownload(id: string): Promise<ActionResult> {
+  // Still waiting in the JS queue — native has never seen this id.
+  if (_globalQueue.cancel(id)) return { success: true };
   try {
-    return await (FileToolkitModule as any).cancelDownload(id);
+    const res = await (FileToolkitModule as any).cancelDownload(id);
+    // Cancelling a background download emits no terminal event, so release
+    // its listeners (and its queue slot) here.
+    if (res?.success) _backgroundWatchers.get(id)?.(_cancelledResult(id));
+    return res;
   } catch (err: any) {
     return { success: false, error: err.message || 'UNKNOWN_ERROR' };
   }
@@ -551,7 +746,7 @@ export async function getCachedFiles(): Promise<CacheResult> {
 
 export async function deleteFile(path: string): Promise<ActionResult> {
   try {
-    return await (FileToolkitModule as any).deleteFile(path);
+    return await (FileToolkitModule as any).deleteFile(_path(path));
   } catch (err: any) {
     return { success: false, error: err.message || 'UNKNOWN_ERROR' };
   }
@@ -591,13 +786,13 @@ function _ensure(res: any, msg: string) {
 }
 
 export async function exists(path: string): Promise<boolean> {
-  const res = await (FileToolkitModule as any).exists(path);
+  const res = await (FileToolkitModule as any).exists(_path(path));
   _ensure(res, 'EXISTS_ERROR');
   return !!res.exists;
 }
 
 export async function stat(path: string): Promise<FsStat> {
-  const res = await (FileToolkitModule as any).stat(path);
+  const res = await (FileToolkitModule as any).stat(_path(path));
   _ensure(res, 'STAT_ERROR');
   return res.stat;
 }
@@ -606,7 +801,7 @@ export async function readFile(
   path: string,
   enc: FsEncoding = 'utf8'
 ): Promise<string> {
-  const res = await (FileToolkitModule as any).readFile(path, enc);
+  const res = await (FileToolkitModule as any).readFile(_path(path), enc);
   _ensure(res, 'READ_ERROR');
   return res.data ?? '';
 }
@@ -616,27 +811,31 @@ export async function writeFile(
   data: string,
   enc: FsEncoding = 'utf8'
 ): Promise<void> {
-  const res = await (FileToolkitModule as any).writeFile(path, data, enc);
+  const res = await (FileToolkitModule as any).writeFile(
+    _path(path),
+    data,
+    enc
+  );
   _ensure(res, 'WRITE_ERROR');
 }
 
 export async function copyFile(from: string, to: string): Promise<void> {
-  const res = await (FileToolkitModule as any).copyFile(from, to);
+  const res = await (FileToolkitModule as any).copyFile(_path(from), _path(to));
   _ensure(res, 'COPY_ERROR');
 }
 
 export async function moveFile(from: string, to: string): Promise<void> {
-  const res = await (FileToolkitModule as any).moveFile(from, to);
+  const res = await (FileToolkitModule as any).moveFile(_path(from), _path(to));
   _ensure(res, 'MOVE_ERROR');
 }
 
 export async function mkdir(path: string): Promise<void> {
-  const res = await (FileToolkitModule as any).mkdir(path);
+  const res = await (FileToolkitModule as any).mkdir(_path(path));
   _ensure(res, 'MKDIR_ERROR');
 }
 
 export async function ls(path: string): Promise<string[]> {
-  const res = await (FileToolkitModule as any).ls(path);
+  const res = await (FileToolkitModule as any).ls(_path(path));
   _ensure(res, 'LS_ERROR');
   return res.entries || [];
 }
@@ -654,7 +853,11 @@ export async function appendFile(
   data: string,
   enc: FsEncoding = 'utf8'
 ): Promise<void> {
-  const res = await (FileToolkitModule as any).appendFile(path, data, enc);
+  const res = await (FileToolkitModule as any).appendFile(
+    _path(path),
+    data,
+    enc
+  );
   _ensure(res, 'APPEND_ERROR');
 }
 
@@ -663,7 +866,7 @@ export async function hash(
   algorithm: HashAlgorithm = 'md5'
 ): Promise<HashResult> {
   try {
-    return await (FileToolkitModule as any).hash(path, algorithm);
+    return await (FileToolkitModule as any).hash(_path(path), algorithm);
   } catch (err: any) {
     return { success: false, error: err.message || 'HASH_ERROR' };
   }
@@ -694,7 +897,7 @@ export async function saveToMediaStore(
 ): Promise<MediaStoreResult> {
   try {
     return await (FileToolkitModule as any).saveToMediaStore({
-      filePath: opts.filePath,
+      filePath: _path(opts.filePath),
       mediaType: opts.mediaType ?? 'download',
       album: opts.album,
     });
@@ -771,8 +974,11 @@ export const cookies = {
  * File system API — POSIX-style operations.
  *
  * @remarks
- * All `fs.*` methods **throw** on failure (via exceptions), unlike top-level
- * helpers such as `deleteFile()` which return `{ success: false }`.
+ * `fs.exists`, `stat`, `readFile`, `writeFile`, `appendFile`, `copyFile`,
+ * `moveFile`, `deleteFile`, `mkdir` and `ls` **throw** on failure. `fs.df` and
+ * `fs.hash` return `{ success: false, error }` instead. Note that the
+ * top-level `deleteFile()` also returns `{ success: false }` rather than
+ * throwing.
  *
  * To avoid IDE auto-import conflicts with Node's built-in `fs`, consider:
  * ```ts
@@ -788,7 +994,7 @@ export const fs: FsApi = {
   copyFile,
   moveFile,
   deleteFile: async (p) => {
-    const res = await (FileToolkitModule as any).deleteFile(p);
+    const res = await (FileToolkitModule as any).deleteFile(_path(p));
     _ensure(res, 'DEL_ERROR');
   },
   mkdir,
@@ -823,23 +1029,21 @@ export interface DownloadRetryEvent {
   error: string;
 }
 
+/**
+ * Fires when a background download finishes. Results that arrive while nothing
+ * is subscribed (e.g. a download that completed while the app was closed) are
+ * kept — up to 100 — and delivered to the next subscriber.
+ */
 export function onDownloadComplete(
   cb: (event: DownloadCompleteEvent) => void
 ): () => void {
-  const s = getEventEmitter().addListener(
-    'onDownloadComplete',
-    cb as (event: any) => void
-  );
-  return () => s.remove();
+  return _subscribeTerminalEvent('onDownloadComplete', cb);
 }
+/** Fires when a background download fails. Buffered like `onDownloadComplete`. */
 export function onDownloadError(
   cb: (event: DownloadErrorEvent) => void
 ): () => void {
-  const s = getEventEmitter().addListener(
-    'onDownloadError',
-    cb as (event: any) => void
-  );
-  return () => s.remove();
+  return _subscribeTerminalEvent('onDownloadError', cb);
 }
 export function onUploadProgress(
   cb: (event: UploadProgressEvent) => void
@@ -860,17 +1064,32 @@ export function onDownloadRetry(
   return () => s.remove();
 }
 
+/** "image/svg+xml" → "svg", "text/plain" → "txt", "" → "bin". */
+function _extensionForMime(mime: string): string {
+  const subtype = mime.split('/')[1]?.split('+')[0]?.trim().toLowerCase();
+  if (!subtype || subtype === 'octet-stream') return 'bin';
+  return subtype === 'plain' ? 'txt' : subtype;
+}
+
 export async function saveBase64AsFile(
   opts: SaveBase64Options
 ): Promise<SaveBase64Result> {
   try {
     let { base64Data, fileName, destination } = opts;
     if (base64Data.startsWith('data:')) {
-      const m = base64Data.match(/^data:([^;]+(?:;[^;]+)*);base64,(.+)$/s);
-      if (m && m[2]) {
-        base64Data = m[2];
-        if (!fileName && m[1])
-          fileName = `file_${Date.now()}.${m[1].split('/')[1] || 'bin'}`;
+      // data:[<mediatype>][;param=value]*[;base64],<data>  (RFC 2397)
+      const comma = base64Data.indexOf(',');
+      const meta = base64Data.slice(5, comma).split(';');
+      if (comma === -1 || meta[meta.length - 1]!.toLowerCase() !== 'base64') {
+        return {
+          success: false,
+          error:
+            'Invalid data URI: only base64-encoded data URIs are supported',
+        };
+      }
+      base64Data = base64Data.slice(comma + 1);
+      if (!fileName) {
+        fileName = `file_${Date.now()}.${_extensionForMime(meta[0]!)}`;
       }
     }
     return await FileToolkitModule.saveBase64AsFile({
@@ -897,7 +1116,7 @@ export async function shareFile(
   opts: ShareFileOptions
 ): Promise<ShareFileResult> {
   try {
-    return await FileToolkitModule.shareFile(opts.filePath, {
+    return await FileToolkitModule.shareFile(_path(opts.filePath), {
       title: opts.title,
       subject: opts.subject,
     });
@@ -908,7 +1127,10 @@ export async function shareFile(
 
 export async function openFile(opts: OpenFileOptions): Promise<OpenFileResult> {
   try {
-    return await FileToolkitModule.openFile(opts.filePath, opts.mimeType || '');
+    return await FileToolkitModule.openFile(
+      _path(opts.filePath),
+      opts.mimeType || ''
+    );
   } catch (err: any) {
     return { success: false, error: err.message || 'UNKNOWN_ERROR' };
   }
@@ -932,7 +1154,10 @@ export async function unzip(
   destDir: string
 ): Promise<UnzipResult> {
   try {
-    return await (FileToolkitModule as any).unzip(sourcePath, destDir);
+    return await (FileToolkitModule as any).unzip(
+      _path(sourcePath),
+      _path(destDir)
+    );
   } catch (err: any) {
     return { success: false, error: err?.message || 'UNZIP_ERROR' };
   }
@@ -943,7 +1168,10 @@ export async function zip(
   destPath: string
 ): Promise<ZipResult> {
   try {
-    return await (FileToolkitModule as any).zip(sourcePath, destPath);
+    return await (FileToolkitModule as any).zip(
+      _path(sourcePath),
+      _path(destPath)
+    );
   } catch (err: any) {
     return { success: false, error: err?.message || 'ZIP_ERROR' };
   }
@@ -967,6 +1195,11 @@ export interface UseDownloadReturn {
  * The `start` callback is memoised with an empty dependency array but uses a
  * ref internally to always read the **latest** `onProgress` callback you pass,
  * so you do not need to memoise your options object.
+ *
+ * The hook tracks one download at a time: calling `start` while a download is
+ * still running cancels it first. For `background: true` downloads, `status`
+ * stays `'downloading'` until the OS reports the outcome, then `result` holds
+ * the final `filePath` (or `error`).
  */
 export function useDownload(): UseDownloadReturn {
   const [status, setStatus] = useState<any>('idle');
@@ -975,43 +1208,63 @@ export function useDownload(): UseDownloadReturn {
   const [downloadId, setDownloadId] = useState<string | null>(null);
   const downloadIdRef = useRef<string | null>(null);
   const latestOptsRef = useRef<DownloadOptions | null>(null);
+  const mountedRef = useRef(false);
 
   // Cancel any in-flight download when the component unmounts to prevent
   // native event listeners from calling setState on an unmounted component.
   useEffect(() => {
+    mountedRef.current = true;
     return () => {
+      mountedRef.current = false;
       if (downloadIdRef.current) {
         cancelDownload(downloadIdRef.current);
+        downloadIdRef.current = null;
       }
     };
   }, []);
 
   const start = useCallback(async (opts: DownloadOptions) => {
+    const previous = downloadIdRef.current;
+    if (previous) {
+      // Forget it first so its late progress/result cannot overwrite this one.
+      downloadIdRef.current = null;
+      await cancelDownload(previous);
+    }
     latestOptsRef.current = opts;
     const id = opts.downloadId || _generateId();
+    const isCurrent = () => mountedRef.current && downloadIdRef.current === id;
+    downloadIdRef.current = id;
     setStatus('downloading');
     setProgress(null);
     setResult(null);
     setDownloadId(id);
-    downloadIdRef.current = id;
-    const res = await download({
+    const run = await _startDownload({
       ...opts,
       downloadId: id,
       onProgress: (p) => {
+        if (!isCurrent()) return;
         setProgress(p);
         // Always call the latest onProgress — avoids stale-closure issues
         latestOptsRef.current?.onProgress?.(p);
       },
     });
+    const res = run.result;
+    if (!isCurrent()) return res;
     setResult(res);
-    const stillRunning =
-      !!opts.background && !!res.success && !!res.downloadId && !res.filePath;
-    setStatus(stillRunning ? 'downloading' : res.success ? 'done' : 'error');
-    // The download has settled — forget the id so that unmounting the component
-    // does not fire a pointless `cancelDownload` against a finished download.
-    if (!stillRunning && downloadIdRef.current === id) {
+    const stillRunning = !!opts.background && !!res.success && !res.filePath;
+    if (!stillRunning) {
+      setStatus(res.success ? 'done' : 'error');
+      // The download has settled — forget the id so that unmounting the component
+      // does not fire a pointless `cancelDownload` against a finished download.
       downloadIdRef.current = null;
+      return res;
     }
+    run.settled.then((final) => {
+      if (!isCurrent()) return;
+      downloadIdRef.current = null;
+      setResult(final);
+      setStatus(final.success ? 'done' : 'error');
+    });
     return res;
   }, []);
 
@@ -1028,12 +1281,15 @@ export function useDownload(): UseDownloadReturn {
     }
   }, []);
   const cancel = useCallback(async () => {
-    if (downloadIdRef.current) {
-      await cancelDownload(downloadIdRef.current);
+    const id = downloadIdRef.current;
+    if (id) {
+      // Forget the id first so the cancelled download's settling is ignored.
+      downloadIdRef.current = null;
+      await cancelDownload(id);
+      if (!mountedRef.current) return;
       setStatus('idle');
       setProgress(null);
       setResult(null);
-      downloadIdRef.current = null;
       setDownloadId(null);
     }
   }, []);
@@ -1050,9 +1306,12 @@ export function useDownload(): UseDownloadReturn {
  * ```
  *
  * **Error handling patterns:**
- * - Top-level functions (`download`, `upload`, `deleteFile`, etc.) return
- *   `{ success: boolean; error?: string }` and **never throw**.
- * - `fs.*` methods **throw** on failure via exceptions.
+ * - Most functions (`download`, `upload`, `deleteFile`, `unzip`, `df`, `hash`,
+ *   etc.) return `{ success: boolean; error?: string }` and **never throw**.
+ * - The filesystem functions `exists`, `stat`, `readFile`, `writeFile`,
+ *   `appendFile`, `copyFile`, `moveFile`, `mkdir` and `ls` **throw** on
+ *   failure — whether called top-level or via `fs.*` — as does
+ *   `fs.deleteFile`.
  * - `useDownload()` sets `status` to `'error'` on failure.
  */
 export default {

@@ -79,3 +79,6 @@ android/generated
 
 # React Native Nitro Modules
 nitrogen/
+
+# Yarn is the package manager; npm would add a second, drifting lockfile
+package-lock.json

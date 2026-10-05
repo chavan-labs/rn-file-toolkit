@@ -264,7 +264,7 @@ export default function DownloadScreen() {
 For programmatic, queue-aware background downloads outside of React components.
 
 ```typescript
-import { download } from 'rn-file-toolkit';
+import { download, onDownloadComplete } from 'rn-file-toolkit';
 
 const result = await download({
   url: 'https://example.com/file.pdf',
@@ -283,11 +283,18 @@ const result = await download({
     delay: 1000,
     onRetry: (attempt, error) => console.warn(`Retry #${attempt}: ${error}`),
   },
+  // percent and totalBytes are -1 when the server sends no Content-Length
   onProgress: (p) => console.log(`${p.percent.toFixed(1)}% downloaded`),
 });
 
-console.log(result.filePath); // Path to the downloaded file
+// A background download resolves as soon as the OS accepts it, so `result`
+// has no filePath yet. The path arrives with the completion event:
+onDownloadComplete((event) => {
+  if (event.downloadId === 'my-unique-id') console.log(event.filePath);
+});
 ```
+
+Without `background: true`, the promise resolves when the file is on disk and `result.filePath` is set.
 
 ### Download Controls
 
@@ -313,6 +320,8 @@ await pauseDownload('video-1');
 await resumeDownload('video-1');
 await cancelDownload('video-1');
 ```
+
+A paused download keeps its partial file and continues with an HTTP `Range` request on resume (if the server ignores `Range`, it restarts from zero). `cancelDownload()` also removes a download that is still waiting in the queue — pass your own `downloadId` when queueing so you can refer to it.
 
 ### Multipart Uploads
 
@@ -357,9 +366,11 @@ You can also retrieve all downloads currently running in the background (useful 
 ```typescript
 import { getBackgroundDownloads } from 'rn-file-toolkit';
 
-const active = await getBackgroundDownloads();
-console.log(active); // Array of background download descriptors
+const { success, downloads } = await getBackgroundDownloads();
+console.log(downloads); // [{ downloadId, url, status, progress }, …]
 ```
+
+Queued background downloads hold their queue slot until they actually finish, so `maxConcurrent` applies to them too.
 
 ### File System (FS)
 
@@ -489,12 +500,15 @@ import {
   onUploadProgress,
 } from 'rn-file-toolkit';
 
-// Fires when any download finishes successfully
+// Fires when a background download finishes (foreground downloads report
+// through the promise returned by `download()`). Results that arrive while
+// nothing is subscribed — e.g. a download that finished while the app was
+// closed — are kept (up to 100) and delivered to the next subscriber.
 const unsub1 = onDownloadComplete((event) => {
   console.log('Download done:', event);
 });
 
-// Fires when any download fails
+// Fires when a background download fails
 const unsub2 = onDownloadError((event) => {
   console.error('Download failed:', event);
 });
@@ -638,7 +652,10 @@ await saveToMediaStore({
 });
 ```
 
-> **Permissions:** iOS requires `NSPhotoLibraryAddUsageDescription` in your `Info.plist` for image/video saves. Android may require `WRITE_EXTERNAL_STORAGE` on API < 29.
+> **Permissions:**
+>
+> - **iOS:** add `NSPhotoLibraryAddUsageDescription` to `Info.plist` for image/video saves. Saving into an `album` also reads the library, so it additionally needs `NSPhotoLibraryUsageDescription`. A missing key returns `{ success: false, error }` instead of crashing.
+> - **Android 9 and below (API < 29):** writing to shared storage needs `WRITE_EXTERNAL_STORAGE`. The Expo config plugin declares it; in a bare app add `<uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="28" />` and request it at runtime with `PermissionsAndroid` before calling `saveToMediaStore`.
 
 ---
 
@@ -682,7 +699,7 @@ await saveToMediaStore({
 | `cancelDownload`         | `(id: string) => Promise<ActionResult>`                                | Cancel a download by ID.                                                                 |
 | `setQueueOptions`        | `(options: QueueOptions) => void`                                      | Set global queue concurrency.                                                            |
 | `getQueueStatus`         | `() => QueueStatus`                                                    | Get current queue state (active/pending counts).                                         |
-| `getBackgroundDownloads` | `() => Promise<any>`                                                   | Retrieve active background download descriptors.                                         |
+| `getBackgroundDownloads` | `() => Promise<BackgroundDownloadsResult>`                                             | Retrieve active background download descriptors.                                         |
 | `getCachedFiles`         | `() => Promise<CacheResult>`                                           | List all files in the cache directory.                                                   |
 | `clearCache`             | `() => Promise<ActionResult>`                                          | Delete all cached files.                                                                 |
 | `deleteFile`             | `(path: string) => Promise<ActionResult>`                              | Delete a single file by path.                                                            |
@@ -740,11 +757,14 @@ Each item is expanded in the [troubleshooting guide](https://chavan-labs.github.
 | :----------------------------- | :------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | **Cleartext HTTP**             | Android blocks `http://` by default from API 28. Use `https://`, or opt in via `usesCleartextTraffic`.                                                     |
 | **Pause / resume**             | Foreground downloads only. Android's system `DownloadManager` has no pause API, so `pauseDownload()` returns `success: false` for `background: true`.      |
-| **Background completion (iOS)** | Forward `handleEventsForBackgroundURLSession` from your `AppDelegate` so the app is woken when a transfer finishes while suspended.                       |
+| **Background completion (iOS)** | Forward `handleEventsForBackgroundURLSession` from your `AppDelegate` with the snippet in the [troubleshooting guide](https://chavan-labs.github.io/rn-file-toolkit/#/troubleshooting), and subscribe to `onDownloadComplete` early to receive downloads that finished while the app was closed. |
 | **`getBackgroundDownloads()`** | `status` is the raw platform value and differs per platform. Use `progress` and the completion events for portable logic.                                  |
 | **`readFile` / `urlToBase64`** | Capped at 50 MB on both platforms to avoid exhausting memory across the bridge.                                                                            |
 | **`saveToMediaStore`**         | Android writes to the shared MediaStore. iOS saves images/videos to the Photo Library and copies other types into Documents (iOS has no shared media store). |
-| **`fs.*` vs top-level**        | `fs.*` methods **throw** on failure; top-level helpers return `{ success: false, error }` and never throw.                                                  |
+| **Errors: throw vs result**    | `exists`, `stat`, `readFile`, `writeFile`, `appendFile`, `copyFile`, `moveFile`, `mkdir`, `ls` (top-level or via `fs.*`) and `fs.deleteFile` **throw** on failure. Everything else, including `fs.df` and `fs.hash`, returns `{ success: false, error }` and never throws. |
+| **New Architecture**           | Requires React Native 0.76+ with the New Architecture (TurboModules) enabled — the default from 0.76 and the only option from 0.82. On the legacy bridge `isAvailable` is `false` and calls report how to enable it. |
+| **Credentials on redirect**    | `Authorization`, `Cookie` and `Proxy-Authorization` from `headers` are not forwarded once a redirect leaves the original origin (scheme, host or port). iOS `background: true` downloads are the exception: the OS follows their redirects itself. |
+| **`file://` URIs**             | Every path argument also accepts a `file://` URI (as returned by pickers and cameras); it is converted to a plain path.                                    |
 | **Sessions**                   | `session.*` is in-memory only and does not survive an app restart or a hot reload.                                                                          |
 
 ---

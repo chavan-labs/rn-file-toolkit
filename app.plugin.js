@@ -3,7 +3,7 @@ const {
   withAndroidManifest,
   AndroidConfig,
   createRunOncePlugin,
-} = require('@expo/config-plugins');
+} = require('expo/config-plugins');
 
 const pkg = require('./package.json');
 

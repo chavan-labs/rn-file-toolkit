@@ -69,8 +69,8 @@ await download({
   downloadId: 'big-video',
 });
 
-const active = await getBackgroundDownloads();
-console.log(active);
+const { downloads } = await getBackgroundDownloads();
+console.log(downloads);
 ```
 
 ## 4) Upload with metadata fields

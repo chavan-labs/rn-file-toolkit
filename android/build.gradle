@@ -1,11 +1,11 @@
 def FileToolkitConfig = [
-  kotlinVersion: "2.0.21",
+  kotlinVersion: "2.2.0",
   minSdkVersion: 24,
   // Fallbacks only — a React Native app sets these in its root build.gradle and
   // they win via getExtOrDefault. They must not lag behind the compileSdk that
   // react-android itself is built against, or AGP fails the consuming build with
   // "dependency requires a higher compileSdk".
-  compileSdkVersion: 36,
+  compileSdkVersion: 37,
   targetSdkVersion: 36
 ]
 
@@ -20,14 +20,17 @@ buildscript {
   }
 
   dependencies {
-    classpath "com.android.tools.build:gradle:8.7.2"
+    classpath "com.android.tools.build:gradle:9.2.1"
     // noinspection DifferentKotlinGradleVersion
-    classpath "org.jetbrains.kotlin:kotlin-gradle-plugin:2.0.21"
+    classpath "org.jetbrains.kotlin:kotlin-gradle-plugin:2.2.0"
   }
 }
 
 apply plugin: "com.android.library"
-apply plugin: "kotlin-android"
+// AGP 9 ships built-in Kotlin; only apply the plugin when the app opted out of it.
+if (project.extensions.findByName("kotlin") == null) {
+  apply plugin: "kotlin-android"
+}
 apply plugin: "com.facebook.react"
 
 android {
@@ -56,14 +59,11 @@ android {
 
   // React Native 0.81+ compiles against Java 17. Leaving this library on 1.8
   // makes Kotlin and Java disagree on the JVM target and AGP aborts the build
-  // with "Inconsistent JVM-target compatibility detected".
+  // with "Inconsistent JVM-target compatibility detected". Kotlin derives its
+  // jvmTarget from this, so no deprecated kotlinOptions block is needed.
   compileOptions {
     sourceCompatibility JavaVersion.VERSION_17
     targetCompatibility JavaVersion.VERSION_17
-  }
-
-  kotlinOptions {
-    jvmTarget = "17"
   }
 }
 

@@ -4,12 +4,207 @@
 #import <UIKit/UIKit.h>
 #import <Photos/Photos.h>
 #import "FileToolkit.h"
-#include <zlib.h>
+#import "FileToolkitZip.h"
+
+// Posted by the host app from -application:handleEventsForBackgroundURLSession:completionHandler:
+// with userInfo @{@"identifier": NSString, @"completionHandler": block}. A notification
+// (rather than a header) keeps it usable from a Swift AppDelegate with no imports.
+static NSString *const FTKBackgroundEventsNotification = @"RNFileToolkitBackgroundSessionEvents";
+// NSUserDefaults key: downloadId → the options needed to finish a background
+// download after the process was killed and relaunched by the system.
+static NSString *const FTKBackgroundMetaKey = @"RNFileToolkitBackgroundDownloads";
+// Terminal events kept while JS has no listeners (e.g. a relaunch into the background).
+static const NSUInteger kFTKMaxBufferedEvents = 100;
+// Same ceiling as Android's urlToBase64.
+static const long long kFTKBase64MaxBytes = 50LL * 1024 * 1024;
+// Grace period before inherited downloads without a task are declared lost.
+static const int64_t kFTKReconcileDelaySeconds = 10;
+// Minimum spacing of progress events when the server sent no Content-Length.
+static const CFAbsoluteTime kFTKUnknownSizeProgressInterval = 0.25;
+
+// pendingRetries values: a failed download waiting out its backoff.
+typedef NS_ENUM(NSInteger, FTKRetryState) {
+    FTKRetryWaiting = 0, // timer pending; starts when it fires
+    FTKRetryPaused  = 1, // paused before the timer fired
+    FTKRetryHeld    = 2, // timer fired while paused; starts on resumeDownload
+};
+
+static NSString *FTKBackgroundSessionIdentifier(void) {
+    return [NSString stringWithFormat:@"%@.filetoolkit.background", NSBundle.mainBundle.bundleIdentifier];
+}
+
+// Task identifiers are only unique within one session, so qualify them.
+static NSString *FTKTaskKey(NSURLSession *session, NSURLSessionTask *task) {
+    return [NSString stringWithFormat:@"%@:%lu",
+            session.configuration.identifier ? @"bg" : @"fg", (unsigned long)task.taskIdentifier];
+}
+
+/**
+ * Redirect policy for every session whose delegate is asked about redirects:
+ * once the origin (scheme, host, port) differs from the original request,
+ * caller-supplied credentials are not forwarded — this includes an https→http
+ * downgrade. Background sessions follow redirects inside the OS without asking.
+ */
+static NSURLRequest *FTKRedirectRequest(NSURLSessionTask *task, NSURLRequest *request) {
+    NSURL *from = task.originalRequest.URL, *to = request.URL;
+    NSInteger (^port)(NSURL *) = ^NSInteger(NSURL *u) {
+        if (u.port) return u.port.integerValue;
+        return [u.scheme caseInsensitiveCompare:@"https"] == NSOrderedSame ? 443 : 80;
+    };
+    BOOL sameOrigin = [(from.scheme ?: @"") caseInsensitiveCompare:(to.scheme ?: @"")] == NSOrderedSame
+                   && [(from.host ?: @"") caseInsensitiveCompare:(to.host ?: @"")] == NSOrderedSame
+                   && port(from) == port(to);
+    if (sameOrigin) return request;
+    NSMutableURLRequest *stripped = [request mutableCopy];
+    for (NSString *header in @[@"Authorization", @"Cookie", @"Proxy-Authorization"]) {
+        [stripped setValue:nil forHTTPHeaderField:header];
+    }
+    return stripped;
+}
+
+// ─── Buffered events (process-wide) ───────────────────────────────────────────
+
+static NSObject *FTKEventLock(void) {
+    static NSObject *lock;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ lock = [NSObject new]; });
+    return lock;
+}
+
+/** Must be called with FTKEventLock() held. Each element is @[name, body]. */
+static NSMutableArray<NSArray *> *FTKBufferedEvents(void) {
+    static NSMutableArray<NSArray *> *events;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ events = [NSMutableArray new]; });
+    return events;
+}
+
+/** Must be called with FTKEventLock() held. */
+static void FTKBufferEventLocked(NSString *name, NSDictionary *body) {
+    NSMutableArray<NSArray *> *events = FTKBufferedEvents();
+    [events addObject:@[name, body]];
+    if (events.count > kFTKMaxBufferedEvents) [events removeObjectAtIndex:0];
+}
+
+// ─── Persisted background-download metadata ───────────────────────────────────
+
+// Tags metadata with the process that wrote it, so reconciliation only ever
+// judges entries inherited from an earlier launch, never one being created now.
+static NSString *FTKLaunchId(void) {
+    static NSString *launchId;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ launchId = [[NSUUID UUID] UUIDString]; });
+    return launchId;
+}
+
+static NSObject *FTKMetaLock(void) {
+    static NSObject *lock;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ lock = [NSObject new]; });
+    return lock;
+}
+
+/**
+ * Persists what is needed to finish a background download in a later process:
+ * where the file goes and how to verify it. Headers are deliberately left out
+ * (they often carry credentials), so a relaunched process does not retry.
+ */
+static void FTKSaveMeta(NSString *downloadId, NSDictionary *options) {
+    NSMutableDictionary *meta = [NSMutableDictionary new];
+    for (NSString *key in @[@"url", @"destination", @"fileName"]) {
+        id value = options[key];
+        if ([value isKindOfClass:[NSString class]]) meta[key] = value;
+    }
+    NSDictionary *checksum = options[@"checksum"];
+    if ([checksum isKindOfClass:[NSDictionary class]]) {
+        NSMutableDictionary *sum = [NSMutableDictionary new];
+        for (NSString *key in @[@"hash", @"algorithm"]) {
+            id value = checksum[key];
+            if ([value isKindOfClass:[NSString class]]) sum[key] = value;
+        }
+        meta[@"checksum"] = sum;
+    }
+    meta[@"downloadId"] = downloadId;
+    meta[@"background"] = @YES;
+    meta[@"launch"] = FTKLaunchId();
+
+    @synchronized (FTKMetaLock()) {
+        NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+        NSMutableDictionary *all = [[defaults dictionaryForKey:FTKBackgroundMetaKey] mutableCopy] ?: [NSMutableDictionary new];
+        all[downloadId] = meta;
+        [defaults setObject:all forKey:FTKBackgroundMetaKey];
+    }
+}
+
+static NSDictionary *FTKLoadMeta(NSString *downloadId) {
+    @synchronized (FTKMetaLock()) {
+        NSDictionary *meta = [[NSUserDefaults standardUserDefaults] dictionaryForKey:FTKBackgroundMetaKey][downloadId];
+        return [meta isKindOfClass:[NSDictionary class]] ? meta : nil;
+    }
+}
+
+static void FTKRemoveMeta(NSString *downloadId) {
+    @synchronized (FTKMetaLock()) {
+        NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+        NSDictionary *all = [defaults dictionaryForKey:FTKBackgroundMetaKey];
+        if (!all[downloadId]) return;
+        NSMutableDictionary *updated = [all mutableCopy];
+        [updated removeObjectForKey:downloadId];
+        [defaults setObject:updated forKey:FTKBackgroundMetaKey];
+    }
+}
+
+/**
+ * downloadIds cancelled in this process. A finish callback already in flight
+ * when cancelDownload ran finds neither options nor metadata — exactly like a
+ * download inherited from an earlier launch whose metadata predates this
+ * version — so this is what tells "cancelled, discard" apart from "recover".
+ */
+// ponytail: never pruned (a few bytes per cancel, reset per process).
+static NSMutableSet<NSString *> *FTKCancelledIds(void) {
+    static NSMutableSet<NSString *> *ids;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ ids = [NSMutableSet new]; });
+    return ids;
+}
+
+static void FTKSetCancelled(NSString *downloadId, BOOL cancelled) {
+    @synchronized (FTKMetaLock()) {
+        if (cancelled) [FTKCancelledIds() addObject:downloadId];
+        else [FTKCancelledIds() removeObject:downloadId];
+    }
+}
+
+static BOOL FTKWasCancelled(NSString *downloadId) {
+    @synchronized (FTKMetaLock()) {
+        return [FTKCancelledIds() containsObject:downloadId];
+    }
+}
+
+// ─── Background session proxy ─────────────────────────────────────────────────
+
+/**
+ * Owns the one process-wide background NSURLSession.
+ *
+ * A background session must exist exactly once per identifier for the life of
+ * the process: re-creating it per module instance (every reload) is undefined
+ * behaviour and routed completions to dead modules. The session's delegate is
+ * this proxy, which forwards to whichever FileToolkit instance is live and,
+ * when none is, still moves finished files into place using persisted metadata.
+ */
+@interface FTKBackgroundSessionProxy : NSObject <NSURLSessionDownloadDelegate>
+@property (atomic, weak) FileToolkit *module;
+@property (nonatomic, strong, readonly) NSURLSession *session;
++ (instancetype)shared;
+- (void)attachModule:(FileToolkit *)module;
+- (void)detachModule:(FileToolkit *)module;
+@end
 
 // ─── Foreground session delegate ──────────────────────────────────────────────
 @interface FileToolkit () <NSURLSessionDownloadDelegate, NSURLSessionDataDelegate, UIDocumentInteractionControllerDelegate>
-@property (nonatomic, strong) NSURLSession *fgSession;       // foreground
-@property (nonatomic, strong) NSURLSession *bgSession;       // background
+// Atomic: read from global/delegate queues while -invalidate clears them.
+@property (atomic, strong) NSURLSession *fgSession;          // foreground
+@property (atomic, strong) NSURLSession *bgSession;          // shared background session; nil once invalidated
 // downloadId → resolve/reject blocks
 @property (nonatomic, strong) NSMutableDictionary *activePromises;
 // downloadId → original options dict
@@ -18,20 +213,35 @@
 @property (nonatomic, strong) NSMutableDictionary *activeTasks;
 // downloadId → NSData (resume data for paused tasks)
 @property (nonatomic, strong) NSMutableDictionary *resumeDataStore;
-// NSURLSessionTask identifier (int) → downloadId (string)
+// FTKTaskKey(session, task) → downloadId (string)
 @property (nonatomic, strong) NSMutableDictionary *taskIdMap;
 // downloadId → current retry attempt count (NSNumber)
 @property (nonatomic, strong) NSMutableDictionary *retryAttempts;
+// downloadId → FTKRetryState for downloads waiting out a retry backoff (no task exists)
+@property (nonatomic, strong) NSMutableDictionary *pendingRetries;
+// downloadId → CFAbsoluteTime of the last unknown-size progress event
+@property (nonatomic, strong) NSMutableDictionary *lastProgressAt;
 // Upload tracking
 @property (nonatomic, strong) NSMutableDictionary *uploadPromises;     // uploadId → {resolve, reject}
 @property (nonatomic, strong) NSMutableDictionary *uploadUrls;         // uploadId → URL string
 @property (nonatomic, strong) NSMutableDictionary *uploadResponseData; // uploadId → NSMutableData
-@property (nonatomic, strong) NSMutableDictionary *uploadTaskIdMap;    // taskIdentifier → uploadId
+@property (nonatomic, strong) NSMutableDictionary *uploadTaskIdMap;    // FTKTaskKey → uploadId
 // Strong ref to prevent ARC deallocation during preview
 @property (nonatomic, strong) UIDocumentInteractionController *documentController;
 // Serial queue for thread-safe dictionary access
 @property (nonatomic, strong) dispatch_queue_t syncQueue;
+// Set (on syncQueue) at the start of -invalidate; no retry task is created after it.
+@property (nonatomic, assign) BOOL invalidated;
+// Guarded by FTKEventLock() so buffering and flushing cannot interleave.
 @property (nonatomic, assign) BOOL hasListeners;
+// Event names JS has subscribed to since listeners were last all removed. Guarded by FTKEventLock().
+@property (nonatomic, strong) NSMutableSet<NSString *> *heardEvents;
+- (void)emitEvent:(NSString *)name body:(NSDictionary *)body bufferIfUnheard:(BOOL)buffer;
+@end
+
+/** Fetches a URL into memory for urlToBase64, enforcing kFTKBase64MaxBytes while receiving. */
+@interface FTKBase64Fetch : NSObject <NSURLSessionDataDelegate>
+- (instancetype)initWithResolve:(RCTPromiseResolveBlock)resolve;
 @end
 
 @implementation FileToolkit
@@ -49,6 +259,9 @@ RCT_EXPORT_MODULE(FileToolkit)
         self.resumeDataStore = [NSMutableDictionary new];
         self.taskIdMap       = [NSMutableDictionary new];
         self.retryAttempts   = [NSMutableDictionary new];
+        self.pendingRetries  = [NSMutableDictionary new];
+        self.lastProgressAt  = [NSMutableDictionary new];
+        self.heardEvents     = [NSMutableSet new];
         self.uploadPromises  = [NSMutableDictionary new];
         self.uploadUrls      = [NSMutableDictionary new];
         self.uploadResponseData = [NSMutableDictionary new];
@@ -58,13 +271,10 @@ RCT_EXPORT_MODULE(FileToolkit)
         NSURLSessionConfiguration *fgConfig = [NSURLSessionConfiguration defaultSessionConfiguration];
         self.fgSession = [NSURLSession sessionWithConfiguration:fgConfig delegate:self delegateQueue:nil];
 
-        // Background session (survives app suspension)
-        NSString *bgId = [NSString stringWithFormat:@"%@.filetoolkit.background", NSBundle.mainBundle.bundleIdentifier];
-        NSURLSessionConfiguration *bgConfig =
-            [NSURLSessionConfiguration backgroundSessionConfigurationWithIdentifier:bgId];
-        bgConfig.discretionary = NO;
-        bgConfig.sessionSendsLaunchEvents = YES;
-        self.bgSession = [NSURLSession sessionWithConfiguration:bgConfig delegate:self delegateQueue:nil];
+        // Background session (survives app suspension) — shared across module instances
+        FTKBackgroundSessionProxy *proxy = [FTKBackgroundSessionProxy shared];
+        self.bgSession = proxy.session;
+        [proxy attachModule:self];
     }
     return self;
 }
@@ -72,18 +282,40 @@ RCT_EXPORT_MODULE(FileToolkit)
 /**
  * Torn down when the React instance goes away (dev reload, bridge restart).
  *
- * Both sessions retain this object as their delegate, so without an explicit
- * invalidation the old module lives forever and keeps pushing events at a dead
- * bridge. Re-creating a background session with an identifier that is still in
- * use also throws, which turned every Fast Refresh into a crash.
+ * The foreground session retains this object as its delegate, so without an
+ * explicit invalidation the old module lives forever and keeps pushing events
+ * at a dead bridge. The background session is process-wide and is deliberately
+ * left running: its proxy simply stops forwarding to this instance.
  */
 - (void)invalidate {
+    // Retry timers hold this instance weakly and die with it, so a background
+    // download waiting out a backoff would never finish. Tell the next JS
+    // context through the process-wide buffer instead of leaving it hanging.
+    __block NSArray<NSString *> *lostIds = nil;
+    dispatch_sync(self.syncQueue, ^{
+        self.invalidated = YES; // see -startRetryForDownload:
+        NSMutableArray<NSString *> *ids = [NSMutableArray new];
+        for (NSString *downloadId in self.pendingRetries) {
+            if ([self.downloadOptions[downloadId][@"background"] boolValue]) {
+                [ids addObject:downloadId];
+                // Belt and braces: anything for this id that still surfaces is discarded.
+                FTKSetCancelled(downloadId, YES);
+            }
+        }
+        [self.pendingRetries removeAllObjects]; // pending timers now bail
+        lostIds = ids;
+    });
+    for (NSString *downloadId in lostIds) {
+        FTKRemoveMeta(downloadId);
+        @synchronized (FTKEventLock()) {
+            FTKBufferEventLocked(@"onDownloadError", @{@"success": @NO, @"downloadId": downloadId, @"error": @"DOWNLOAD_LOST"});
+        }
+    }
+
     [self.fgSession invalidateAndCancel];
-    // Background transfers are meant to survive; let them finish and just drop
-    // this delegate so the identifier is released for the next instance.
-    [self.bgSession finishTasksAndInvalidate];
     self.fgSession = nil;
     self.bgSession = nil;
+    [[FTKBackgroundSessionProxy shared] detachModule:self];
     [super invalidate];
 }
 
@@ -92,11 +324,66 @@ RCT_EXPORT_MODULE(FileToolkit)
 }
 
 - (void)startObserving {
-    self.hasListeners = YES;
+    @synchronized (FTKEventLock()) {
+        self.hasListeners = YES;
+    }
 }
 
 - (void)stopObserving {
-    self.hasListeners = NO;
+    @synchronized (FTKEventLock()) {
+        self.hasListeners = NO;
+        [self.heardEvents removeAllObjects]; // no listener of any name is left
+    }
+}
+
+/**
+ * Tracks which event names JS subscribes to and delivers the terminal events
+ * buffered for that name while it had no listener (or no module existed, e.g.
+ * a download that finished while the app was not running). JS registers the
+ * listener in the same tick as this call, so it receives the flush.
+ *
+ * removeListeners: only reports a count, so a name stays "heard" until every
+ * listener is gone (stopObserving); a terminal event for a name that was heard
+ * and then dropped while others remain is sent rather than buffered.
+ */
+- (void)addListener:(NSString *)eventName {
+    [super addListener:eventName];
+    @synchronized (FTKEventLock()) {
+        if (!self.hasListeners) return;
+        [self.heardEvents addObject:eventName];
+        NSMutableArray<NSArray *> *events = FTKBufferedEvents();
+        NSMutableArray<NSArray *> *remaining = [NSMutableArray new];
+        for (NSArray *event in events) {
+            if ([event[0] isEqualToString:eventName]) {
+                [self sendEventWithName:event[0] body:event[1]];
+            } else {
+                [remaining addObject:event];
+            }
+        }
+        [events setArray:remaining];
+    }
+}
+
+/** Sends an event if JS is listening; otherwise drops it. */
+- (void)emitEvent:(NSString *)name body:(NSDictionary *)body {
+    [self emitEvent:name body:body bufferIfUnheard:NO];
+}
+
+/**
+ * With `buffer`, an event whose name has no JS listener yet is kept and
+ * delivered by -addListener: — used for background-download results, whose
+ * only channel is the event (foreground results already went to the promise).
+ * Keyed per name: after a relaunch JS may subscribe to progress long before
+ * completion, and a completion sent then would be dropped by JS.
+ */
+- (void)emitEvent:(NSString *)name body:(NSDictionary *)body bufferIfUnheard:(BOOL)buffer {
+    @synchronized (FTKEventLock()) {
+        if (buffer && !(self.hasListeners && [self.heardEvents containsObject:name])) {
+            FTKBufferEventLocked(name, body);
+        } else if (self.hasListeners) {
+            [self sendEventWithName:name body:body];
+        }
+    }
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -111,7 +398,7 @@ RCT_EXPORT_MODULE(FileToolkit)
  * File names can come from a server (URL path, redirect target) or from caller
  * input, so `../` sequences must never be able to escape the destination.
  */
-- (NSString *)sanitizeFileName:(NSString *)name {
+static NSString *FTKSanitizeFileName(NSString *name) {
     NSString *base = [name lastPathComponent];
     base = [base stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
     base = [base stringByReplacingOccurrencesOfString:@"/" withString:@"_"];
@@ -133,7 +420,7 @@ RCT_EXPORT_MODULE(FileToolkit)
  * fail at the final move with "No such file or directory", so the directory is
  * always materialised here.
  */
-- (NSURL *)directoryForDestination:(NSString *)destType {
+static NSURL *FTKDirectoryForDestination(NSString *destType) {
     NSFileManager *fm = [NSFileManager defaultManager];
     NSURL *dirURL = nil;
 
@@ -157,9 +444,9 @@ RCT_EXPORT_MODULE(FileToolkit)
     return dirURL;
 }
 
-- (NSURL *)destURLForFileName:(NSString *)fileName destination:(NSString *)destType {
-    NSURL *dirURL = [self directoryForDestination:destType];
-    return [dirURL URLByAppendingPathComponent:[self sanitizeFileName:fileName]];
+static NSURL *FTKDestURL(NSString *fileName, NSString *destType) {
+    NSURL *dirURL = FTKDirectoryForDestination(destType);
+    return [dirURL URLByAppendingPathComponent:FTKSanitizeFileName(fileName)];
 }
 
 // MD5 and SHA-1 are deliberately offered: they are still what most download
@@ -167,7 +454,7 @@ RCT_EXPORT_MODULE(FileToolkit)
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
 
-- (NSString *)calculateChecksumForPath:(NSString *)path algorithm:(NSString *)algo {
+static NSString *FTKChecksum(NSString *path, NSString *algo) {
     NSInputStream *inputStream = [NSInputStream inputStreamWithFileAtPath:path];
     if (!inputStream) return nil;
     [inputStream open];
@@ -222,9 +509,9 @@ RCT_EXPORT_MODULE(FileToolkit)
 
 #pragma clang diagnostic pop
 
-- (NSString *)fileNameFromOptions:(NSDictionary *)options task:(NSURLSessionDownloadTask *)task {
+static NSString *FTKFileNameFromOptions(NSDictionary *options, NSURLSessionDownloadTask *task) {
     NSString *name = options[@"fileName"];
-    if (!name || [name isEqualToString:@""]) {
+    if (![name isKindOfClass:[NSString class]] || [name isEqualToString:@""]) {
         // Prefer the *final* URL so that a redirect to the real asset still yields
         // a sensible name rather than the name of the redirecting endpoint.
         name = task.response.URL.lastPathComponent ?: task.originalRequest.URL.lastPathComponent;
@@ -232,20 +519,86 @@ RCT_EXPORT_MODULE(FileToolkit)
     if (!name || [name isEqualToString:@""]) {
         name = @"downloaded_file";
     }
-    return [self sanitizeFileName:name];
+    return FTKSanitizeFileName(name);
+}
+
+/**
+ * Moves a finished download into place and verifies its checksum, returning the
+ * result payload. Must run synchronously inside didFinishDownloadingToURL: —
+ * the system deletes `location` as soon as that call returns. Needs no module
+ * instance, so the background proxy can finish downloads with no live bridge.
+ */
+static NSDictionary *FTKFinalizeDownload(NSURLSessionDownloadTask *downloadTask, NSURL *location,
+                                         NSString *downloadId, NSDictionary *options, BOOL *isError) {
+    // NSURLSessionDownloadTask reports 4xx/5xx as a *successful* download whose body
+    // is the error page. Without this check `download()` resolves with success:YES
+    // and an HTML error document saved under the expected file name.
+    NSHTTPURLResponse *httpResponse = [downloadTask.response isKindOfClass:[NSHTTPURLResponse class]]
+        ? (NSHTTPURLResponse *)downloadTask.response : nil;
+    if (httpResponse && (httpResponse.statusCode < 200 || httpResponse.statusCode >= 300)) {
+        [[NSFileManager defaultManager] removeItemAtURL:location error:nil];
+        *isError = YES;
+        return @{
+            @"success": @NO,
+            @"downloadId": downloadId,
+            @"error": [NSString stringWithFormat:@"SERVER_ERROR: %ld", (long)httpResponse.statusCode]
+        };
+    }
+
+    NSString *fileName = FTKFileNameFromOptions(options, downloadTask);
+    NSString *destType = [options[@"destination"] isKindOfClass:[NSString class]] ? options[@"destination"] : @"downloads";
+    NSURL *destURL = FTKDestURL(fileName, destType);
+
+    NSError *error = nil;
+    [[NSFileManager defaultManager] removeItemAtURL:destURL error:nil];
+    if (![[NSFileManager defaultManager] moveItemAtURL:location toURL:destURL error:&error]) {
+        *isError = YES;
+        return @{@"success": @NO, @"downloadId": downloadId, @"error": error.localizedDescription ?: @"Failed to move downloaded file"};
+    }
+
+    // Checksum verification
+    NSDictionary *checksum = options[@"checksum"];
+    if ([checksum isKindOfClass:[NSDictionary class]]) {
+        NSString *expectedHash = checksum[@"hash"];
+        NSString *algo = checksum[@"algorithm"] ?: @"MD5";
+        NSString *actualHash = FTKChecksum(destURL.path, algo.uppercaseString);
+        if (![actualHash.lowercaseString isEqualToString:expectedHash.lowercaseString]) {
+            [[NSFileManager defaultManager] removeItemAtURL:destURL error:nil];
+            *isError = YES;
+            return @{
+                @"success": @NO,
+                @"downloadId": downloadId,
+                @"error": [NSString stringWithFormat:@"CHECKSUM_MISMATCH: expected %@, got %@", expectedHash, actualHash]
+            };
+        }
+    }
+    *isError = NO;
+    return @{@"success": @YES, @"downloadId": downloadId, @"filePath": destURL.path};
+}
+
+- (void)URLSession:(NSURLSession *)session
+                          task:(NSURLSessionTask *)task
+    willPerformHTTPRedirection:(NSHTTPURLResponse *)response
+                    newRequest:(NSURLRequest *)request
+             completionHandler:(void (^)(NSURLRequest *))completionHandler {
+    completionHandler(FTKRedirectRequest(task, request));
 }
 
 // ─── download ─────────────────────────────────────────────────────────────────
 
 - (void)download:(NSDictionary *)options resolve:(RCTPromiseResolveBlock)resolve reject:(RCTPromiseRejectBlock)reject {
     NSString *urlString = options[@"url"];
-    if (!urlString) {
+    if (![urlString isKindOfClass:[NSString class]]) {
         resolve(@{@"success": @NO, @"error": @"URL is missing"});
         return;
     }
 
     BOOL isBackground = [options[@"background"] boolValue];
-    NSString *downloadId = options[@"downloadId"] ?: [self generateDownloadId];
+    // Used as a dictionary/NSUserDefaults key, so it must be a non-empty string.
+    NSString *downloadId = options[@"downloadId"];
+    if (![downloadId isKindOfClass:[NSString class]] || downloadId.length == 0) {
+        downloadId = [self generateDownloadId];
+    }
     NSURL *url = [NSURL URLWithString:urlString];
     if (!url) {
         resolve(@{@"success": @NO, @"error": @"Invalid URL"});
@@ -255,7 +608,7 @@ RCT_EXPORT_MODULE(FileToolkit)
     
     // Add custom headers
     NSDictionary *headers = options[@"headers"];
-    if (headers) {
+    if ([headers isKindOfClass:[NSDictionary class]]) {
         for (NSString *key in headers) {
             [request setValue:headers[key] forHTTPHeaderField:key];
         }
@@ -266,23 +619,40 @@ RCT_EXPORT_MODULE(FileToolkit)
         resolve(@{@"success": @NO, @"error": @"Module was invalidated"});
         return;
     }
+
+    // A downloadId is a handle for pause/resume/cancel and events, so it must be
+    // unique among running downloads (matches Android). Spec methods run on this
+    // module's serial method queue, so no other download: call can interleave.
+    __block BOOL idInUse = NO;
+    dispatch_sync(self.syncQueue, ^{
+        idInUse = self.activeTasks[downloadId] != nil
+               || self.pendingRetries[downloadId] != nil
+               || self.resumeDataStore[downloadId] != nil;
+    });
+    if (idInUse) {
+        resolve(@{@"success": @NO, @"downloadId": downloadId, @"error": @"DOWNLOAD_ID_IN_USE"});
+        return;
+    }
+
     NSURLSessionDownloadTask *task = [session downloadTaskWithRequest:request];
-    NSString *taskKey = [NSString stringWithFormat:@"%lu", (unsigned long)task.taskIdentifier];
+    NSString *taskKey = FTKTaskKey(session, task);
+    task.taskDescription = downloadId;
 
     dispatch_sync(self.syncQueue, ^{
+        FTKSetCancelled(downloadId, NO); // the id may be reused after a cancel
         self.taskIdMap[taskKey]       = downloadId;
         self.activeTasks[downloadId]  = task;
         self.downloadOptions[downloadId] = options;
+        if (!isBackground) {
+            self.activePromises[downloadId] = @{@"resolve": resolve, @"reject": reject};
+        }
     });
-    task.taskDescription = downloadId;
 
     if (isBackground) {
+        // Written before the task starts: the process may be gone by the time it ends.
+        FTKSaveMeta(downloadId, options);
         // Resolve immediately with the downloadId — result comes via event
         resolve(@{@"success": @YES, @"downloadId": downloadId});
-    } else {
-        dispatch_sync(self.syncQueue, ^{
-            self.activePromises[downloadId] = @{@"resolve": resolve, @"reject": reject};
-        });
     }
 
     [task resume];
@@ -292,31 +662,67 @@ RCT_EXPORT_MODULE(FileToolkit)
 
 - (void)pauseDownload:(NSString *)downloadId resolve:(RCTPromiseResolveBlock)resolve reject:(RCTPromiseRejectBlock)reject {
     __block NSURLSessionDownloadTask *task = nil;
+    __block BOOL retryHeld = NO;
     dispatch_sync(self.syncQueue, ^{
         task = self.activeTasks[downloadId];
+        NSNumber *retryState = self.pendingRetries[downloadId];
+        if (!task && retryState) {
+            // Waiting out a retry backoff: there is no task to pause, so keep the
+            // retry from starting until resumeDownload is called.
+            if (retryState.integerValue == FTKRetryWaiting) {
+                self.pendingRetries[downloadId] = @(FTKRetryPaused);
+            }
+            retryHeld = YES;
+        }
     });
+    if (retryHeld) {
+        resolve(@{@"success": @YES});
+        return;
+    }
     if (!task) {
         resolve(@{@"success": @NO, @"error": @"Download not found"});
         return;
     }
 
     [task cancelByProducingResumeData:^(NSData *resumeData) {
-        __block RCTPromiseResolveBlock originalResolve = nil;
+        __block BOOL stillActive = NO;
+        __block BOOL wasBackground = NO;
+        __block NSDictionary *failedFuncs = nil;
         dispatch_sync(self.syncQueue, ^{
-            if (resumeData) {
+            // Settled meanwhile (cancelled, or completed and claimed by
+            // -finishDownload:): storing resume data would let a resume revive it.
+            stillActive = self.downloadOptions[downloadId] != nil;
+            wasBackground = [self.downloadOptions[downloadId][@"background"] boolValue];
+            if (stillActive && resumeData) {
                 self.resumeDataStore[downloadId] = resumeData;
-            } else {
-                NSDictionary *funcs = self.activePromises[downloadId];
-                if (funcs) {
-                    originalResolve = funcs[@"resolve"];
-                }
-                [self.activePromises removeObjectForKey:downloadId];
-                [self.downloadOptions removeObjectForKey:downloadId];
+            } else if (stillActive) {
+                // The task is gone and cannot be resumed. Take the download and
+                // mark it in this one step, so a completion racing in can no
+                // longer claim it (and discards its file) — one result only.
+                failedFuncs = [self takeDownloadLocked:downloadId];
+                FTKSetCancelled(downloadId, YES);
             }
-            [self.activeTasks removeObjectForKey:downloadId];
+            // Only forget the task we paused; a racing retry may have replaced it.
+            if (self.activeTasks[downloadId] == task) {
+                [self.activeTasks removeObjectForKey:downloadId];
+            }
         });
-        if (originalResolve) {
-            originalResolve(@{@"success": @NO, @"error": @"Download could not be paused and was cancelled"});
+        if (!stillActive) {
+            // Cancelled, or finished, while pausing: already settled elsewhere.
+            resolve(@{@"success": @NO, @"error": @"Download is no longer active"});
+            return;
+        }
+        if (!resumeData) {
+            // Settle like any other failure. For a background download the event
+            // is the only channel JS has, so it must not be skipped.
+            NSString *message = wasBackground
+                ? @"PAUSE_FAILED_NO_RESUME_DATA"
+                : @"Download could not be paused and was cancelled";
+            [self settleDownload:downloadId
+                           funcs:failedFuncs
+                          result:@{@"success": @NO, @"downloadId": downloadId, @"error": message}
+                         isError:YES
+                    isBackground:wasBackground];
         }
         resolve(@{@"success": resumeData ? @YES : @NO});
     }];
@@ -327,10 +733,32 @@ RCT_EXPORT_MODULE(FileToolkit)
 - (void)resumeDownload:(NSString *)downloadId resolve:(RCTPromiseResolveBlock)resolve reject:(RCTPromiseRejectBlock)reject {
     __block NSData *resumeData = nil;
     __block NSDictionary *options = nil;
+    __block BOOL retryPending = NO;
+    __block BOOL startRetryNow = NO;
     dispatch_sync(self.syncQueue, ^{
-        resumeData = self.resumeDataStore[downloadId];
         options = self.downloadOptions[downloadId];
+        NSNumber *retryState = self.pendingRetries[downloadId];
+        if (retryState) {
+            retryPending = YES;
+            if (retryState.integerValue == FTKRetryHeld) {
+                // Timer already fired while paused: start it now.
+                self.pendingRetries[downloadId] = @(FTKRetryWaiting);
+                startRetryNow = YES;
+            } else if (retryState.integerValue == FTKRetryPaused) {
+                // Backoff still running: the timer will start it.
+                self.pendingRetries[downloadId] = @(FTKRetryWaiting);
+            }
+            return;
+        }
+        resumeData = self.resumeDataStore[downloadId];
     });
+    if (retryPending) {
+        if (startRetryNow) {
+            [self startRetryForDownload:downloadId isBackground:[options[@"background"] boolValue]];
+        }
+        resolve(@{@"success": @YES});
+        return;
+    }
     if (!resumeData) {
         resolve(@{@"success": @NO, @"error": @"No resume data — download was not paused or was cancelled"});
         return;
@@ -338,15 +766,36 @@ RCT_EXPORT_MODULE(FileToolkit)
 
     BOOL isBackground = [options[@"background"] boolValue];
     NSURLSession *session = isBackground ? self.bgSession : self.fgSession;
+    if (!session) {
+        resolve(@{@"success": @NO, @"error": @"Module was invalidated"});
+        return;
+    }
 
     NSURLSessionDownloadTask *task = [session downloadTaskWithResumeData:resumeData];
-    NSString *taskKey = [NSString stringWithFormat:@"%lu", (unsigned long)task.taskIdentifier];
+    if (!task) {
+        resolve(@{@"success": @NO, @"error": @"Could not resume download"});
+        return;
+    }
+    // Tasks created from resume data do not inherit the description, and it is
+    // how a relaunched process recovers the downloadId.
+    task.taskDescription = downloadId;
+    NSString *taskKey = FTKTaskKey(session, task);
 
+    __block BOOL cancelled = NO;
     dispatch_sync(self.syncQueue, ^{
+        if (!self.resumeDataStore[downloadId]) {
+            cancelled = YES; // cancelDownload ran in between
+            return;
+        }
         self.taskIdMap[taskKey]      = downloadId;
         self.activeTasks[downloadId] = task;
         [self.resumeDataStore removeObjectForKey:downloadId];
     });
+    if (cancelled) {
+        [task cancel];
+        resolve(@{@"success": @NO, @"error": @"No resume data — download was not paused or was cancelled"});
+        return;
+    }
 
     [task resume];
     resolve(@{@"success": @YES});
@@ -367,13 +816,27 @@ RCT_EXPORT_MODULE(FileToolkit)
         [self.activePromises  removeObjectForKey:downloadId];
         [self.downloadOptions removeObjectForKey:downloadId];
         [self.retryAttempts   removeObjectForKey:downloadId];
+        // A download waiting out a retry backoff has no task; dropping this makes
+        // the pending dispatch_after bail instead of starting a new attempt.
+        [self.pendingRetries  removeObjectForKey:downloadId];
+        [self.lastProgressAt  removeObjectForKey:downloadId];
+        FTKSetCancelled(downloadId, YES); // same step as the take, see -finishDownload:
     });
+    FTKRemoveMeta(downloadId);
     if (funcs) {
         RCTPromiseResolveBlock dlResolve = funcs[@"resolve"];
         if (dlResolve) dlResolve(@{@"success": @NO, @"error": @"Cancelled"});
     }
     if (task) {
         [task cancel];
+    } else {
+        // A background download started by an earlier process (or module
+        // instance) has no entry in activeTasks; find it by its description.
+        [self.bgSession getTasksWithCompletionHandler:^(NSArray *dataTasks, NSArray *uploadTasks, NSArray *downloadTasks) {
+            for (NSURLSessionTask *bgTask in downloadTasks) {
+                if ([bgTask.taskDescription isEqualToString:downloadId]) [bgTask cancel];
+            }
+        }];
     }
     resolve(@{@"success": @YES});
 }
@@ -596,6 +1059,49 @@ RCT_EXPORT_MODULE(FileToolkit)
 
 // ─── copyFile ────────────────────────────────────────────────────────────────
 
+/**
+ * Copies or moves `fromPath` to `toPath`, returning nil on success or an error
+ * message. The item is staged next to the destination and rename(2)'d over it,
+ * so an existing destination survives any failure. Copying a file onto itself
+ * is a no-op rather than deleting it, and an existing directory is never
+ * replaced (that used to wipe it recursively).
+ */
+static NSString *FTKTransferItem(NSString *fromPath, NSString *toPath, BOOL move) {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    BOOL destIsDir = NO;
+    if ([fm fileExistsAtPath:toPath isDirectory:&destIsDir]) {
+        // Compare inodes, not strings: /private/var vs /var, symlinks, hard links.
+        NSDictionary *src = [fm attributesOfItemAtPath:fromPath error:nil];
+        NSDictionary *dst = [fm attributesOfItemAtPath:toPath error:nil];
+        if (src && dst && [src[NSFileSystemNumber] isEqual:dst[NSFileSystemNumber]]
+                       && [src[NSFileSystemFileNumber] isEqual:dst[NSFileSystemFileNumber]]) {
+            return nil;
+        }
+        if (destIsDir) return [NSString stringWithFormat:@"Destination is a directory: %@", toPath];
+    }
+
+    NSString *parent = [toPath stringByDeletingLastPathComponent];
+    if (parent.length > 0) {
+        [fm createDirectoryAtPath:parent withIntermediateDirectories:YES attributes:nil error:nil];
+    }
+    NSString *tmp = [parent stringByAppendingPathComponent:
+                     [NSString stringWithFormat:@".%@.ftk-tmp", [NSUUID UUID].UUIDString]];
+    NSError *error = nil;
+    BOOL staged = move ? [fm moveItemAtPath:fromPath toPath:tmp error:&error]
+                       : [fm copyItemAtPath:fromPath toPath:tmp error:&error];
+    if (!staged) {
+        [fm removeItemAtPath:tmp error:nil];
+        return error.localizedDescription ?: (move ? @"MOVE_FILE_ERROR" : @"COPY_FILE_ERROR");
+    }
+    if (rename(tmp.fileSystemRepresentation, toPath.fileSystemRepresentation) != 0) {
+        NSString *reason = @(strerror(errno));
+        if (move) [fm moveItemAtPath:tmp toPath:fromPath error:nil]; // put the source back
+        else [fm removeItemAtPath:tmp error:nil];
+        return reason;
+    }
+    return nil;
+}
+
 - (void)copyFile:(NSString *)fromPath toPath:(NSString *)toPath resolve:(RCTPromiseResolveBlock)resolve reject:(RCTPromiseRejectBlock)reject {
     NSFileManager *fm = [NSFileManager defaultManager];
     BOOL isDir = NO;
@@ -604,21 +1110,8 @@ RCT_EXPORT_MODULE(FileToolkit)
         return;
     }
 
-    NSString *parent = [toPath stringByDeletingLastPathComponent];
-    if (parent.length > 0) {
-        [fm createDirectoryAtPath:parent withIntermediateDirectories:YES attributes:nil error:nil];
-    }
-
-    [fm removeItemAtPath:toPath error:nil];
-    NSError *copyError = nil;
-    BOOL success = [fm copyItemAtPath:fromPath toPath:toPath error:&copyError];
-
-    if (!success || copyError) {
-        resolve(@{@"success": @NO, @"error": copyError.localizedDescription ?: @"COPY_FILE_ERROR"});
-        return;
-    }
-
-    resolve(@{@"success": @YES});
+    NSString *error = FTKTransferItem(fromPath, toPath, NO);
+    resolve(error ? @{@"success": @NO, @"error": error} : @{@"success": @YES});
 }
 
 // ─── moveFile ────────────────────────────────────────────────────────────────
@@ -630,21 +1123,8 @@ RCT_EXPORT_MODULE(FileToolkit)
         return;
     }
 
-    NSString *parent = [toPath stringByDeletingLastPathComponent];
-    if (parent.length > 0) {
-        [fm createDirectoryAtPath:parent withIntermediateDirectories:YES attributes:nil error:nil];
-    }
-
-    [fm removeItemAtPath:toPath error:nil];
-    NSError *moveError = nil;
-    BOOL success = [fm moveItemAtPath:fromPath toPath:toPath error:&moveError];
-
-    if (!success || moveError) {
-        resolve(@{@"success": @NO, @"error": moveError.localizedDescription ?: @"MOVE_FILE_ERROR"});
-        return;
-    }
-
-    resolve(@{@"success": @YES});
+    NSString *error = FTKTransferItem(fromPath, toPath, YES);
+    resolve(error ? @{@"success": @NO, @"error": error} : @{@"success": @YES});
 }
 
 // ─── mkdir ───────────────────────────────────────────────────────────────────
@@ -694,7 +1174,12 @@ RCT_EXPORT_MODULE(FileToolkit)
 // ─── getBackgroundDownloads ───────────────────────────────────────────────────
 
 - (void)getBackgroundDownloads:(RCTPromiseResolveBlock)resolve reject:(RCTPromiseRejectBlock)reject {
-    [self.bgSession getTasksWithCompletionHandler:^(NSArray *dataTasks, NSArray *uploadTasks, NSArray *downloadTasks) {
+    NSURLSession *session = self.bgSession;
+    if (!session) {
+        resolve(@{@"success": @NO, @"error": @"Module was invalidated", @"downloads": @[]});
+        return;
+    }
+    [session getTasksWithCompletionHandler:^(NSArray *dataTasks, NSArray *uploadTasks, NSArray *downloadTasks) {
         NSMutableArray *results = [NSMutableArray new];
         for (NSURLSessionDownloadTask *task in downloadTasks) {
             NSString *downloadId = task.taskDescription ?: @"";
@@ -717,42 +1202,52 @@ RCT_EXPORT_MODULE(FileToolkit)
 }
 
 // ─── NSURLSession delegates ───────────────────────────────────────────────────
+// Foreground callbacks arrive directly; background ones via FTKBackgroundSessionProxy.
 
 - (void)URLSession:(NSURLSession *)session
       downloadTask:(NSURLSessionDownloadTask *)downloadTask
       didWriteData:(int64_t)bytesWritten
  totalBytesWritten:(int64_t)totalBytesWritten
 totalBytesExpectedToWrite:(int64_t)totalBytesExpectedToWrite {
-    if (totalBytesExpectedToWrite > 0) {
-        int progress = (int)((totalBytesWritten * 100) / totalBytesExpectedToWrite);
-        NSString *taskKey = [NSString stringWithFormat:@"%lu", (unsigned long)downloadTask.taskIdentifier];
-        NSString *url = downloadTask.originalRequest.URL.absoluteString ?: @"";
+    // Without a Content-Length the total is unknown: report bytes only, with
+    // progress/totalBytes = -1, and throttle since every chunk lands here.
+    BOOL sizeKnown = totalBytesExpectedToWrite > 0;
+    int progress = sizeKnown ? (int)((totalBytesWritten * 100) / totalBytesExpectedToWrite) : -1;
+    int64_t totalBytes = sizeKnown ? totalBytesExpectedToWrite : -1;
+    NSString *taskKey = FTKTaskKey(session, downloadTask);
+    NSString *taskDownloadId = downloadTask.taskDescription;
+    NSString *url = downloadTask.originalRequest.URL.absoluteString ?: @"";
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
 
-        __weak typeof(self) weakSelf = self;
-        dispatch_async(self.syncQueue, ^{
-            __strong typeof(weakSelf) strongSelf = weakSelf;
-            if (!strongSelf) return;
-            NSString *downloadId = strongSelf.taskIdMap[taskKey];
-            if (!downloadId) return;
-            
-            if (strongSelf.hasListeners) {
-                [strongSelf sendEventWithName:@"onDownloadProgress"
-                                   body:@{
-                                       @"url": url,
-                                       @"downloadId": downloadId,
-                                       @"progress": @(progress),
-                                       @"bytesDownloaded": @(totalBytesWritten),
-                                       @"totalBytes": @(totalBytesExpectedToWrite)
-                                   }];
-            }
-        });
-    }
+    __weak __typeof__(self) weakSelf = self;
+    dispatch_async(self.syncQueue, ^{
+        __strong __typeof__(weakSelf) strongSelf = weakSelf;
+        if (!strongSelf) return;
+        NSString *downloadId = strongSelf.taskIdMap[taskKey] ?: taskDownloadId;
+        if (!downloadId) return;
+
+        if (!sizeKnown) {
+            NSNumber *last = strongSelf.lastProgressAt[downloadId];
+            if (last && now - last.doubleValue < kFTKUnknownSizeProgressInterval) return;
+            strongSelf.lastProgressAt[downloadId] = @(now);
+        }
+
+        [strongSelf emitEvent:@"onDownloadProgress"
+                         body:@{
+                             @"url": url,
+                             @"downloadId": downloadId,
+                             @"progress": @(progress),
+                             @"bytesDownloaded": @(totalBytesWritten),
+                             @"totalBytes": @(totalBytes)
+                         }];
+    });
 }
 
 - (void)URLSession:(NSURLSession *)session
       downloadTask:(NSURLSessionDownloadTask *)downloadTask
 didFinishDownloadingToURL:(NSURL *)location {
-    NSString *taskKey = [NSString stringWithFormat:@"%lu", (unsigned long)downloadTask.taskIdentifier];
+    BOOL isBackground = session.configuration.identifier != nil;
+    NSString *taskKey = FTKTaskKey(session, downloadTask);
     __block NSString *downloadId = nil;
     __block NSDictionary *options = nil;
     dispatch_sync(self.syncQueue, ^{
@@ -763,76 +1258,76 @@ didFinishDownloadingToURL:(NSURL *)location {
     });
     // A background download can finish after the app was terminated and relaunched,
     // in which case the in-memory maps are empty. The task itself still carries the
-    // id, so recover it instead of dropping the finished file on the floor.
+    // id, and its options were persisted, so recover both instead of dropping the
+    // finished file on the floor (or saving it to the wrong place unverified).
     if (!downloadId) downloadId = downloadTask.taskDescription;
     if (!downloadId) return;
-
-    NSString *fileName = [self fileNameFromOptions:options task:downloadTask];
-    NSString *destType = options[@"destination"] ?: @"downloads";
-    NSURL *destURL = [self destURLForFileName:fileName destination:destType];
-
-    // NSURLSessionDownloadTask reports 4xx/5xx as a *successful* download whose body
-    // is the error page. Without this check `download()` resolves with success:YES
-    // and an HTML error document saved under the expected file name.
-    NSHTTPURLResponse *httpResponse = [downloadTask.response isKindOfClass:[NSHTTPURLResponse class]]
-        ? (NSHTTPURLResponse *)downloadTask.response : nil;
-    if (httpResponse && (httpResponse.statusCode < 200 || httpResponse.statusCode >= 300)) {
+    if (!options && isBackground) options = FTKLoadMeta(downloadId);
+    if (!options && (!isBackground || FTKWasCancelled(downloadId))) {
+        // Cancelled while it was finishing: nobody wants the file, and JS was
+        // already told "Cancelled".
         [[NSFileManager defaultManager] removeItemAtURL:location error:nil];
-        NSDictionary *statusErr = @{
-            @"success": @NO,
-            @"downloadId": downloadId,
-            @"error": [NSString stringWithFormat:@"SERVER_ERROR: %ld", (long)httpResponse.statusCode]
-        };
-        [self finishDownload:downloadId taskKey:taskKey result:statusErr isError:YES options:options];
+        dispatch_sync(self.syncQueue, ^{
+            [self.taskIdMap removeObjectForKey:taskKey];
+        });
         return;
     }
 
-    NSError *error;
-    [[NSFileManager defaultManager] removeItemAtURL:destURL error:nil];
-    [[NSFileManager defaultManager] moveItemAtURL:location toURL:destURL error:&error];
-
-    NSDictionary *resultDict;
     BOOL isError = NO;
-    if (error) {
-        isError = YES;
-        resultDict = @{@"success": @NO, @"downloadId": downloadId, @"error": error.localizedDescription};
-    } else {
-        // Checksum verification
-        NSDictionary *checksum = options[@"checksum"];
-        if (checksum) {
-            NSString *expectedHash = checksum[@"hash"];
-            NSString *algo = checksum[@"algorithm"] ?: @"MD5";
-            NSString *actualHash = [self calculateChecksumForPath:destURL.path algorithm:algo.uppercaseString];
-            if (![actualHash.lowercaseString isEqualToString:expectedHash.lowercaseString]) {
-                [[NSFileManager defaultManager] removeItemAtURL:destURL error:nil];
-                isError = YES;
-                resultDict = @{
-                    @"success": @NO,
-                    @"downloadId": downloadId,
-                    @"error": [NSString stringWithFormat:@"CHECKSUM_MISMATCH: expected %@, got %@", expectedHash, actualHash]
-                };
-            } else {
-                resultDict = @{@"success": @YES, @"downloadId": downloadId, @"filePath": destURL.path};
-            }
-        } else {
-            resultDict = @{@"success": @YES, @"downloadId": downloadId, @"filePath": destURL.path};
-        }
-    }
-
-    [self finishDownload:downloadId taskKey:taskKey result:resultDict isError:isError options:options];
+    NSDictionary *resultDict = FTKFinalizeDownload(downloadTask, location, downloadId, options, &isError);
+    [self finishDownload:downloadId taskKey:taskKey result:resultDict isError:isError isBackground:isBackground];
 }
 
-/** Settles a finished download: resolves the promise or emits the event, then cleans up. */
+/**
+ * Settles a finished download: resolves the promise or emits the event, then cleans up.
+ *
+ * The promise is taken and removed in the same syncQueue block, so a racing
+ * cancelDownload (or a second completion path) can never settle it twice.
+ */
 - (void)finishDownload:(NSString *)downloadId
                taskKey:(NSString *)taskKey
                 result:(NSDictionary *)resultDict
                isError:(BOOL)isError
-               options:(NSDictionary *)options {
+          isBackground:(BOOL)isBackground {
     __block NSDictionary *funcs = nil;
-    BOOL isBackground = [options[@"background"] boolValue];
+    __block BOOL claimed = NO;
     dispatch_sync(self.syncQueue, ^{
-        funcs = self.activePromises[downloadId];
+        // cancelDownload and a failed pause mark the id inside this same queue
+        // when they settle it, so exactly one of them or this path reports it.
+        claimed = !FTKWasCancelled(downloadId);
+        if (claimed) {
+            funcs = [self takeDownloadLocked:downloadId];
+        }
+        if (taskKey) [self.taskIdMap removeObjectForKey:taskKey];
     });
+    if (!claimed) {
+        // Already settled as cancelled: drop a file this completion moved into place.
+        NSString *filePath = resultDict[@"filePath"];
+        if (filePath) [[NSFileManager defaultManager] removeItemAtPath:filePath error:nil];
+        return;
+    }
+    [self settleDownload:downloadId funcs:funcs result:resultDict isError:isError isBackground:isBackground];
+}
+
+/** Removes every trace of a download and returns its promise blocks. Call on syncQueue. */
+- (NSDictionary *)takeDownloadLocked:(NSString *)downloadId {
+    NSDictionary *funcs = self.activePromises[downloadId];
+    [self.activePromises  removeObjectForKey:downloadId];
+    [self.downloadOptions removeObjectForKey:downloadId];
+    [self.activeTasks     removeObjectForKey:downloadId];
+    [self.retryAttempts   removeObjectForKey:downloadId];
+    [self.pendingRetries  removeObjectForKey:downloadId];
+    [self.lastProgressAt  removeObjectForKey:downloadId];
+    return funcs;
+}
+
+/** Reports a download already taken with -takeDownloadLocked:. */
+- (void)settleDownload:(NSString *)downloadId
+                 funcs:(NSDictionary *)funcs
+                result:(NSDictionary *)resultDict
+               isError:(BOOL)isError
+          isBackground:(BOOL)isBackground {
+    if (isBackground) FTKRemoveMeta(downloadId);
 
     if (funcs && !isBackground) {
         // Foreground: resolve the promise
@@ -840,30 +1335,31 @@ didFinishDownloadingToURL:(NSURL *)location {
         resolve(resultDict);
         // Also emit the error event for foreground failures so global listeners fire
         // consistently across platforms (mirrors Android behaviour).
-        if (isError && self.hasListeners) {
-            [self sendEventWithName:@"onDownloadError" body:resultDict];
+        if (isError) {
+            [self emitEvent:@"onDownloadError" body:resultDict];
         }
     } else {
         // Background: fire the correct event based on isError flag
-        NSString *event = isError ? @"onDownloadError" : @"onDownloadComplete";
-        if (self.hasListeners) {
-            [self sendEventWithName:event body:resultDict];
-        }
+        [self emitEvent:isError ? @"onDownloadError" : @"onDownloadComplete"
+                   body:resultDict
+        bufferIfUnheard:isBackground];
     }
+}
 
-    dispatch_sync(self.syncQueue, ^{
-        [self.activePromises  removeObjectForKey:downloadId];
-        [self.downloadOptions removeObjectForKey:downloadId];
-        [self.activeTasks     removeObjectForKey:downloadId];
-        if (taskKey) [self.taskIdMap removeObjectForKey:taskKey];
-        [self.retryAttempts   removeObjectForKey:downloadId];
-    });
+/**
+ * Our own cancel/pause. A background task the *system* cancelled (force quit,
+ * Background App Refresh off, …) carries a reason key and is a real failure.
+ */
+static BOOL FTKIsOwnCancellation(NSError *error) {
+    return [error.domain isEqualToString:NSURLErrorDomain] &&
+           error.code == NSURLErrorCancelled &&
+           error.userInfo[NSURLErrorBackgroundTaskCancelledReasonKey] == nil;
 }
 
 - (void)URLSession:(NSURLSession *)session
               task:(NSURLSessionTask *)task
 didCompleteWithError:(NSError *)error {
-    NSString *taskKey = [NSString stringWithFormat:@"%lu", (unsigned long)task.taskIdentifier];
+    NSString *taskKey = FTKTaskKey(session, task);
 
     // ── Upload task completion ─────────────────────────────────────────────────
     __block NSString *uploadId = nil;
@@ -872,8 +1368,13 @@ didCompleteWithError:(NSError *)error {
     dispatch_sync(self.syncQueue, ^{
         uploadId = self.uploadTaskIdMap[taskKey];
         if (uploadId) {
+            // Taken and removed together so the promise can only settle once.
             uploadFuncs = self.uploadPromises[uploadId];
             uploadRespData = self.uploadResponseData[uploadId];
+            [self.uploadPromises removeObjectForKey:uploadId];
+            [self.uploadUrls removeObjectForKey:uploadId];
+            [self.uploadResponseData removeObjectForKey:uploadId];
+            [self.uploadTaskIdMap removeObjectForKey:taskKey];
         }
     });
     if (uploadId) {
@@ -898,31 +1399,20 @@ didCompleteWithError:(NSError *)error {
                 @"uploadId": uploadId
             });
         }
-
-        dispatch_sync(self.syncQueue, ^{
-            // Guard against double-resolution in upload
-            if (self.uploadPromises[uploadId]) {
-                [self.uploadPromises removeObjectForKey:uploadId];
-                [self.uploadUrls removeObjectForKey:uploadId];
-                [self.uploadResponseData removeObjectForKey:uploadId];
-                [self.uploadTaskIdMap removeObjectForKey:taskKey];
-            } else {
-                uploadId = nil; // Already resolved
-            }
-        });
-        if (!uploadId) return;
+        return;
     }
 
     // ── Download task error handling ───────────────────────────────────────
     if (!error) return;
     // Ignore cancellation — but still clean up taskIdMap to prevent memory leak
-    if (error.code == NSURLErrorCancelled) {
+    if (FTKIsOwnCancellation(error)) {
         dispatch_sync(self.syncQueue, ^{
             [self.taskIdMap removeObjectForKey:taskKey];
         });
         return;
     }
 
+    BOOL isBackground = session.configuration.identifier != nil;
     __block NSString *downloadId = nil;
     __block NSDictionary *options = nil;
     __block NSInteger currentAttempt = 0;
@@ -932,98 +1422,113 @@ didCompleteWithError:(NSError *)error {
             options = self.downloadOptions[downloadId];
             currentAttempt = [self.retryAttempts[downloadId] integerValue];
         }
+        // Remove old task mapping — will be replaced on retry
+        [self.taskIdMap removeObjectForKey:taskKey];
+        if (downloadId) [self.activeTasks removeObjectForKey:downloadId];
     });
     if (!downloadId) downloadId = task.taskDescription;
     if (!downloadId) return;
-
-    BOOL isBackground = [options[@"background"] boolValue];
+    if (!options && isBackground) options = FTKLoadMeta(downloadId);
+    if (!options && (!isBackground || FTKWasCancelled(downloadId))) return; // cancelled while failing; already settled
 
     // ── Retry logic ────────────────────────────────────────────────────
-    NSDictionary *retryConfig = options[@"retry"];
-    NSInteger maxAttempts = retryConfig ? [retryConfig[@"attempts"] integerValue] : 0;
-    NSInteger baseDelay   = retryConfig ? ([retryConfig[@"delay"] integerValue] ?: 1000) : 1000;
-
-    // Remove old task mapping — will be replaced on retry
-    dispatch_sync(self.syncQueue, ^{
-        [self.taskIdMap  removeObjectForKey:taskKey];
-        [self.activeTasks removeObjectForKey:downloadId];
-    });
+    NSDictionary *retryConfig = [options[@"retry"] isKindOfClass:[NSDictionary class]] ? options[@"retry"] : nil;
+    id attemptsValue = retryConfig[@"attempts"];
+    NSInteger maxAttempts = [attemptsValue isKindOfClass:[NSNumber class]] ? [attemptsValue integerValue] : 0;
+    // Only a missing delay defaults to 1000 ms; an explicit 0 means "retry at once".
+    id delayValue = retryConfig[@"delay"];
+    double delay = [delayValue isKindOfClass:[NSNumber class]] ? [delayValue doubleValue] : 1000;
+    NSInteger baseDelay = delay > 0 ? (NSInteger)MIN(delay, 30000.0) : 0;
 
     if (currentAttempt < maxAttempts) {
-        // Schedule a retry
+        // Schedule a retry. Until it starts there is no task, so pendingRetries is
+        // what lets cancel/pause/resume act on the download in the meantime.
         NSInteger nextAttempt = currentAttempt + 1;
         dispatch_sync(self.syncQueue, ^{
             self.retryAttempts[downloadId] = @(nextAttempt);
+            self.pendingRetries[downloadId] = @(FTKRetryWaiting);
         });
 
         NSInteger shiftBits = currentAttempt < 15 ? currentAttempt : 15;
         NSInteger delayMs = MIN(baseDelay * (1 << shiftBits), (NSInteger)30000);
 
         // Emit retry event so JS onRetry callback is called
-        if (self.hasListeners) {
-            [self sendEventWithName:@"onDownloadRetry" body:@{
-                @"downloadId": downloadId,
-                @"url": options[@"url"] ?: @"",
-                @"attempt": @(nextAttempt),
-                @"error": error.localizedDescription ?: @""
-            }];
-        }
+        [self emitEvent:@"onDownloadRetry" body:@{
+            @"downloadId": downloadId,
+            @"url": options[@"url"] ?: @"",
+            @"attempt": @(nextAttempt),
+            @"error": error.localizedDescription ?: @""
+        }];
 
-        __weak typeof(self) weakSelf = self;
+        __weak __typeof__(self) weakSelf = self;
         dispatch_after(
             dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delayMs * NSEC_PER_MSEC)),
             dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0),
             ^{
-                __strong typeof(weakSelf) strongSelf = weakSelf;
+                __strong __typeof__(weakSelf) strongSelf = weakSelf;
                 if (!strongSelf) return;
 
-                NSString *urlString = options[@"url"];
-                if (!urlString) return;
-                NSURL *url = [NSURL URLWithString:urlString];
-                if (!url) return;
-                NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:url];
-                NSDictionary *headers = options[@"headers"];
-                if (headers) {
-                    for (NSString *key in headers) {
-                        [request setValue:headers[key] forHTTPHeaderField:key];
-                    }
-                }
-                NSURLSession *sess = isBackground ? strongSelf.bgSession : strongSelf.fgSession;
-                NSURLSessionDownloadTask *newTask = [sess downloadTaskWithRequest:request];
-                NSString *newTaskKey = [NSString stringWithFormat:@"%lu",
-                                        (unsigned long)newTask.taskIdentifier];
-                dispatch_sync(strongSelf.syncQueue, ^{
-                    strongSelf.taskIdMap[newTaskKey]      = downloadId;
-                    strongSelf.activeTasks[downloadId]   = newTask;
-                });
-                newTask.taskDescription              = downloadId;
-                [newTask resume];
+                // Re-checks cancel/pause/invalidate atomically before starting.
+                [strongSelf startRetryForDownload:downloadId isBackground:isBackground];
             }
         );
         return; // Don't resolve promise yet — retry is in flight
     }
 
     // ── No more retries — normal error path ──────────────────────────────
-    NSDictionary *errDict = @{@"success": @NO, @"downloadId": downloadId, @"error": error.localizedDescription};
+    // finishDownload always emits onDownloadError, so global listeners fire on both platforms.
+    NSDictionary *errDict = @{@"success": @NO, @"downloadId": downloadId, @"error": error.localizedDescription ?: @""};
+    [self finishDownload:downloadId taskKey:nil result:errDict isError:YES isBackground:isBackground];
+}
 
-    __block NSDictionary *funcs = nil;
+/** Starts the next attempt of a download whose retry backoff has elapsed. */
+- (void)startRetryForDownload:(NSString *)downloadId isBackground:(BOOL)isBackground {
+    __block NSDictionary *options = nil;
     dispatch_sync(self.syncQueue, ^{
-        [self.retryAttempts removeObjectForKey:downloadId];
-        funcs = self.activePromises[downloadId];
+        options = self.downloadOptions[downloadId];
     });
-    // Always emit the event so global onDownloadError listeners fire on both platforms.
-    if (self.hasListeners) {
-        [self sendEventWithName:@"onDownloadError" body:errDict];
-    }
-    if (funcs && !isBackground) {
-        RCTPromiseResolveBlock resolve = funcs[@"resolve"];
-        resolve(errDict);
+    if (!options) return; // cancelled in the meantime
+
+    NSString *urlString = options[@"url"];
+    NSURL *url = [urlString isKindOfClass:[NSString class]] ? [NSURL URLWithString:urlString] : nil;
+    if (!url) {
+        NSDictionary *errDict = @{@"success": @NO, @"downloadId": downloadId, @"error": @"Invalid URL"};
+        [self finishDownload:downloadId taskKey:nil result:errDict isError:YES isBackground:isBackground];
+        return;
     }
 
+    NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:url];
+    NSDictionary *headers = options[@"headers"];
+    if ([headers isKindOfClass:[NSDictionary class]]) {
+        for (NSString *key in headers) {
+            [request setValue:headers[key] forHTTPHeaderField:key];
+        }
+    }
+
+    // Checking the retry state and creating the task are one step on syncQueue,
+    // ordered against cancelDownload, pauseDownload and -invalidate (which sets
+    // `invalidated` here before tearing the sessions down). So either the retry
+    // starts and nobody reports it lost, or it is reported lost / cancelled /
+    // paused and no task is ever created — and no task is created on a session
+    // that is being invalidated.
+    __block NSURLSessionDownloadTask *newTask = nil;
     dispatch_sync(self.syncQueue, ^{
-        [self.activePromises  removeObjectForKey:downloadId];
-        [self.downloadOptions removeObjectForKey:downloadId];
+        NSNumber *state = self.pendingRetries[downloadId];
+        if (self.invalidated || !state || !self.downloadOptions[downloadId]) return;
+        if (state.integerValue != FTKRetryWaiting) {
+            // Paused during the backoff: hold until resumeDownload.
+            self.pendingRetries[downloadId] = @(FTKRetryHeld);
+            return;
+        }
+        NSURLSession *sess = isBackground ? self.bgSession : self.fgSession;
+        if (!sess) return;
+        [self.pendingRetries removeObjectForKey:downloadId];
+        newTask = [sess downloadTaskWithRequest:request];
+        newTask.taskDescription = downloadId;
+        self.taskIdMap[FTKTaskKey(sess, newTask)] = downloadId;
+        self.activeTasks[downloadId] = newTask;
     });
+    [newTask resume];
 }
 
 // ─── Upload progress delegate ────────────────────────────────────────────────
@@ -1034,21 +1539,19 @@ didCompleteWithError:(NSError *)error {
     totalBytesSent:(int64_t)totalBytesSent
 totalBytesExpectedToSend:(int64_t)totalBytesExpectedToSend {
     if (totalBytesExpectedToSend > 0) {
-        NSString *taskKey = [NSString stringWithFormat:@"%lu", (unsigned long)task.taskIdentifier];
+        NSString *taskKey = FTKTaskKey(session, task);
         int progress = (int)((totalBytesSent * 100) / totalBytesExpectedToSend);
         
-        __weak typeof(self) weakSelf = self;
+        __weak __typeof__(self) weakSelf = self;
         dispatch_async(self.syncQueue, ^{
-            __strong typeof(weakSelf) strongSelf = weakSelf;
+            __strong __typeof__(weakSelf) strongSelf = weakSelf;
             if (!strongSelf) return;
             
             NSString *uploadId = strongSelf.uploadTaskIdMap[taskKey];
             if (uploadId) {
                 NSString *url = strongSelf.uploadUrls[uploadId] ?: @"";
-                if (strongSelf.hasListeners) {
-                    [strongSelf sendEventWithName:@"onUploadProgress"
-                                       body:@{@"url": url, @"uploadId": uploadId, @"progress": @(progress)}];
-                }
+                [strongSelf emitEvent:@"onUploadProgress"
+                                 body:@{@"url": url, @"uploadId": uploadId, @"progress": @(progress)}];
             }
         });
     }
@@ -1059,14 +1562,10 @@ totalBytesExpectedToSend:(int64_t)totalBytesExpectedToSend {
 - (void)URLSession:(NSURLSession *)session
           dataTask:(NSURLSessionDataTask *)dataTask
     didReceiveData:(NSData *)data {
-    NSString *taskKey = [NSString stringWithFormat:@"%lu", (unsigned long)dataTask.taskIdentifier];
-    __block NSString *uploadId = nil;
+    NSString *taskKey = FTKTaskKey(session, dataTask);
     dispatch_sync(self.syncQueue, ^{
-        uploadId = self.uploadTaskIdMap[taskKey];
-    });
-    if (!uploadId) return;
-
-    dispatch_sync(self.syncQueue, ^{
+        NSString *uploadId = self.uploadTaskIdMap[taskKey];
+        if (!uploadId) return;
         NSMutableData *responseData = self.uploadResponseData[uploadId];
         if (!responseData) {
             responseData = [NSMutableData new];
@@ -1132,6 +1631,7 @@ totalBytesExpectedToSend:(int64_t)totalBytesExpectedToSend {
     [[NSFileManager defaultManager] createFileAtPath:tempFilePath contents:nil attributes:nil];
     NSFileHandle *fileHandle = [NSFileHandle fileHandleForWritingAtPath:tempFilePath];
     if (!fileHandle) {
+        [[NSFileManager defaultManager] removeItemAtPath:tempFilePath error:nil];
         resolve(@{@"success": @NO, @"error": @"Failed to create temp file for upload"});
         return;
     }
@@ -1148,27 +1648,49 @@ totalBytesExpectedToSend:(int64_t)totalBytesExpectedToSend {
     [preamble appendData:[[NSString stringWithFormat:@"Content-Disposition: form-data; name=\"%@\"; filename=\"%@\"\r\n", fieldName, fileName] dataUsingEncoding:NSUTF8StringEncoding]];
     [preamble appendData:[@"Content-Type: application/octet-stream\r\n\r\n" dataUsingEncoding:NSUTF8StringEncoding]];
     
-    [fileHandle writeData:preamble];
+    // -writeData: raises an Objective-C exception on failure (e.g. disk full),
+    // which would crash the app from this background queue; use the NSError API.
+    NSError *bodyError = nil;
+    BOOL bodyOK = [fileHandle writeData:preamble error:&bodyError];
 
     // Stream the actual file content to the temp file
     NSInputStream *inputStream = [NSInputStream inputStreamWithFileAtPath:filePath];
     [inputStream open];
+    if (bodyOK && (!inputStream || inputStream.streamStatus == NSStreamStatusError)) {
+        bodyOK = NO;
+        bodyError = inputStream.streamError;
+    }
     uint8_t buffer[32768]; // 32KB chunks
-    while ([inputStream hasBytesAvailable]) {
+    while (bodyOK && [inputStream hasBytesAvailable]) {
         NSInteger bytesRead = [inputStream read:buffer maxLength:sizeof(buffer)];
         if (bytesRead > 0) {
-            [fileHandle writeData:[NSData dataWithBytes:buffer length:bytesRead]];
+            bodyOK = [fileHandle writeData:[NSData dataWithBytes:buffer length:bytesRead] error:&bodyError];
         } else if (bytesRead < 0) {
+            // A read error must fail the upload, not send a truncated file.
+            bodyOK = NO;
+            bodyError = inputStream.streamError;
+        } else {
             break;
         }
     }
     [inputStream close];
 
-    NSMutableData *postamble = [NSMutableData data];
-    [postamble appendData:[@"\r\n" dataUsingEncoding:NSUTF8StringEncoding]];
-    [postamble appendData:[[NSString stringWithFormat:@"--%@--\r\n", boundary] dataUsingEncoding:NSUTF8StringEncoding]];
-    [fileHandle writeData:postamble];
-    [fileHandle closeFile];
+    if (bodyOK) {
+        NSMutableData *postamble = [NSMutableData data];
+        [postamble appendData:[@"\r\n" dataUsingEncoding:NSUTF8StringEncoding]];
+        [postamble appendData:[[NSString stringWithFormat:@"--%@--\r\n", boundary] dataUsingEncoding:NSUTF8StringEncoding]];
+        bodyOK = [fileHandle writeData:postamble error:&bodyError];
+    }
+    NSError *closeError = nil;
+    if (![fileHandle closeAndReturnError:&closeError] && bodyOK) {
+        bodyOK = NO;
+        bodyError = closeError;
+    }
+    if (!bodyOK) {
+        [[NSFileManager defaultManager] removeItemAtPath:tempFilePath error:nil];
+        resolve(@{@"success": @NO, @"error": bodyError.localizedDescription ?: @"Failed to write upload body"});
+        return;
+    }
 
     NSURL *tempFileURL = [NSURL fileURLWithPath:tempFilePath];
 
@@ -1181,7 +1703,7 @@ totalBytesExpectedToSend:(int64_t)totalBytesExpectedToSend {
 
     // Use delegate-based session for upload progress support with fromFile: instead of fromData:
     NSURLSessionUploadTask *task = [session uploadTaskWithRequest:request fromFile:tempFileURL];
-    NSString *taskKey = [NSString stringWithFormat:@"%lu", (unsigned long)task.taskIdentifier];
+    NSString *taskKey = FTKTaskKey(session, task);
 
     dispatch_sync(self.syncQueue, ^{
         self.uploadTaskIdMap[taskKey] = uploadId;
@@ -1223,7 +1745,7 @@ RCT_EXPORT_METHOD(saveBase64AsFile:(NSDictionary *)options
         return;
     }
     
-    NSURL *destURL = [self destURLForFileName:fileName destination:destination];
+    NSURL *destURL = FTKDestURL(fileName, destination);
     NSError *writeError = nil;
     BOOL success = [decodedData writeToURL:destURL options:NSDataWritingAtomic error:&writeError];
     
@@ -1267,42 +1789,13 @@ RCT_EXPORT_METHOD(urlToBase64:(NSDictionary *)options
         }
     }
     
-    // Create ephemeral session instead of using sharedSession
+    // Ephemeral session with a delegate, so the 50 MB cap is enforced while the
+    // body arrives instead of after the whole response was buffered.
     NSURLSessionConfiguration *config = [NSURLSessionConfiguration ephemeralSessionConfiguration];
-    NSURLSession *session = [NSURLSession sessionWithConfiguration:config];
-    NSURLSessionDataTask *task = [session dataTaskWithRequest:request completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
-        if (error) {
-            resolve(@{@"success": @NO, @"error": error.localizedDescription});
-            return;
-        }
-        
-        NSHTTPURLResponse *httpResponse = (NSHTTPURLResponse *)response;
-        if (httpResponse.statusCode < 200 || httpResponse.statusCode >= 300) {
-            resolve(@{@"success": @NO, @"error": [NSString stringWithFormat:@"HTTP %ld", (long)httpResponse.statusCode]});
-            return;
-        }
-        
-        if (!data || data.length == 0) {
-            resolve(@{@"success": @NO, @"error": @"No data received"});
-            return;
-        }
-        
-        // Get MIME type from response
-        NSString *mimeType = httpResponse.MIMEType ?: @"application/octet-stream";
-        
-        // Encode to base64
-        NSString *base64String = [data base64EncodedStringWithOptions:0];
-        NSString *dataUri = [NSString stringWithFormat:@"data:%@;base64,%@", mimeType, base64String];
-        
-        resolve(@{
-            @"success": @YES,
-            @"base64": base64String,
-            @"mimeType": mimeType,
-            @"dataUri": dataUri
-        });
-    }];
-    
-    [task resume];
+    FTKBase64Fetch *fetch = [[FTKBase64Fetch alloc] initWithResolve:resolve];
+    NSURLSession *session = [NSURLSession sessionWithConfiguration:config delegate:fetch delegateQueue:nil];
+    [[session dataTaskWithRequest:request] resume];
+    // Releases the session (and its strong delegate reference) once the task ends.
     [session finishTasksAndInvalidate];
 }
 
@@ -1435,241 +1928,22 @@ RCT_EXPORT_METHOD(openFile:(NSString *)filePath
 
 // ─── Unzip ────────────────────────────────────────────────────────────────────
 
+// Pure-Foundation zip reader/writer — zlib is a system library (s.libraries = "z"),
+// so no third-party archive dependency is needed. See FileToolkitZip.mm.
 RCT_EXPORT_METHOD(unzip:(NSString *)sourcePath
                   destDir:(NSString *)destDir
                   resolve:(RCTPromiseResolveBlock)resolve
                   reject:(RCTPromiseRejectBlock)reject)
 {
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-        NSFileManager *fm = [NSFileManager defaultManager];
-        NSURL *destURL = [NSURL fileURLWithPath:destDir];
-
-        if (![fm fileExistsAtPath:sourcePath]) {
-            resolve(@{@"success": @NO,
-                      @"error": [NSString stringWithFormat:@"Source zip file does not exist: %@", sourcePath]});
-            return;
-        }
-
-        // Ensure destination directory exists
-        NSError *mkdirErr = nil;
-        [fm createDirectoryAtURL:destURL withIntermediateDirectories:YES attributes:nil error:&mkdirErr];
-
-        // Pure-Foundation zip reader — zlib is a system library (s.libraries = "z"),
-        // so no third-party archive dependency is needed. See -extractZipData:.
-        NSError *readError = nil;
-        NSData *zipData = [NSData dataWithContentsOfFile:sourcePath options:NSDataReadingMappedIfSafe error:&readError];
-        if (!zipData) {
-            resolve(@{@"success": @NO, @"error": readError.localizedDescription ?: @"Cannot read zip file"});
-            return;
-        }
-
         NSMutableArray<NSString *> *extractedFiles = [NSMutableArray new];
         NSError *extractError = nil;
-        BOOL ok = [self extractZipData:zipData toDirectory:destDir extractedFiles:extractedFiles error:&extractError];
-
-        if (ok) {
+        if (FTKUnzipFile(sourcePath, destDir, extractedFiles, &extractError)) {
             resolve(@{@"success": @YES, @"destDir": destDir, @"files": extractedFiles});
         } else {
             resolve(@{@"success": @NO, @"error": extractError.localizedDescription ?: @"UNZIP_ERROR"});
         }
     });
-}
-
-/**
- * Pure-Foundation ZIP extractor.
- * Parses the ZIP local file headers (signature 0x04034b50) sequentially.
- * Uses zlib inflate (deflate method) and store (method 0) — the two methods
- * used by virtually every ZIP file in the wild.
- * No third-party library required; zlib is a system framework (s.libraries = 'z').
- */
-- (BOOL)extractZipData:(NSData *)data
-           toDirectory:(NSString *)destDir
-        extractedFiles:(NSMutableArray<NSString *> *)extractedFiles
-                 error:(NSError **)error
-{
-    const uint8_t *bytes = (const uint8_t *)data.bytes;
-    NSUInteger length    = data.length;
-    NSUInteger offset    = 0;
-    NSFileManager *fm    = [NSFileManager defaultManager];
-
-    while (offset + 30 <= length) {
-        // Local file header signature
-        uint32_t sig = 0;
-        memcpy(&sig, bytes + offset, 4);
-        if (sig != 0x04034b50) break; // no more local headers
-
-        uint16_t flags         = 0; memcpy(&flags,         bytes + offset + 6,  2);
-        uint16_t method        = 0; memcpy(&method,        bytes + offset + 8,  2);
-        uint32_t crc32val      = 0; memcpy(&crc32val,      bytes + offset + 14, 4);
-        uint32_t compSize      = 0; memcpy(&compSize,      bytes + offset + 18, 4);
-        uint32_t uncompSize    = 0; memcpy(&uncompSize,    bytes + offset + 22, 4);
-        uint16_t fileNameLen   = 0; memcpy(&fileNameLen,   bytes + offset + 26, 2);
-        uint16_t extraFieldLen = 0; memcpy(&extraFieldLen, bytes + offset + 28, 2);
-
-        // Little-endian on all platforms
-        flags         = CFSwapInt16LittleToHost(flags);
-        method        = CFSwapInt16LittleToHost(method);
-        compSize      = CFSwapInt32LittleToHost(compSize);
-        uncompSize    = CFSwapInt32LittleToHost(uncompSize);
-        fileNameLen   = CFSwapInt16LittleToHost(fileNameLen);
-        extraFieldLen = CFSwapInt16LittleToHost(extraFieldLen);
-
-        BOOL hasDataDescriptor = (flags & (1 << 3)) != 0;
-
-        offset += 30;
-        if (offset + fileNameLen > length) break;
-
-        NSString *fileName = [[NSString alloc] initWithBytes:bytes + offset
-                                                       length:fileNameLen
-                                                     encoding:NSUTF8StringEncoding];
-        if (!fileName) fileName = [[NSString alloc] initWithBytes:bytes + offset
-                                                            length:fileNameLen
-                                                          encoding:NSISOLatin1StringEncoding];
-        offset += fileNameLen + extraFieldLen;
-
-        if (!fileName) break; // corrupt ZIP
-        if (!hasDataDescriptor && offset + compSize > length) {
-            offset += compSize;
-            continue;
-        }
-
-        NSString *destPath = [destDir stringByAppendingPathComponent:fileName];
-
-        // Protect against zip-slip/path traversal (e.g. ../../outside.txt)
-        NSString *standardizedDestDir = [destDir stringByStandardizingPath];
-        NSString *standardizedDestPath = [destPath stringByStandardizingPath];
-        NSString *safePrefix = [standardizedDestDir stringByAppendingString:@"/"];
-        if (![standardizedDestPath isEqualToString:standardizedDestDir] &&
-            ![standardizedDestPath hasPrefix:safePrefix]) {
-            if (error) {
-                *error = [NSError errorWithDomain:@"RNFileToolkit"
-                                             code:-100
-                                         userInfo:@{NSLocalizedDescriptionKey: @"ZIP entry has invalid path"}];
-            }
-            return NO;
-        }
-
-        // Directory entry
-        if ([fileName hasSuffix:@"/"]) {
-            [fm createDirectoryAtPath:destPath withIntermediateDirectories:YES attributes:nil error:nil];
-            continue;
-        }
-
-        // Ensure parent directory
-        NSString *parentDir = [destPath stringByDeletingLastPathComponent];
-        [fm createDirectoryAtPath:parentDir withIntermediateDirectories:YES attributes:nil error:nil];
-
-        const uint8_t *compData = bytes + offset;
-
-        if (method == 0) {
-            if (hasDataDescriptor) {
-                if (error) *error = [NSError errorWithDomain:@"RNFileToolkit" code:-5
-                    userInfo:@{NSLocalizedDescriptionKey: @"STORE method with Data Descriptor not supported"}];
-                return NO;
-            }
-            // Store (no compression)
-            NSData *fileData = [NSData dataWithBytes:compData length:compSize];
-            // Verify CRC32 before writing
-            uint32_t expectedCRC = CFSwapInt32LittleToHost(crc32val);
-            uLong actualCRC = crc32(0L, (const Bytef *)fileData.bytes, (uInt)fileData.length);
-            if ((uint32_t)actualCRC != expectedCRC) {
-                if (error) *error = [NSError errorWithDomain:@"RNFileToolkit" code:-3
-                    userInfo:@{NSLocalizedDescriptionKey: [NSString stringWithFormat:@"CRC32 mismatch for entry: %@", fileName]}];
-                return NO;
-            }
-            if (![fileData writeToFile:destPath options:NSDataWritingAtomic error:error]) {
-                return NO;
-            }
-        } else if (method == 8) {
-            // Deflate — use zlib inflate with raw deflate stream
-            // Guard against maliciously crafted entries claiming huge uncompressed sizes.
-        // Cap at 512 MB — large enough for legitimate files, small enough to be safe.
-        const uint32_t kMaxUncompSize = 512u * 1024u * 1024u;
-        if (uncompSize > kMaxUncompSize) {
-            if (error) {
-                *error = [NSError errorWithDomain:@"RNFileToolkit" code:-4
-                    userInfo:@{NSLocalizedDescriptionKey:
-                        [NSString stringWithFormat:@"ZIP entry uncompressed size (%u bytes) exceeds limit", uncompSize]}];
-            }
-            return NO;
-        }
-        NSMutableData *output = [NSMutableData dataWithLength:uncompSize > 0 ? uncompSize : 65536];
-            z_stream strm;
-            memset(&strm, 0, sizeof(strm));
-            strm.next_in  = (Bytef *)compData;
-            strm.avail_in = hasDataDescriptor ? (uInt)(length - offset) : (uInt)compSize;
-
-            // inflateInit2 with -15 for raw deflate (no zlib wrapper)
-            if (inflateInit2(&strm, -15) != Z_OK) {
-                if (error) *error = [NSError errorWithDomain:@"RNFileToolkit" code:-1
-                    userInfo:@{NSLocalizedDescriptionKey: @"zlib inflateInit2 failed"}];
-                return NO;
-            }
-
-            if (uncompSize > 0) {
-                [output setLength:uncompSize];
-                strm.next_out  = (Bytef *)output.mutableBytes;
-                strm.avail_out = (uInt)uncompSize;
-                int ret = inflate(&strm, Z_FINISH);
-                inflateEnd(&strm);
-                if (ret != Z_STREAM_END && ret != Z_OK) {
-                    if (error) *error = [NSError errorWithDomain:@"RNFileToolkit" code:-2
-                        userInfo:@{NSLocalizedDescriptionKey: [NSString stringWithFormat:@"inflate error %d", ret]}];
-                    return NO;
-                }
-                [output setLength:strm.total_out];
-            } else {
-                // Unknown uncompressed size: inflate in chunks
-                NSMutableData *chunk = [NSMutableData dataWithLength:65536];
-                NSMutableData *result = [NSMutableData new];
-                int ret;
-                do {
-                    strm.next_out  = (Bytef *)chunk.mutableBytes;
-                    strm.avail_out = (uInt)chunk.length;
-                    ret = inflate(&strm, Z_NO_FLUSH);
-                    if (ret == Z_STREAM_ERROR || ret == Z_DATA_ERROR || ret == Z_MEM_ERROR) break;
-                    NSUInteger produced = chunk.length - strm.avail_out;
-                    [result appendBytes:chunk.mutableBytes length:produced];
-                } while (ret != Z_STREAM_END);
-                inflateEnd(&strm);
-                output = result;
-            }
-
-            if (hasDataDescriptor) {
-                uint32_t actualCompSize = (uint32_t)strm.total_in;
-                uint32_t ddSig = 0;
-                if (offset + actualCompSize + 4 <= length) {
-                    memcpy(&ddSig, bytes + offset + actualCompSize, 4);
-                }
-                NSUInteger ddOffset = offset + actualCompSize + (ddSig == 0x08074b50 ? 4 : 0);
-                if (ddOffset + 12 <= length) {
-                    memcpy(&crc32val, bytes + ddOffset, 4);
-                }
-                compSize = actualCompSize + (ddSig == 0x08074b50 ? 16 : 12);
-            }
-
-            // Verify CRC32 of decompressed data before writing
-            uint32_t expectedCRC = CFSwapInt32LittleToHost(crc32val);
-            uLong actualCRC = crc32(0L, (const Bytef *)output.bytes, (uInt)output.length);
-            if ((uint32_t)actualCRC != expectedCRC) {
-                if (error) *error = [NSError errorWithDomain:@"RNFileToolkit" code:-3
-                    userInfo:@{NSLocalizedDescriptionKey: [NSString stringWithFormat:@"CRC32 mismatch for entry: %@", fileName]}];
-                return NO;
-            }
-            if (![output writeToFile:destPath options:NSDataWritingAtomic error:error]) {
-                return NO;
-            }
-        } else {
-            // Unsupported compression method — skip
-            offset += compSize;
-            continue;
-        }
-
-        [extractedFiles addObject:destPath];
-        offset += compSize;
-    }
-
-    return YES;
 }
 
 // ─── Zip ──────────────────────────────────────────────────────────────────────
@@ -1680,249 +1954,12 @@ RCT_EXPORT_METHOD(zip:(NSString *)sourcePath
                   reject:(RCTPromiseRejectBlock)reject)
 {
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-        NSFileManager *fm = [NSFileManager defaultManager];
-        BOOL isDir = NO;
-        if (![fm fileExistsAtPath:sourcePath isDirectory:&isDir]) {
-            resolve(@{@"success": @NO, @"error": @"Source path does not exist"});
-            return;
-        }
-
-        // Ensure destination parent directory exists
-        NSString *destParent = [destPath stringByDeletingLastPathComponent];
-        [fm createDirectoryAtPath:destParent withIntermediateDirectories:YES attributes:nil error:nil];
-
-        // Delete existing destination file
-        [fm removeItemAtPath:destPath error:nil];
-
-        // Create the destination file and open a handle for writing
-        [fm createFileAtPath:destPath contents:nil attributes:nil];
-        NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:destPath];
-        if (!fh) {
-            resolve(@{@"success": @NO, @"error": @"Failed to create destination zip file"});
-            return;
-        }
-
-        NSMutableArray<NSDictionary *> *centralDirectory = [NSMutableArray new];
-
-        NSArray<NSString *> *filesToZip;
-        NSString *baseDir;
-        // Entry names are prefixed with the source folder name so the archive
-        // expands into `<folder>/…` — matching Android and what `zip -r` produces.
-        NSString *entryPrefix = @"";
-        if (isDir) {
-            NSDirectoryEnumerator *enumerator = [fm enumeratorAtPath:sourcePath];
-            NSMutableArray *files = [NSMutableArray new];
-            NSString *file;
-            while ((file = [enumerator nextObject])) {
-                [files addObject:file];
-            }
-            filesToZip = files;
-            baseDir = sourcePath;
-            entryPrefix = [sourcePath lastPathComponent];
+        NSError *zipError = nil;
+        if (FTKZipPath(sourcePath, destPath, &zipError)) {
+            resolve(@{@"success": @YES, @"zipPath": destPath});
         } else {
-            filesToZip = @[[sourcePath lastPathComponent]];
-            baseDir = [sourcePath stringByDeletingLastPathComponent];
+            resolve(@{@"success": @NO, @"error": zipError.localizedDescription ?: @"ZIP_ERROR"});
         }
-
-        for (NSString *relativePath in filesToZip) {
-            NSString *fullPath = [baseDir stringByAppendingPathComponent:relativePath];
-            BOOL entryIsDir = NO;
-            [fm fileExistsAtPath:fullPath isDirectory:&entryIsDir];
-
-            NSString *entryName = entryPrefix.length > 0
-                ? [entryPrefix stringByAppendingPathComponent:relativePath]
-                : relativePath;
-            // Directory entries must end in "/" or extractors treat them as files.
-            if (entryIsDir) entryName = [entryName stringByAppendingString:@"/"];
-            NSData *entryNameData = [entryName dataUsingEncoding:NSUTF8StringEncoding];
-            uint16_t nameLen = (uint16_t)entryNameData.length;
-
-            uint32_t localHeaderOffset = (uint32_t)[fh offsetInFile];
-
-            // Write local file header with placeholder CRC/sizes
-            uint32_t sig       = CFSwapInt32HostToLittle(0x04034b50);
-            uint16_t version   = CFSwapInt16HostToLittle(20);
-            uint16_t flags     = 0;
-            uint16_t modTime   = 0, modDate = 0;
-            uint16_t extraLen  = 0;
-
-            // Placeholders — will be patched after streaming
-            uint16_t method    = 0;
-            uint32_t crcLE     = 0;
-            uint32_t compSz    = 0;
-            uint32_t uncompSz  = 0;
-
-            [fh writeData:[NSData dataWithBytes:&sig       length:4]];
-            [fh writeData:[NSData dataWithBytes:&version   length:2]];
-            [fh writeData:[NSData dataWithBytes:&flags     length:2]];
-            [fh writeData:[NSData dataWithBytes:&method    length:2]]; // offset +8
-            [fh writeData:[NSData dataWithBytes:&modTime   length:2]];
-            [fh writeData:[NSData dataWithBytes:&modDate   length:2]];
-            [fh writeData:[NSData dataWithBytes:&crcLE     length:4]]; // offset +14
-            [fh writeData:[NSData dataWithBytes:&compSz    length:4]]; // offset +18
-            [fh writeData:[NSData dataWithBytes:&uncompSz  length:4]]; // offset +22
-            [fh writeData:[NSData dataWithBytes:&nameLen   length:2]];
-            [fh writeData:[NSData dataWithBytes:&extraLen  length:2]];
-            [fh writeData:entryNameData];
-
-            uint32_t crc = 0;
-            uint32_t compressedSize = 0;
-            uint32_t uncompressedSize = 0;
-            uint16_t compressionMethod = 0;
-
-            if (entryIsDir) {
-                // Directory entry — no data to write
-            } else {
-                NSInputStream *inputStream = [NSInputStream inputStreamWithFileAtPath:fullPath];
-                [inputStream open];
-
-                if (!inputStream || inputStream.streamStatus == NSStreamStatusError) {
-                    [inputStream close];
-                    continue;
-                }
-
-                // Stream-compress with zlib deflate
-                z_stream strm;
-                memset(&strm, 0, sizeof(strm));
-                deflateInit2(&strm, Z_DEFAULT_COMPRESSION, Z_DEFLATED, -15, 8, Z_DEFAULT_STRATEGY);
-
-                uint8_t inBuf[32768];
-                uint8_t outBuf[32768];
-                int flush = Z_NO_FLUSH;
-
-                while ([inputStream hasBytesAvailable]) {
-                    NSInteger bytesRead = [inputStream read:inBuf maxLength:sizeof(inBuf)];
-                    if (bytesRead <= 0) break;
-
-                    crc = (uint32_t)crc32((uLong)crc, inBuf, (uInt)bytesRead);
-                    uncompressedSize += (uint32_t)bytesRead;
-
-                    strm.next_in = inBuf;
-                    strm.avail_in = (uInt)bytesRead;
-
-                    if (![inputStream hasBytesAvailable]) {
-                        flush = Z_FINISH;
-                    }
-
-                    do {
-                        strm.next_out = outBuf;
-                        strm.avail_out = sizeof(outBuf);
-                        deflate(&strm, flush);
-                        NSUInteger produced = sizeof(outBuf) - strm.avail_out;
-                        if (produced > 0) {
-                            [fh writeData:[NSData dataWithBytes:outBuf length:produced]];
-                            compressedSize += (uint32_t)produced;
-                        }
-                    } while (strm.avail_out == 0);
-                }
-
-                // Finalize deflate if we didn't hit Z_FINISH yet
-                if (flush != Z_FINISH) {
-                    strm.next_in = NULL;
-                    strm.avail_in = 0;
-                    do {
-                        strm.next_out = outBuf;
-                        strm.avail_out = sizeof(outBuf);
-                        deflate(&strm, Z_FINISH);
-                        NSUInteger produced = sizeof(outBuf) - strm.avail_out;
-                        if (produced > 0) {
-                            [fh writeData:[NSData dataWithBytes:outBuf length:produced]];
-                            compressedSize += (uint32_t)produced;
-                        }
-                    } while (strm.avail_out == 0);
-                }
-
-                deflateEnd(&strm);
-                [inputStream close];
-                compressionMethod = 8;
-            }
-
-            // Patch the local file header with actual CRC, sizes, method
-            unsigned long long currentPos = [fh offsetInFile];
-            uint16_t methLE   = CFSwapInt16HostToLittle(compressionMethod);
-            uint32_t crcPatch = CFSwapInt32HostToLittle(crc);
-            uint32_t csPatch  = CFSwapInt32HostToLittle(compressedSize);
-            uint32_t usPatch  = CFSwapInt32HostToLittle(uncompressedSize);
-
-            [fh seekToFileOffset:localHeaderOffset + 8];
-            [fh writeData:[NSData dataWithBytes:&methLE    length:2]];
-            [fh seekToFileOffset:localHeaderOffset + 10]; // skip modTime
-            [fh seekToFileOffset:localHeaderOffset + 14];
-            [fh writeData:[NSData dataWithBytes:&crcPatch  length:4]];
-            [fh writeData:[NSData dataWithBytes:&csPatch   length:4]];
-            [fh writeData:[NSData dataWithBytes:&usPatch   length:4]];
-
-            [fh seekToFileOffset:currentPos]; // restore position
-
-            [centralDirectory addObject:@{
-                @"name":            entryNameData,
-                @"method":          @(compressionMethod),
-                @"crc":             @(crc),
-                @"compSize":        @(compressedSize),
-                @"uncompSize":      @(uncompressedSize),
-                @"localOffset":     @(localHeaderOffset),
-            }];
-        }
-
-        // Central directory
-        uint32_t cdOffset = (uint32_t)[fh offsetInFile];
-        for (NSDictionary *entry in centralDirectory) {
-            NSData *nameData = entry[@"name"];
-            uint16_t nameLen = (uint16_t)nameData.length;
-            uint32_t cdSig   = CFSwapInt32HostToLittle(0x02014b50);
-            uint16_t verMade = CFSwapInt16HostToLittle(20);
-            uint16_t verNeeded = CFSwapInt16HostToLittle(20);
-            uint16_t flags   = 0;
-            uint16_t meth    = CFSwapInt16HostToLittle((uint16_t)[entry[@"method"] unsignedShortValue]);
-            uint16_t modTime = 0, modDate = 0;
-            uint32_t crcLE   = CFSwapInt32HostToLittle((uint32_t)[entry[@"crc"] unsignedIntValue]);
-            uint32_t compSz  = CFSwapInt32HostToLittle((uint32_t)[entry[@"compSize"] unsignedIntValue]);
-            uint32_t uncompSz = CFSwapInt32HostToLittle((uint32_t)[entry[@"uncompSize"] unsignedIntValue]);
-            uint16_t extraLen = 0, commentLen = 0;
-            uint16_t disk    = 0;
-            uint16_t intAttr = 0;
-            uint32_t extAttr = 0;
-            uint32_t localOff = CFSwapInt32HostToLittle((uint32_t)[entry[@"localOffset"] unsignedIntValue]);
-
-            [fh writeData:[NSData dataWithBytes:&cdSig      length:4]];
-            [fh writeData:[NSData dataWithBytes:&verMade    length:2]];
-            [fh writeData:[NSData dataWithBytes:&verNeeded  length:2]];
-            [fh writeData:[NSData dataWithBytes:&flags      length:2]];
-            [fh writeData:[NSData dataWithBytes:&meth       length:2]];
-            [fh writeData:[NSData dataWithBytes:&modTime    length:2]];
-            [fh writeData:[NSData dataWithBytes:&modDate    length:2]];
-            [fh writeData:[NSData dataWithBytes:&crcLE      length:4]];
-            [fh writeData:[NSData dataWithBytes:&compSz     length:4]];
-            [fh writeData:[NSData dataWithBytes:&uncompSz   length:4]];
-            [fh writeData:[NSData dataWithBytes:&nameLen    length:2]];
-            [fh writeData:[NSData dataWithBytes:&extraLen   length:2]];
-            [fh writeData:[NSData dataWithBytes:&commentLen length:2]];
-            [fh writeData:[NSData dataWithBytes:&disk       length:2]];
-            [fh writeData:[NSData dataWithBytes:&intAttr    length:2]];
-            [fh writeData:[NSData dataWithBytes:&extAttr    length:4]];
-            [fh writeData:[NSData dataWithBytes:&localOff   length:4]];
-            [fh writeData:nameData];
-        }
-
-        uint32_t cdSize   = CFSwapInt32HostToLittle((uint32_t)([fh offsetInFile] - cdOffset));
-        uint32_t cdOffLE  = CFSwapInt32HostToLittle(cdOffset);
-        uint16_t numEntries = CFSwapInt16HostToLittle((uint16_t)centralDirectory.count);
-        uint16_t commentLen = 0;
-
-        // End of central directory record
-        uint32_t eocdSig = CFSwapInt32HostToLittle(0x06054b50);
-        uint16_t disk = 0;
-        [fh writeData:[NSData dataWithBytes:&eocdSig    length:4]];
-        [fh writeData:[NSData dataWithBytes:&disk       length:2]];
-        [fh writeData:[NSData dataWithBytes:&disk       length:2]];
-        [fh writeData:[NSData dataWithBytes:&numEntries length:2]];
-        [fh writeData:[NSData dataWithBytes:&numEntries length:2]];
-        [fh writeData:[NSData dataWithBytes:&cdSize     length:4]];
-        [fh writeData:[NSData dataWithBytes:&cdOffLE    length:4]];
-        [fh writeData:[NSData dataWithBytes:&commentLen length:2]];
-
-        [fh closeFile];
-        resolve(@{@"success": @YES, @"zipPath": destPath});
     });
 }
 
@@ -2009,7 +2046,7 @@ RCT_EXPORT_METHOD(zip:(NSString *)sourcePath
             return;
         }
 
-        NSString *hashValue = [self calculateChecksumForPath:filePath algorithm:[algorithm uppercaseString]];
+        NSString *hashValue = FTKChecksum(filePath, [algorithm uppercaseString]);
         if (!hashValue) {
             resolve(@{@"success": @NO, @"error": @"Failed to compute hash"});
             return;
@@ -2106,20 +2143,55 @@ RCT_EXPORT_METHOD(saveToMediaStore:(NSDictionary *)options
     NSString *mediaType = options[@"mediaType"] ?: @"download";
 
     if ([mediaType isEqualToString:@"image"] || [mediaType isEqualToString:@"video"]) {
-        // Use Photos framework for images and videos
-        [PHPhotoLibrary requestAuthorization:^(PHAuthorizationStatus status) {
+        // Use Photos framework for images and videos.
+        // Saving alone needs only add-only access (NSPhotoLibraryAddUsageDescription);
+        // finding or creating an album needs read-write (NSPhotoLibraryUsageDescription).
+        // Requesting an access level whose Info.plist key is missing kills the app,
+        // so check first and report it instead.
+        NSString *album = options[@"album"];
+        if (![album isKindOfClass:[NSString class]] || album.length == 0) album = nil;
+        NSString *usageKey = album ? @"NSPhotoLibraryUsageDescription" : @"NSPhotoLibraryAddUsageDescription";
+        id usage = [[NSBundle mainBundle] objectForInfoDictionaryKey:usageKey];
+        if (![usage isKindOfClass:[NSString class]] || [usage length] == 0) {
+            resolve(@{@"success": @NO, @"error": [NSString stringWithFormat:@"Missing %@ in Info.plist", usageKey]});
+            return;
+        }
+
+        BOOL isImage = [mediaType isEqualToString:@"image"];
+        PHAccessLevel accessLevel = album ? PHAccessLevelReadWrite : PHAccessLevelAddOnly;
+        [PHPhotoLibrary requestAuthorizationForAccessLevel:accessLevel handler:^(PHAuthorizationStatus status) {
             if (status != PHAuthorizationStatusAuthorized && status != PHAuthorizationStatusLimited) {
                 resolve(@{@"success": @NO, @"error": @"Photo library access denied"});
                 return;
             }
-            
+
+            PHAssetCollection *existingAlbum = nil;
+            if (album) {
+                PHFetchResult<PHAssetCollection *> *albums =
+                    [PHAssetCollection fetchAssetCollectionsWithType:PHAssetCollectionTypeAlbum
+                                                             subtype:PHAssetCollectionSubtypeAlbumRegular
+                                                             options:nil];
+                for (PHAssetCollection *collection in albums) {
+                    if ([collection.localizedTitle isEqualToString:album]) {
+                        existingAlbum = collection;
+                        break;
+                    }
+                }
+            }
+
             PHPhotoLibrary *photoLibrary = [PHPhotoLibrary sharedPhotoLibrary];
             [photoLibrary performChanges:^{
                 NSURL *fileURL = [NSURL fileURLWithPath:filePath];
-                if ([mediaType isEqualToString:@"image"]) {
-                    [PHAssetChangeRequest creationRequestForAssetFromImageAtFileURL:fileURL];
-                } else {
-                    [PHAssetChangeRequest creationRequestForAssetFromVideoAtFileURL:fileURL];
+                PHAssetChangeRequest *assetRequest = isImage
+                    ? [PHAssetChangeRequest creationRequestForAssetFromImageAtFileURL:fileURL]
+                    : [PHAssetChangeRequest creationRequestForAssetFromVideoAtFileURL:fileURL];
+                if (album) {
+                    // Same change block, so the asset and its album membership land together.
+                    PHAssetCollectionChangeRequest *albumRequest = existingAlbum
+                        ? [PHAssetCollectionChangeRequest changeRequestForAssetCollection:existingAlbum]
+                        : [PHAssetCollectionChangeRequest creationRequestForAssetCollectionWithTitle:album];
+                    PHObjectPlaceholder *placeholder = assetRequest.placeholderForCreatedAsset;
+                    if (placeholder) [albumRequest addAssets:@[placeholder]];
                 }
             } completionHandler:^(BOOL success, NSError *error) {
                 if (success) {
@@ -2148,6 +2220,304 @@ RCT_EXPORT_METHOD(saveToMediaStore:(NSDictionary *)options
             }
         });
     }
+}
+
+@end
+
+// ─── FTKBackgroundSessionProxy ────────────────────────────────────────────────
+
+@implementation FTKBackgroundSessionProxy {
+    NSMutableArray *_completionHandlers;       // guarded by @synchronized(self)
+    BOOL _eventsFinishedWithoutHandler;        // guarded by @synchronized(self)
+}
+
+/**
+ * Registered at image load — before UIApplicationMain — so the app delegate's
+ * handleEventsForBackgroundURLSession notification is never missed, even when
+ * the system relaunches the app in the background before React starts.
+ */
++ (void)load {
+    static id observer;
+    observer = [[NSNotificationCenter defaultCenter]
+        addObserverForName:FTKBackgroundEventsNotification
+                    object:nil
+                     queue:nil
+                usingBlock:^(NSNotification *note) {
+        NSString *identifier = note.userInfo[@"identifier"];
+        id handler = note.userInfo[@"completionHandler"];
+        if (![identifier isKindOfClass:[NSString class]] ||
+            ![identifier isEqualToString:FTKBackgroundSessionIdentifier()]) return; // another library's session
+        if (![handler isKindOfClass:NSClassFromString(@"NSBlock")]) return;
+        [[FTKBackgroundSessionProxy shared] addCompletionHandler:handler];
+    }];
+}
+
++ (instancetype)shared {
+    static FTKBackgroundSessionProxy *proxy;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        proxy = [FTKBackgroundSessionProxy new];
+        proxy->_completionHandlers = [NSMutableArray new];
+        NSURLSessionConfiguration *config =
+            [NSURLSessionConfiguration backgroundSessionConfigurationWithIdentifier:FTKBackgroundSessionIdentifier()];
+        config.discretionary = NO;
+        config.sessionSendsLaunchEvents = YES;
+        // Never invalidated: it must live as long as the process.
+        proxy->_session = [NSURLSession sessionWithConfiguration:config delegate:proxy delegateQueue:nil];
+        [proxy reconcileInheritedDownloads];
+    });
+    return proxy;
+}
+
+/**
+ * Drops persisted entries from earlier launches whose task no longer exists
+ * (paused when the app was killed — resume data is memory-only — or discarded
+ * by the system) and tells JS with onDownloadError "DOWNLOAD_LOST".
+ *
+ * Entries written by this launch are skipped, so a download being started right
+ * now can never be mistaken for a lost one. The decision runs on the session's
+ * serial delegate queue, the same queue that delivers completions, so it cannot
+ * interleave with a finishing download; the grace period gives tasks whose
+ * results are still queued from the relaunch time to be reported first.
+ */
+- (void)reconcileInheritedDownloads {
+    NSURLSession *session = _session;
+    __weak FTKBackgroundSessionProxy *weakSelf = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, kFTKReconcileDelaySeconds * (int64_t)NSEC_PER_SEC),
+                   dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        [session getAllTasksWithCompletionHandler:^(NSArray<__kindof NSURLSessionTask *> *tasks) {
+            NSMutableSet<NSString *> *liveIds = [NSMutableSet new];
+            for (NSURLSessionTask *task in tasks) {
+                if (task.taskDescription) [liveIds addObject:task.taskDescription];
+            }
+            [session.delegateQueue addOperationWithBlock:^{
+                NSDictionary *all = nil;
+                @synchronized (FTKMetaLock()) {
+                    all = [[NSUserDefaults standardUserDefaults] dictionaryForKey:FTKBackgroundMetaKey];
+                }
+                for (NSString *downloadId in all) {
+                    NSDictionary *meta = all[downloadId];
+                    if (![meta isKindOfClass:[NSDictionary class]]) continue;
+                    if ([meta[@"launch"] isEqual:FTKLaunchId()] || [liveIds containsObject:downloadId]) continue;
+                    if (!FTKLoadMeta(downloadId)) continue; // finished meanwhile
+                    FTKRemoveMeta(downloadId);
+                    NSDictionary *body = @{@"success": @NO, @"downloadId": downloadId, @"error": @"DOWNLOAD_LOST"};
+                    FileToolkit *module = weakSelf.module;
+                    if (module) {
+                        [module emitEvent:@"onDownloadError" body:body bufferIfUnheard:YES];
+                    } else {
+                        @synchronized (FTKEventLock()) {
+                            FTKBufferEventLocked(@"onDownloadError", body);
+                        }
+                    }
+                }
+            }];
+        }];
+    });
+}
+
+- (void)attachModule:(FileToolkit *)module {
+    @synchronized (self) {
+        self.module = module;
+    }
+}
+
+- (void)detachModule:(FileToolkit *)module {
+    // A reload may create the new instance before the old one is invalidated.
+    @synchronized (self) {
+        if (self.module == module) self.module = nil;
+    }
+}
+
+- (void)addCompletionHandler:(id)handler {
+    // +shared has created the session by now, which is what makes the system
+    // deliver the pending events in the first place.
+    void (^block)(void) = [handler copy];
+    BOOL callNow = NO;
+    @synchronized (self) {
+        if (_eventsFinishedWithoutHandler) {
+            // The session (created early by the module) already drained its events.
+            _eventsFinishedWithoutHandler = NO;
+            callNow = YES;
+        } else {
+            [_completionHandlers addObject:block];
+        }
+    }
+    if (callNow) dispatch_async(dispatch_get_main_queue(), block);
+}
+
+- (void)URLSessionDidFinishEventsForBackgroundURLSession:(NSURLSession *)session {
+    NSArray *handlers;
+    @synchronized (self) {
+        handlers = [_completionHandlers copy];
+        [_completionHandlers removeAllObjects];
+        if (handlers.count == 0) _eventsFinishedWithoutHandler = YES;
+    }
+    if (handlers.count == 0) return;
+    // UIKit requires the handler on the main thread. Finished files were already
+    // moved synchronously in didFinishDownloadingToURL:, so it is safe to suspend.
+    dispatch_async(dispatch_get_main_queue(), ^{
+        for (void (^handler)(void) in handlers) handler();
+    });
+}
+
+- (void)URLSession:(NSURLSession *)session
+      downloadTask:(NSURLSessionDownloadTask *)downloadTask
+      didWriteData:(int64_t)bytesWritten
+ totalBytesWritten:(int64_t)totalBytesWritten
+totalBytesExpectedToWrite:(int64_t)totalBytesExpectedToWrite {
+    [self.module URLSession:session
+               downloadTask:downloadTask
+               didWriteData:bytesWritten
+          totalBytesWritten:totalBytesWritten
+  totalBytesExpectedToWrite:totalBytesExpectedToWrite];
+}
+
+- (void)URLSession:(NSURLSession *)session
+      downloadTask:(NSURLSessionDownloadTask *)downloadTask
+didFinishDownloadingToURL:(NSURL *)location {
+    FileToolkit *module = self.module;
+    if (module) {
+        [module URLSession:session downloadTask:downloadTask didFinishDownloadingToURL:location];
+        return;
+    }
+    // No React instance (relaunched in the background, or between reloads): the
+    // file must still be moved before this returns. The event waits for JS.
+    NSString *downloadId = downloadTask.taskDescription;
+    if (downloadId.length == 0) return;
+    if (FTKWasCancelled(downloadId)) {
+        [[NSFileManager defaultManager] removeItemAtURL:location error:nil];
+        return;
+    }
+    BOOL isError = NO;
+    NSDictionary *result = FTKFinalizeDownload(downloadTask, location, downloadId, FTKLoadMeta(downloadId), &isError);
+    FTKRemoveMeta(downloadId);
+    @synchronized (FTKEventLock()) {
+        FTKBufferEventLocked(isError ? @"onDownloadError" : @"onDownloadComplete", result);
+    }
+}
+
+- (void)URLSession:(NSURLSession *)session
+              task:(NSURLSessionTask *)task
+didCompleteWithError:(NSError *)error {
+    FileToolkit *module = self.module;
+    if (module) {
+        [module URLSession:session task:task didCompleteWithError:error];
+        return;
+    }
+    // Success was handled in didFinishDownloadingToURL:. Without a module there
+    // is no retry state, so any real failure is final.
+    if (!error || FTKIsOwnCancellation(error)) return;
+    NSString *downloadId = task.taskDescription;
+    if (downloadId.length == 0 || FTKWasCancelled(downloadId)) return;
+    FTKRemoveMeta(downloadId);
+    @synchronized (FTKEventLock()) {
+        FTKBufferEventLocked(@"onDownloadError", @{
+            @"success": @NO,
+            @"downloadId": downloadId,
+            @"error": error.localizedDescription ?: @""
+        });
+    }
+}
+
+@end
+
+// ─── FTKBase64Fetch ───────────────────────────────────────────────────────────
+
+// All callbacks arrive on the session's serial delegate queue, so no locking.
+@implementation FTKBase64Fetch {
+    RCTPromiseResolveBlock _resolve;
+    NSMutableData *_data;
+    NSString *_mimeType;
+    BOOL _settled;
+}
+
+- (instancetype)initWithResolve:(RCTPromiseResolveBlock)resolve {
+    if (self = [super init]) {
+        _resolve = [resolve copy];
+    }
+    return self;
+}
+
+- (void)settle:(NSDictionary *)result {
+    if (_settled) return;
+    _settled = YES;
+    _data = nil;
+    _resolve(result);
+}
+
+- (void)URLSession:(NSURLSession *)session
+                          task:(NSURLSessionTask *)task
+    willPerformHTTPRedirection:(NSHTTPURLResponse *)response
+                    newRequest:(NSURLRequest *)request
+             completionHandler:(void (^)(NSURLRequest *))completionHandler {
+    completionHandler(FTKRedirectRequest(task, request));
+}
+
+- (void)settleTooLarge {
+    [self settle:@{@"success": @NO, @"error": @"Response exceeds 50 MB limit for urlToBase64"}];
+}
+
+- (void)URLSession:(NSURLSession *)session
+          dataTask:(NSURLSessionDataTask *)dataTask
+didReceiveResponse:(NSURLResponse *)response
+ completionHandler:(void (^)(NSURLSessionResponseDisposition))completionHandler {
+    NSHTTPURLResponse *httpResponse = [response isKindOfClass:[NSHTTPURLResponse class]]
+        ? (NSHTTPURLResponse *)response : nil;
+    if (httpResponse && (httpResponse.statusCode < 200 || httpResponse.statusCode >= 300)) {
+        [self settle:@{@"success": @NO, @"error": [NSString stringWithFormat:@"HTTP %ld", (long)httpResponse.statusCode]}];
+        completionHandler(NSURLSessionResponseCancel);
+        return;
+    }
+    // Reject up front when the server announces the size.
+    if (response.expectedContentLength > kFTKBase64MaxBytes) {
+        [self settleTooLarge];
+        completionHandler(NSURLSessionResponseCancel);
+        return;
+    }
+    _mimeType = response.MIMEType;
+    _data = [NSMutableData dataWithCapacity:response.expectedContentLength > 0
+                                            ? (NSUInteger)response.expectedContentLength : 0];
+    completionHandler(NSURLSessionResponseAllow);
+}
+
+- (void)URLSession:(NSURLSession *)session dataTask:(NSURLSessionDataTask *)dataTask didReceiveData:(NSData *)data {
+    if (_settled) return;
+    if (!_data) _data = [NSMutableData new];
+    // …and while receiving, for chunked responses or a lying Content-Length.
+    if ((long long)_data.length + (long long)data.length > kFTKBase64MaxBytes) {
+        [self settleTooLarge];
+        [dataTask cancel];
+        return;
+    }
+    [_data appendData:data];
+}
+
+- (void)URLSession:(NSURLSession *)session task:(NSURLSessionTask *)task didCompleteWithError:(NSError *)error {
+    if (_settled) return;
+    if (error) {
+        [self settle:@{@"success": @NO, @"error": error.localizedDescription ?: @"URL_TO_BASE64_ERROR"}];
+        return;
+    }
+    NSData *body = _data;
+    _data = nil;
+    if (body.length == 0) {
+        [self settle:@{@"success": @NO, @"error": @"No data received"}];
+        return;
+    }
+
+    // Get MIME type from response
+    NSString *mimeType = _mimeType ?: @"application/octet-stream";
+    NSString *base64String = [body base64EncodedStringWithOptions:0];
+    body = nil; // drop the raw bytes before building the data URI copy
+    NSString *dataUri = [NSString stringWithFormat:@"data:%@;base64,%@", mimeType, base64String];
+
+    [self settle:@{
+        @"success": @YES,
+        @"base64": base64String,
+        @"mimeType": mimeType,
+        @"dataUri": dataUri
+    }];
 }
 
 @end

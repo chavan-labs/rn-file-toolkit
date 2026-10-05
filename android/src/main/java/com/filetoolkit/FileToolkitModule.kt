@@ -1,78 +1,133 @@
 package com.filetoolkit
 
 import android.app.DownloadManager
+import android.content.ActivityNotFoundException
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Environment
+import android.os.SystemClock
+import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
 import android.content.BroadcastReceiver
 import android.content.IntentFilter
-import android.database.Cursor
-import android.os.Handler
-import android.os.Looper
 import android.os.Build
 import com.facebook.react.bridge.ReactApplicationContext
 import com.facebook.react.bridge.ReadableMap
 import com.facebook.react.bridge.Promise
 import com.facebook.react.bridge.Arguments
+import com.facebook.react.bridge.WritableMap
 import com.facebook.react.modules.core.DeviceEventManagerModule
+import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
+import java.io.IOException
+import java.io.InputStream
 import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLDecoder
 import java.security.MessageDigest
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.Executors
+import java.util.concurrent.ScheduledFuture
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
 import java.util.zip.ZipEntry
-import java.util.zip.ZipInputStream
 import java.util.zip.ZipOutputStream
 import kotlin.concurrent.thread
 import android.webkit.MimeTypeMap
 
 // ─── Per-download state ───────────────────────────────────────────────────────
 
-private data class DownloadState(
-  val url: String,
-  val fileName: String,
-  val isBackground: Boolean,
-  @Volatile var paused: Boolean = false,
-  @Volatile var cancelled: Boolean = false,
-  /** Bytes already written (for Range resume) */
-  @Volatile var bytesDownloaded: Long = 0L
-)
+/** State of one foreground download. The promise lives here, not in a map keyed
+ *  by downloadId, so a reused id can never settle another download's promise. */
+private class DownloadState(val promise: Promise) {
+  @Volatile var paused: Boolean = false
+  @Volatile var cancelled: Boolean = false
+  /** Connection currently in use, so pause/cancel can disconnect a blocked read. */
+  @Volatile var connection: HttpURLConnection? = null
+  private val outcome = AtomicReference<String?>(null)
+
+  /**
+   * The single running → finished transition ([OUTCOME_COMPLETED],
+   * [OUTCOME_FAILED] or [OUTCOME_CANCELLED]). Returns true for exactly one
+   * caller, who then owns settling [promise].
+   */
+  fun claim(result: String): Boolean = outcome.compareAndSet(null, result)
+  val result: String? get() = outcome.get()
+
+  /** Bumped by every [interrupt], so the thread can tell a forced disconnect
+   *  from a real EOF/error even if the flags were already reset by a resume. */
+  val interrupts = AtomicInteger()
+
+  /** Unblocks a read/connect in progress; the download thread then checks the flags. */
+  fun interrupt() {
+    interrupts.incrementAndGet()
+    try { connection?.disconnect() } catch (_: Exception) {}
+  }
+}
+
+private const val OUTCOME_COMPLETED = "COMPLETED"
+private const val OUTCOME_FAILED = "FAILED"
+private const val OUTCOME_CANCELLED = "CANCELLED"
+
+/** ".<name>.<uuid>.part" — see [FileToolkitModule.download]. */
+private val PARTIAL_FILE_NAME = Regex("""\..*\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.part""")
+
+/** "bytes <start>-<end>/<total|*>" */
+private val CONTENT_RANGE = Regex("""bytes\s+(\d+)-(\d+)/(\d+|\*)""", RegexOption.IGNORE_CASE)
 
 class FileToolkitModule(private val reactContext: ReactApplicationContext) :
   NativeFileToolkitSpec(reactContext) {
 
-  // downloadId → state
+  // downloadId → state (foreground downloads only)
   private val activeDownloads = ConcurrentHashMap<String, DownloadState>()
   // downloadId → background DownloadManager ID
   private val bgDownloadIds = ConcurrentHashMap<String, Long>()
-  // Stored promises for foreground downloads — resolved on completion (not early)
-  private val foregroundPromises = ConcurrentHashMap<String, Promise>()
+  // Absolute paths of partial files owned by a running foreground download thread
+  // (including one that was cancelled but has not cleaned up yet).
+  private val livePartFiles: MutableSet<String> = ConcurrentHashMap.newKeySet()
 
-  private val bgPollHandler = Handler(Looper.getMainLooper())
-  private val bgPollRunnable = object : Runnable {
-    override fun run() {
-      if (bgDownloadIds.isNotEmpty()) {
-        pollBackgroundDownloads()
-        bgPollHandler.postDelayed(this, 1500)
-      }
-      // Stop polling when no background downloads remain
-    }
+  /**
+   * Single background thread for everything DownloadManager-related: polling,
+   * finalisation and checksum verification. DownloadManager.query is a
+   * ContentProvider round-trip and hashing a large file takes seconds; neither
+   * may run on the main thread. Being single-threaded also serialises
+   * [finalizeBackground] calls coming from the poller and the receiver.
+   */
+  private val bgExecutor = Executors.newSingleThreadScheduledExecutor { r ->
+    Thread(r, "FileToolkit-bg").apply { isDaemon = true }
   }
+  // Guarded by bgExecutor.
+  private var bgPollFuture: ScheduledFuture<*>? = null
 
   private val downloadReceiver = object : BroadcastReceiver() {
     override fun onReceive(context: Context?, intent: Intent?) {
       if (intent?.action == DownloadManager.ACTION_DOWNLOAD_COMPLETE) {
         val id = intent.getLongExtra(DownloadManager.EXTRA_DOWNLOAD_ID, -1L)
-        handleBackgroundDownloadComplete(id)
+        // The receiver is exported (DownloadManager is another app), so the
+        // broadcast may be forged: finalizeBackground re-queries the real status.
+        runOnBgExecutor { finalizeBackground(id) }
       }
     }
   }
+
+  /**
+   * Background terminal events emitted before JS subscribed to them (e.g. a
+   * download that finished while the process was dead and is reported right
+   * after launch) would otherwise be dropped by RCTDeviceEventEmitter. They are
+   * held here until the first addListener() for that event name. Foreground
+   * events are never buffered: their promise already reports the outcome.
+   * Guarded by itself.
+   */
+  private val pendingEvents = ArrayDeque<Pair<String, WritableMap>>()
+  // Guarded by pendingEvents.
+  private val subscribedEvents = HashSet<String>()
+  private val maxPendingEvents = 100
 
   /**
    * Persistent DownloadManager id → toolkit downloadId mapping.
@@ -81,19 +136,26 @@ class FileToolkitModule(private val reactContext: ReactApplicationContext) :
    * memory. It also must not live in the notification description: callers can
    * override that via `notificationDescription`, which used to silently break
    * every progress/complete event for the download.
+   *
+   * Keys: "<bgId>" → downloadId, and "<bgId>.checksum" → "<ALGORITHM>:<hash>".
    */
   private val bgPrefs by lazy {
     reactContext.getSharedPreferences("rn_file_toolkit_bg", Context.MODE_PRIVATE)
   }
 
-  private fun rememberBackgroundDownload(downloadId: String, bgId: Long) {
+  private fun rememberBackgroundDownload(downloadId: String, bgId: Long, checksum: String?) {
     bgDownloadIds[downloadId] = bgId
-    bgPrefs.edit().putString(bgId.toString(), downloadId).apply()
+    bgPrefs.edit().apply {
+      putString(bgId.toString(), downloadId)
+      if (checksum != null) putString("$bgId.checksum", checksum)
+    }.apply()
   }
 
-  private fun forgetBackgroundDownload(downloadId: String, bgId: Long) {
-    bgDownloadIds.remove(downloadId)
-    bgPrefs.edit().remove(bgId.toString()).apply()
+  /** Stops tracking a background download. Returns false if it was not (or no longer) tracked. */
+  private fun forgetBackgroundDownload(downloadId: String, bgId: Long): Boolean {
+    val removed = bgDownloadIds.remove(downloadId, bgId)
+    bgPrefs.edit().remove(bgId.toString()).remove("$bgId.checksum").apply()
+    return removed
   }
 
   /** Resolves a DownloadManager id back to the toolkit downloadId, or null. */
@@ -103,7 +165,8 @@ class FileToolkitModule(private val reactContext: ReactApplicationContext) :
   }
 
   init {
-    // Re-adopt downloads started before the process was killed.
+    // Re-adopt downloads started before the process was killed. Their completion
+    // broadcast may have been sent while we were dead, so polling picks them up.
     try {
       bgPrefs.all.forEach { (key, value) ->
         val bgId = key.toLongOrNull()
@@ -117,6 +180,16 @@ class FileToolkitModule(private val reactContext: ReactApplicationContext) :
     } else {
       reactContext.registerReceiver(downloadReceiver, filter)
     }
+    if (bgDownloadIds.isNotEmpty()) ensureBackgroundPolling()
+    // Partial files whose thread died with the process are never cleaned up
+    // otherwise. None can be live yet, but check anyway.
+    runOnBgExecutor {
+      for (dir in toolkitDirs()) {
+        dir.listFiles()?.forEach { f ->
+          if (f.isFile && isPartialFile(f) && f.absolutePath !in livePartFiles) f.delete()
+        }
+      }
+    }
   }
 
   override fun invalidate() {
@@ -124,31 +197,56 @@ class FileToolkitModule(private val reactContext: ReactApplicationContext) :
     try {
       reactContext.unregisterReceiver(downloadReceiver)
     } catch (_: Exception) {} // Receiver may not be registered
-    bgPollHandler.removeCallbacks(bgPollRunnable)
+    synchronized(bgExecutor) {
+      bgPollFuture?.cancel(false)
+      bgPollFuture = null
+      bgExecutor.shutdownNow()
+    }
     // Stop foreground download threads and settle their promises, otherwise a dev
     // reload leaves orphaned threads writing files for a bridge that is gone.
-    activeDownloads.values.forEach { it.cancelled = true }
-    activeDownloads.clear()
-    foregroundPromises.keys.toList().forEach { id ->
-      foregroundPromises.remove(id)?.resolve(Arguments.createMap().apply {
-        putBoolean("success", false)
-        putString("downloadId", id)
-        putString("error", "CANCELLED")
-      })
+    activeDownloads.forEach { (id, state) ->
+      state.cancelled = true
+      state.interrupt()
+      if (state.claim(OUTCOME_CANCELLED)) state.promise.resolve(cancelledResult(id))
     }
+    activeDownloads.clear()
   }
 
   override fun addListener(eventName: String?) {
-    // No-op - Required by React Native NativeEventEmitter
+    // Called by NativeEventEmitter for every JS subscription. The first one for
+    // an event name releases whatever was buffered for it.
+    if (eventName == null) return
+    val flush = synchronized(pendingEvents) {
+      if (!subscribedEvents.add(eventName)) return
+      val matching = pendingEvents.filter { it.first == eventName }
+      pendingEvents.removeAll { it.first == eventName }
+      matching
+    }
+    flush.forEach { (event, map) -> sendEvent(event, map) }
   }
 
   override fun removeListeners(count: Double) {
-    // No-op - Required by React Native NativeEventEmitter
+    // No-op: buffering only needs to know that JS subscribed once. Events after
+    // the last listener is removed are dropped, as before.
   }
 
   // ─── Helpers ───────────────────────────────────────────────────────────────
 
-  private fun emit(event: String, map: com.facebook.react.bridge.WritableMap) {
+  /** [bufferUntilSubscribed]: only for background (DownloadManager) terminal events. */
+  private fun emit(event: String, map: WritableMap, bufferUntilSubscribed: Boolean = false) {
+    if (bufferUntilSubscribed) {
+      synchronized(pendingEvents) {
+        if (event !in subscribedEvents) {
+          pendingEvents.addLast(event to map)
+          if (pendingEvents.size > maxPendingEvents) pendingEvents.removeFirst()
+          return
+        }
+      }
+    }
+    sendEvent(event, map)
+  }
+
+  private fun sendEvent(event: String, map: WritableMap) {
     // Downloads run on background threads and can outlive the React instance
     // (dev reload, activity teardown). Emitting into a dead instance throws and
     // crashes the app, so bail out instead.
@@ -160,6 +258,12 @@ class FileToolkitModule(private val reactContext: ReactApplicationContext) :
     } catch (_: Exception) {
       // React instance torn down between the check and the emit — nothing to do.
     }
+  }
+
+  private fun cancelledResult(downloadId: String): WritableMap = Arguments.createMap().apply {
+    putBoolean("success", false)
+    putString("downloadId", downloadId)
+    putString("error", "CANCELLED")
   }
 
   /**
@@ -230,6 +334,9 @@ class FileToolkitModule(private val reactContext: ReactApplicationContext) :
     File(reactContext.getExternalFilesDir(Environment.DIRECTORY_DOCUMENTS) ?: reactContext.filesDir, "RNFileToolkit")
   ).distinctBy { it.absolutePath }
 
+  /** In-progress foreground download (see [download]); never a finished file. */
+  private fun isPartialFile(f: File) = PARTIAL_FILE_NAME.matches(f.name)
+
   private fun getDestinationFile(fileName: String, destination: String?): File {
     return File(getDestinationDir(destination), sanitizeFileName(fileName))
   }
@@ -270,29 +377,55 @@ class FileToolkitModule(private val reactContext: ReactApplicationContext) :
    *   follow http→https (and https→http) redirects, which is exactly what CDNs
    *   and pre-signed storage URLs use. Without this the caller sees an empty
    *   file or a 30x "server error".
+   * - **Credentials on redirect.** Every redirect is followed here, under one
+   *   policy: once the origin changes (scheme, host or port — so including an
+   *   https→http downgrade), `Authorization`, `Cookie` and
+   *   `Proxy-Authorization` are no longer sent. The platform only drops
+   *   `Authorization`, and only for the redirects it follows itself.
    */
   private fun openDownloadConnection(
     urlString: String,
     headersMap: ReadableMap?,
-    resumeFrom: Long
+    resumeFrom: Long,
+    ifRange: String? = null,
+    state: DownloadState? = null
   ): HttpURLConnection {
-    var currentUrl = URL(urlString)
+    val originalUrl = URL(urlString)
+    var currentUrl = originalUrl
     var redirects = 0
     while (true) {
+      val sameOrigin = currentUrl.protocol.equals(originalUrl.protocol, ignoreCase = true) &&
+        currentUrl.host.equals(originalUrl.host, ignoreCase = true) &&
+        currentUrl.port.let { if (it == -1) currentUrl.defaultPort else it } ==
+        originalUrl.port.let { if (it == -1) originalUrl.defaultPort else it }
       val connection = currentUrl.openConnection() as HttpURLConnection
       connection.connectTimeout = connectTimeoutMs
       connection.readTimeout = readTimeoutMs
-      connection.instanceFollowRedirects = true
+      connection.instanceFollowRedirects = false
       // Ask for an unencoded body: HttpURLConnection transparently gunzips a
       // gzipped response but still reports the *compressed* Content-Length,
       // which makes progress percentages run past 100%.
       connection.setRequestProperty("Accept-Encoding", "identity")
 
       headersMap?.toHashMap()?.forEach { (key, value) ->
-        if (value is String) connection.setRequestProperty(key, value)
+        if (value is String && (sameOrigin || key.lowercase() !in CREDENTIAL_HEADERS)) {
+          connection.setRequestProperty(key, value)
+        }
       }
       if (resumeFrom > 0) {
         connection.setRequestProperty("Range", "bytes=$resumeFrom-")
+        // If the resource changed since the partial was written, the server
+        // answers 200 with the full body instead of splicing mismatched bytes.
+        if (ifRange != null) connection.setRequestProperty("If-Range", ifRange)
+      }
+      if (state != null) {
+        // Publish before connecting so pause/cancel can abort a stalled connect.
+        // Re-check afterwards: either they see this connection or we see the flag.
+        state.connection = connection
+        if (state.paused || state.cancelled) {
+          connection.disconnect()
+          throw java.io.IOException("Download paused or cancelled")
+        }
       }
       connection.connect()
 
@@ -302,7 +435,7 @@ class FileToolkitModule(private val reactContext: ReactApplicationContext) :
         code == HttpURLConnection.HTTP_SEE_OTHER ||
         code == 307 || code == 308
       val location = connection.getHeaderField("Location")
-      if (!isRedirect || location == null || redirects >= 5) return connection
+      if (!isRedirect || location == null || redirects >= MAX_REDIRECTS) return connection
 
       connection.disconnect()
       currentUrl = URL(currentUrl, location)
@@ -333,17 +466,23 @@ class FileToolkitModule(private val reactContext: ReactApplicationContext) :
     val checksumMap = options.takeIf { it.hasKey("checksum") }?.getMap("checksum")
 
     // ─── Retry config ──────────────────────────────────────────────────────
-    val retryMap = options.takeIf { it.hasKey("retry") }?.getMap("retry")
-    val maxAttempts = retryMap?.takeIf { it.hasKey("attempts") }?.getInt("attempts") ?: 0
-    val baseDelay = retryMap?.takeIf { it.hasKey("delay") }?.getInt("delay") ?: 1000
+    val retryMap = options.takeIf { it.hasKey("retry") && !it.isNull("retry") }?.getMap("retry")
+    val maxAttempts = retryMap?.takeIf { it.hasKey("attempts") && !it.isNull("attempts") }?.getInt("attempts") ?: 0
+    // hasKey alone is not enough: `delay: undefined` can arrive as an explicit null.
+    // 0 is a valid delay (retry immediately).
+    val baseDelay = retryMap?.takeIf { it.hasKey("delay") && !it.isNull("delay") }
+      ?.getDouble("delay")?.toLong()?.coerceAtLeast(0L) ?: 1000L
 
-    val state = DownloadState(url = urlString, fileName = fileName, isBackground = isBackground)
-    // Only add foreground downloads to activeDownloads — the state object is used
-    // exclusively by the foreground pause/cancel logic.  Background downloads are
-    // managed through bgDownloadIds / DownloadManager; adding them here created a
-    // race window where cancelDownload could see the state but not yet the bgId.
-    if (!isBackground) {
-      activeDownloads[downloadId] = state
+    // A downloadId is a handle for pause/resume/cancel and events, so it must
+    // be unique among running downloads. cancelDownload frees it synchronously.
+    val idInUse = Arguments.createMap().apply {
+      putBoolean("success", false)
+      putString("downloadId", downloadId)
+      putString("error", "DOWNLOAD_ID_IN_USE")
+    }
+    if (activeDownloads.containsKey(downloadId) || bgDownloadIds.containsKey(downloadId)) {
+      promise.resolve(idInUse)
+      return
     }
 
     if (isBackground) {
@@ -363,13 +502,14 @@ class FileToolkitModule(private val reactContext: ReactApplicationContext) :
           // Set destination — mirror the RNFileToolkit subdirectory used by getDestinationFile
           setDestinationUri(Uri.fromFile(File(getBackgroundDestinationDir(destination), fileName)))
         }
+        // Persisted with the id so the checksum is still verified when the
+        // download finishes after a process restart.
+        val checksum = checksumMap?.let { m ->
+          m.getString("hash")?.let { hash -> "${m.getString("algorithm")?.uppercase() ?: "MD5"}:$hash" }
+        }
         val bgId = dm.enqueue(request)
-        rememberBackgroundDownload(downloadId, bgId)
-        activeDownloads.remove(downloadId)
-
-        // Start polling if not running
-        bgPollHandler.removeCallbacks(bgPollRunnable)
-        bgPollHandler.post(bgPollRunnable)
+        rememberBackgroundDownload(downloadId, bgId, checksum)
+        ensureBackgroundPolling()
 
         promise.resolve(Arguments.createMap().apply {
           putBoolean("success", true)
@@ -378,7 +518,6 @@ class FileToolkitModule(private val reactContext: ReactApplicationContext) :
       } catch (e: Exception) {
         // DownloadManager rejects unsupported schemes (file://, data:) and can be
         // disabled by the user, both of which throw rather than returning an id.
-        activeDownloads.remove(downloadId)
         promise.resolve(Arguments.createMap().apply {
           putBoolean("success", false)
           putString("downloadId", downloadId)
@@ -388,209 +527,328 @@ class FileToolkitModule(private val reactContext: ReactApplicationContext) :
       return
     }
 
-    // Foreground: store promise — resolve on completion (matches iOS behaviour)
-    foregroundPromises[downloadId] = promise
+    // Foreground: the promise is resolved on completion (matches iOS behaviour).
+    // Every exit path — completion, failure, cancelDownload, invalidate — goes
+    // through state.claim(), so it is settled exactly once.
+    val state = DownloadState(promise)
+    if (activeDownloads.putIfAbsent(downloadId, state) != null) {
+      promise.resolve(idInUse)
+      return
+    }
 
     thread {
-      var attempt = 0
-      var lastError = "NETWORK_ERROR"
+      fun fail(error: String, claimed: Boolean = false) {
+        if (!claimed && !state.claim(OUTCOME_FAILED)) return
+        state.promise.resolve(Arguments.createMap().apply {
+          putBoolean("success", false)
+          putString("downloadId", downloadId)
+          putString("error", error)
+        })
+        emit("onDownloadError", Arguments.createMap().apply {
+          putBoolean("success", false)
+          putString("downloadId", downloadId)
+          putString("error", error)
+        })
+      }
 
-      retryLoop@ while (true) {
-        // ── Before retry: emit event + wait with exponential backoff ───────
-        if (attempt > 0) {
-          state.bytesDownloaded = 0L          // fresh download on retry
-          getDestinationFile(fileName, destination).delete() // Fix #5: Delete corrupted partial file
+      fun settleCancelled() {
+        if (state.claim(OUTCOME_CANCELLED)) state.promise.resolve(cancelledResult(downloadId))
+      }
 
-          val delayMs = (baseDelay.toLong() * (1L shl (attempt - 1))).coerceAtMost(30_000L)
-          // Bug #5 fix: emit retry event BEFORE the delay so JS callback fires immediately
-          val retryEvt = Arguments.createMap().apply {
-            putString("downloadId", downloadId)
-            putString("url", urlString)
-            putInt("attempt", attempt)
-            putString("error", lastError)
+      val destDir: File
+      try {
+        destDir = getDestinationDir(destination)
+      } catch (e: Exception) {
+        activeDownloads.remove(downloadId, state)
+        fail(e.message ?: "NETWORK_ERROR")
+        return@thread
+      }
+      val destFile = File(destDir, fileName)
+      // Each download writes to its own hidden partial file and is renamed into
+      // place only once complete and verified, so two downloads of the same name
+      // never interleave and a cancel only ever deletes its own bytes.
+      val partFile = File(destDir, ".${fileName.take(64)}.${UUID.randomUUID()}.part")
+      // Registered before the file exists so clearCache / the startup sweep never
+      // delete it from under us.
+      livePartFiles.add(partFile.absolutePath)
+
+      try {
+        var attempt = 0
+        var retryPending = false
+        var lastError = "NETWORK_ERROR"
+        // Strong validator of the full response, sent as If-Range when resuming.
+        var validator: String? = null
+
+        retryLoop@ while (true) {
+          // ── Before retry: emit event + wait with exponential backoff ───────
+          if (retryPending) {
+            retryPending = false
+            val delayMs = (minOf(baseDelay, 30_000L) * (1L shl minOf(attempt - 1, 20))).coerceAtMost(30_000L)
+            // Bug #5 fix: emit retry event BEFORE the delay so JS callback fires immediately
+            val retryEvt = Arguments.createMap().apply {
+              putString("downloadId", downloadId)
+              putString("url", urlString)
+              putInt("attempt", attempt)
+              putString("error", lastError)
+            }
+            emit("onDownloadRetry", retryEvt)
+            // Interruptible retry delay — respects cancel
+            val deadline = System.currentTimeMillis() + delayMs
+            while (!state.cancelled && System.currentTimeMillis() < deadline) {
+              Thread.sleep(minOf(deadline - System.currentTimeMillis(), 100L).coerceAtLeast(0L))
+            }
           }
-          emit("onDownloadRetry", retryEvt)
-          // Interruptible retry delay — respects cancel and responds to pause
-          val deadline = System.currentTimeMillis() + delayMs
-          while (System.currentTimeMillis() < deadline) {
-            if (state.cancelled) break
-            Thread.sleep(minOf(deadline - System.currentTimeMillis(), 100L).coerceAtLeast(0L))
-          }
-          // Wait while paused (checked after the retry delay, also respects cancel)
+          // Paused: the connection is already closed and the partial file kept,
+          // so a pause of any length is fine. Wait (still honouring cancel).
           while (state.paused && !state.cancelled) {
             Thread.sleep(100L)
           }
-        }
-
-        try {
-          val resumeFrom = state.bytesDownloaded
-          val destFile = getDestinationFile(fileName, destination)
-
-          val connection = openDownloadConnection(urlString, headersMap, resumeFrom)
-
-          val responseCode = connection.responseCode
-          if (responseCode != HttpURLConnection.HTTP_OK && responseCode != HttpURLConnection.HTTP_PARTIAL) {
-            // Server error — do NOT retry (4xx/5xx are not transient)
-            connection.disconnect()
-            activeDownloads.remove(downloadId)
-            foregroundPromises.remove(downloadId)?.resolve(Arguments.createMap().apply {
-              putBoolean("success", false)
-              putString("downloadId", downloadId)
-              putString("error", "SERVER_ERROR: $responseCode")
-            })
-            emit("onDownloadError", Arguments.createMap().apply {
-              putBoolean("success", false)
-              putString("downloadId", downloadId)
-              putString("error", "SERVER_ERROR: $responseCode")
-            })
+          if (state.cancelled) {
+            settleCancelled()
             return@thread
           }
 
-          val contentLength = connection.getHeaderField("Content-Length")?.toLongOrNull() ?: -1L
-          val totalExpected = if (resumeFrom > 0) resumeFrom + contentLength else contentLength
-
-          // Bug #1 fix: always close streams via try-finally to prevent handle leaks between retries
-          val input = connection.inputStream
-          val output: FileOutputStream = if (resumeFrom > 0) {
-            FileOutputStream(destFile, true) // append
-          } else {
-            FileOutputStream(destFile, false)
-          }
-
-          val buffer = ByteArray(8192)
-          var total = resumeFrom
-          var count: Int
-          var lastProgress = -1
+          // Resume from what is actually on disk (0 when there is no partial).
+          val resumeFrom = partFile.length()
+          var connection: HttpURLConnection? = null
+          var finished = false
+          val interruptsBefore = state.interrupts.get()
 
           try {
-            while (input.read(buffer).also { count = it } != -1) {
-              while (state.paused && !state.cancelled) {
-                state.bytesDownloaded = total
-                Thread.sleep(200)
-              }
-              if (state.cancelled) {
-                output.flush(); output.close(); input.close()
-                destFile.delete()
-                activeDownloads.remove(downloadId)
-                foregroundPromises.remove(downloadId)?.resolve(
-                  Arguments.createMap().apply {
-                    putBoolean("success", false)
-                    putString("downloadId", downloadId)
-                    putString("error", "CANCELLED")
-                  }
-                )
-                return@thread
-              }
+            val conn = openDownloadConnection(urlString, headersMap, resumeFrom, validator, state)
+            connection = conn
 
-              output.write(buffer, 0, count)
-              total += count
+            val responseCode = conn.responseCode
+            if (responseCode == 416 && resumeFrom > 0) {
+              // Partial no longer satisfiable (resource changed/shrank): start over.
+              partFile.delete()
+              continue@retryLoop
+            }
+            if (responseCode != HttpURLConnection.HTTP_OK && responseCode != HttpURLConnection.HTTP_PARTIAL) {
+              // Server error — do NOT retry (4xx/5xx are not transient)
+              fail("SERVER_ERROR: $responseCode")
+              return@thread
+            }
 
-              if (totalExpected > 0) {
-                val progress = (total * 100 / totalExpected).toInt()
-                if (progress > lastProgress) {
-                  lastProgress = progress
-                  val evt = Arguments.createMap().apply {
-                    putString("url", urlString)
-                    putString("downloadId", downloadId)
-                    putInt("progress", progress)
-                    putDouble("bytesDownloaded", total.toDouble())
-                    putDouble("totalBytes", totalExpected.toDouble())
+            val contentLength = conn.getHeaderField("Content-Length")?.toLongOrNull() ?: -1L
+            val append: Boolean
+            val totalExpected: Long
+            if (responseCode == HttpURLConnection.HTTP_PARTIAL && resumeFrom > 0) {
+              val contentRange = conn.getHeaderField("Content-Range")
+              val rangeMatch = contentRange?.let { CONTENT_RANGE.find(it) }
+              if (rangeMatch?.groupValues?.get(1)?.toLongOrNull() != resumeFrom) {
+                // Missing, unparseable or not the range we asked for — the bytes
+                // cannot be spliced on safely, so restart from 0 (without Range).
+                partFile.delete()
+                continue@retryLoop
+              }
+              append = true
+              totalExpected = rangeMatch?.groupValues?.get(3)?.toLongOrNull()
+                ?: if (contentLength >= 0) resumeFrom + contentLength else -1L
+            } else {
+              // Full body (no Range sent, or the server ignored it): start from 0.
+              append = false
+              totalExpected = contentLength
+              validator = conn.getHeaderField("ETag")?.takeUnless { it.startsWith("W/") }
+                ?: conn.getHeaderField("Last-Modified")
+            }
+
+            var input: InputStream? = null
+            var output: FileOutputStream? = null
+            try {
+              input = conn.inputStream
+              output = FileOutputStream(partFile, append)
+              val buffer = ByteArray(8192)
+              var total = if (append) resumeFrom else 0L
+              var lastProgress = -1
+              var lastUnknownProgressAt = 0L
+
+              // On pause or cancel, stop reading and close the connection; the
+              // partial stays on disk and is resumed with a Range request.
+              while (!state.cancelled && !state.paused) {
+                val count = input.read(buffer)
+                if (count == -1) {
+                  val sizeOk = totalExpected < 0 || total == totalExpected
+                  if (state.interrupts.get() != interruptsBefore) {
+                    // A forced disconnect (pause/cancel) can look like EOF on a body
+                    // without a length; only trust it if the size is known and matches.
+                    finished = totalExpected >= 0 && sizeOk
+                    break
                   }
-                  emit("onDownloadProgress", evt)
+                  if (!sizeOk) {
+                    // Short (or long) body: retry via Range if attempts remain.
+                    throw java.io.IOException("INCOMPLETE_DOWNLOAD: received $total of $totalExpected bytes")
+                  }
+                  finished = true
+                  break
+                }
+                output.write(buffer, 0, count)
+                total += count
+
+                if (totalExpected > 0) {
+                  val progress = (total * 100 / totalExpected).toInt()
+                  if (progress > lastProgress) {
+                    lastProgress = progress
+                    val evt = Arguments.createMap().apply {
+                      putString("url", urlString)
+                      putString("downloadId", downloadId)
+                      putInt("progress", progress)
+                      putDouble("bytesDownloaded", total.toDouble())
+                      putDouble("totalBytes", totalExpected.toDouble())
+                    }
+                    emit("onDownloadProgress", evt)
+                  }
+                } else {
+                  // Unknown size (no Content-Length): report bytes only, throttled.
+                  val now = SystemClock.elapsedRealtime()
+                  if (now - lastUnknownProgressAt >= 250L) {
+                    lastUnknownProgressAt = now
+                    val evt = Arguments.createMap().apply {
+                      putString("url", urlString)
+                      putString("downloadId", downloadId)
+                      putInt("progress", -1)
+                      putDouble("bytesDownloaded", total.toDouble())
+                      putDouble("totalBytes", -1.0)
+                    }
+                    emit("onDownloadProgress", evt)
+                  }
                 }
               }
+              output.flush()
+            } finally {
+              // Bug #1 fix: guaranteed close regardless of exception
+              try { output?.close() } catch (_: Exception) {}
+              try { input?.close() } catch (_: Exception) {}
             }
-            output.flush()
+          } catch (e: Exception) {
+            // Check the flags first: pause/cancel disconnect the connection, which
+            // surfaces here as an IOException that is not a network error.
+            if (state.cancelled) {
+              settleCancelled()
+              return@thread
+            }
+            // Paused (or paused and already resumed): wait for resume if needed,
+            // then continue via Range. No retry consumed.
+            if (state.paused || state.interrupts.get() != interruptsBefore) continue@retryLoop
+            lastError = e.message ?: "NETWORK_ERROR"   // Bug #3 fix: save error for next retry event
+            // Network error — retry if attempts remain. The partial file is kept
+            // and the retry resumes from its length.
+            if (attempt < maxAttempts) {
+              attempt++
+              retryPending = true
+              continue@retryLoop
+            }
+            fail(lastError)
+            return@thread
           } finally {
-            // Bug #1 fix: guaranteed close regardless of exception
-            try { output.close() } catch (_: Exception) {}
-            try { input.close() } catch (_: Exception) {}
-            connection.disconnect()
+            state.connection = null
+            connection?.disconnect()
           }
 
-          activeDownloads.remove(downloadId)
-
-          // ── Checksum verification ─────────────────────────────────────────
-          if (checksumMap != null) {
-            val expectedHash = checksumMap.getString("hash")
-            val algorithm = checksumMap.getString("algorithm")?.uppercase() ?: "MD5"
-            if (expectedHash != null) {
-              val actualHash = calculateChecksum(destFile, algorithm)
-              if (!actualHash.equals(expectedHash, ignoreCase = true)) {
-                destFile.delete()
-                foregroundPromises.remove(downloadId)?.resolve(Arguments.createMap().apply {
-                  putBoolean("success", false)
-                  putString("downloadId", downloadId)
-                  putString("error", "CHECKSUM_MISMATCH: expected $expectedHash, got $actualHash")
-                })
-                emit("onDownloadError", Arguments.createMap().apply {
-                  putBoolean("success", false)
-                  putString("downloadId", downloadId)
-                  putString("error", "CHECKSUM_MISMATCH: expected $expectedHash, got $actualHash")
-                })
-                return@thread
-              }
-            }
-          }
-
-          val resolvedPromise = foregroundPromises.remove(downloadId)
-          resolvedPromise?.resolve(Arguments.createMap().apply {
-            putBoolean("success", true)
-            putString("downloadId", downloadId)
-            putString("filePath", destFile.absolutePath)
-          })
-          // Only emit the event when there is no foreground promise (background-style usage),
-          // matching iOS behaviour where onDownloadComplete fires only for background downloads.
-          if (resolvedPromise == null) {
-            emit("onDownloadComplete", Arguments.createMap().apply {
-              putBoolean("success", true)
-              putString("downloadId", downloadId)
-              putString("filePath", destFile.absolutePath)
-            })
-          }
-          break@retryLoop // ✅ success
-
-        } catch (e: Exception) {
-          lastError = e.message ?: "NETWORK_ERROR"   // Bug #3 fix: save error for next retry event
           if (state.cancelled) {
-            activeDownloads.remove(downloadId)
-            foregroundPromises.remove(downloadId)?.resolve(
-              Arguments.createMap().apply {
-                putBoolean("success", false)
-                putString("downloadId", downloadId)
-                putString("error", "CANCELLED")
-              }
-            )
+            settleCancelled()
             return@thread
           }
-          // Network error — retry if attempts remain
-          if (attempt < maxAttempts) {
-            attempt++
-            // loop continues → will sleep + retry
-          } else {
-            activeDownloads.remove(downloadId)
-            foregroundPromises.remove(downloadId)?.resolve(Arguments.createMap().apply {
-              putBoolean("success", false)
-              putString("downloadId", downloadId)
-              putString("error", lastError)
-            })
-            emit("onDownloadError", Arguments.createMap().apply {
-              putBoolean("success", false)
-              putString("downloadId", downloadId)
-              putString("error", lastError)
-            })
-            return@thread
+          if (finished) break@retryLoop
+          // Paused mid-body: loop back, wait for resume, reconnect with Range.
+        }
+
+        // ── Checksum verification ─────────────────────────────────────────
+        // Failures here are terminal: re-downloading cannot fix a wrong expected
+        // hash or an unsupported algorithm.
+        if (checksumMap != null) {
+          val expectedHash = checksumMap.getString("hash")
+          val algorithm = checksumMap.getString("algorithm")?.uppercase() ?: "MD5"
+          if (expectedHash != null) {
+            val actualHash = try {
+              calculateChecksum(partFile, algorithm)
+            } catch (e: Exception) {
+              fail(e.message ?: "CHECKSUM_ERROR")
+              return@thread
+            }
+            if (!actualHash.equals(expectedHash, ignoreCase = true)) {
+              fail("CHECKSUM_MISMATCH: expected $expectedHash, got $actualHash")
+              return@thread
+            }
           }
         }
+
+        if (state.cancelled) {
+          settleCancelled()
+          return@thread
+        }
+        // Commit point. If cancel claimed first it wins: the partial is deleted
+        // in finally and the existing file is untouched. Otherwise cancelDownload
+        // now reports ALREADY_COMPLETED.
+        if (!state.claim(OUTCOME_COMPLETED)) return@thread
+
+        // rename(2) atomically replaces an existing file of the same name.
+        // No delete-then-rename fallback: if the rename fails, the user's existing
+        // file must stay intact.
+        if (!partFile.renameTo(destFile)) {
+          fail("Could not move downloaded file to ${destFile.absolutePath}", claimed = true)
+          return@thread
+        }
+        state.promise.resolve(Arguments.createMap().apply {
+          putBoolean("success", true)
+          putString("downloadId", downloadId)
+          putString("filePath", destFile.absolutePath)
+        })
+        // onDownloadComplete is only emitted for background downloads (matches iOS);
+        // a foreground download reports completion through its promise.
+      } catch (e: Throwable) {
+        // InterruptedException, OOM, … — never leave the promise hanging.
+        fail(e.message ?: "NETWORK_ERROR")
+      } finally {
+        // Only remove our own entry: the id may since have been reused.
+        activeDownloads.remove(downloadId, state)
+        if (partFile.exists()) partFile.delete()
+        livePartFiles.remove(partFile.absolutePath)
       }
     }
   }
 
+  // ─── Background (DownloadManager) tracking ──────────────────────────────────
+
+  private fun runOnBgExecutor(task: () -> Unit) {
+    try {
+      bgExecutor.execute {
+        try { task() } catch (_: Exception) {}
+      }
+    } catch (_: Exception) {} // RejectedExecutionException after invalidate
+  }
+
+  /** Starts the poller if it is not running. Call after adding to [bgDownloadIds]. */
+  private fun ensureBackgroundPolling() {
+    synchronized(bgExecutor) {
+      if (bgPollFuture != null || bgExecutor.isShutdown) return
+      bgPollFuture = bgExecutor.scheduleWithFixedDelay({
+        try {
+          // Stop when nothing is tracked. Checked under the lock so a download
+          // added concurrently either sees the old future or restarts it.
+          val idle = synchronized(bgExecutor) {
+            if (bgDownloadIds.isEmpty()) {
+              bgPollFuture?.cancel(false)
+              bgPollFuture = null
+              true
+            } else false
+          }
+          if (!idle) pollBackgroundDownloads()
+        } catch (_: Exception) {
+          // An exception would silently cancel all future runs of this task.
+        }
+      }, 0L, 1500L, TimeUnit.MILLISECONDS)
+    }
+  }
+
   private fun pollBackgroundDownloads() {
+    val tracked = bgDownloadIds.values.toSet()
+    if (tracked.isEmpty()) return
     val dm = reactContext.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
-    val query = DownloadManager.Query()
+    val query = DownloadManager.Query().setFilterById(*tracked.toLongArray())
     val cursor = dm.query(query) ?: return
-    val currentBgIds = bgDownloadIds.values.toSet()
+    val seen = HashSet<Long>()
+    val terminal = ArrayList<Long>()
     cursor.use { c ->
       if (c.moveToFirst()) {
         val idIdx = c.getColumnIndex(DownloadManager.COLUMN_ID)
@@ -600,9 +858,13 @@ class FileToolkitModule(private val reactContext: ReactApplicationContext) :
         val uriIdx = c.getColumnIndex(DownloadManager.COLUMN_URI)
         do {
           val bgId = c.getLong(idIdx)
-          if (!currentBgIds.contains(bgId)) continue
-          val downloadId = downloadIdForBgId(bgId) ?: continue
+          seen.add(bgId)
           val status = c.getInt(statusIdx)
+          if (status == DownloadManager.STATUS_SUCCESSFUL || status == DownloadManager.STATUS_FAILED) {
+            terminal.add(bgId)
+            continue
+          }
+          val downloadId = downloadIdForBgId(bgId) ?: continue
           val total = c.getLong(totalIdx)
           val current = c.getLong(currentIdx)
           if (status == DownloadManager.STATUS_RUNNING || status == DownloadManager.STATUS_PENDING) {
@@ -620,43 +882,84 @@ class FileToolkitModule(private val reactContext: ReactApplicationContext) :
         } while (c.moveToNext())
       }
     }
+    // Finished (possibly while the process was dead, so the broadcast was
+    // missed) or removed from DownloadManager by the user.
+    terminal.forEach { finalizeBackground(it) }
+    tracked.filter { it !in seen }.forEach { finalizeBackground(it) }
   }
 
-  private fun handleBackgroundDownloadComplete(bgId: Long) {
+  /**
+   * Reports the outcome of a background download exactly once and stops
+   * tracking it. Called (on [bgExecutor]) by both the completion receiver and
+   * the poller; anything that is not a terminal status is ignored, so a forged
+   * or early ACTION_DOWNLOAD_COMPLETE cannot end a running download.
+   */
+  private fun finalizeBackground(bgId: Long) {
+    val downloadId = bgDownloadIds.entries.firstOrNull { it.value == bgId }?.key ?: return
     val dm = reactContext.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
-    val query = DownloadManager.Query().setFilterById(bgId)
-    val cursor = dm.query(query) ?: return
-    cursor.use {
-      if (it.moveToFirst()) {
-        val statusIdx = it.getColumnIndex(DownloadManager.COLUMN_STATUS)
-        val uriIdx = it.getColumnIndex(DownloadManager.COLUMN_LOCAL_URI)
-        val reasonIdx = it.getColumnIndex(DownloadManager.COLUMN_REASON)
+    var status = -1
+    var localUri: String? = null
+    var reason = 0
+    var found = false
+    dm.query(DownloadManager.Query().setFilterById(bgId))?.use { c ->
+      if (c.moveToFirst()) {
+        found = true
+        status = c.getInt(c.getColumnIndexOrThrow(DownloadManager.COLUMN_STATUS))
+        localUri = c.getString(c.getColumnIndexOrThrow(DownloadManager.COLUMN_LOCAL_URI))
+        reason = c.getInt(c.getColumnIndexOrThrow(DownloadManager.COLUMN_REASON))
+      }
+    } ?: return // Query failed: leave it tracked and try again on the next poll.
+    if (found && status != DownloadManager.STATUS_SUCCESSFUL && status != DownloadManager.STATUS_FAILED) return
 
-        // Not one of ours (another library or the host app enqueued it).
-        val downloadId = downloadIdForBgId(bgId) ?: return
-        val status = it.getInt(statusIdx)
-        forgetBackgroundDownload(downloadId, bgId)
+    val checksum = bgPrefs.getString("$bgId.checksum", null)
+    // Atomic claim — loses against cancelDownload or an earlier finalisation.
+    if (!forgetBackgroundDownload(downloadId, bgId)) return
 
-        if (status == DownloadManager.STATUS_SUCCESSFUL) {
-          val localUri = it.getString(uriIdx)
-          // COLUMN_LOCAL_URI is a percent-encoded file:// URI; Uri.parse().path
-          // decodes it, whereas trimming the scheme leaves "%20" in the path.
-          val filePath = localUri?.let { uri -> Uri.parse(uri).path } ?: ""
-          emit("onDownloadComplete", Arguments.createMap().apply {
-            putBoolean("success", true)
-            putString("downloadId", downloadId)
-            putString("filePath", filePath)
-          })
-        } else {
-          val reason = it.getInt(reasonIdx)
-          emit("onDownloadError", Arguments.createMap().apply {
-            putBoolean("success", false)
-            putString("downloadId", downloadId)
-            putString("error", "DownloadManager failed with reason/code: $reason")
-          })
-        }
+    if (!found) {
+      emit("onDownloadError", Arguments.createMap().apply {
+        putBoolean("success", false)
+        putString("downloadId", downloadId)
+        putString("error", "DownloadManager entry was removed")
+      }, bufferUntilSubscribed = true)
+      return
+    }
+    if (status == DownloadManager.STATUS_FAILED) {
+      emit("onDownloadError", Arguments.createMap().apply {
+        putBoolean("success", false)
+        putString("downloadId", downloadId)
+        putString("error", "DownloadManager failed with reason/code: $reason")
+      }, bufferUntilSubscribed = true)
+      return
+    }
+
+    // COLUMN_LOCAL_URI is a percent-encoded file:// URI; Uri.parse().path
+    // decodes it, whereas trimming the scheme leaves "%20" in the path.
+    val filePath = localUri?.let { uri -> Uri.parse(uri).path } ?: ""
+    if (checksum != null) {
+      val algorithm = checksum.substringBefore(':')
+      val expectedHash = checksum.substringAfter(':')
+      val error = try {
+        val actualHash = calculateChecksum(File(filePath), algorithm)
+        if (actualHash.equals(expectedHash, ignoreCase = true)) null
+        else "CHECKSUM_MISMATCH: expected $expectedHash, got $actualHash"
+      } catch (e: Exception) {
+        e.message ?: "CHECKSUM_ERROR"
+      }
+      if (error != null) {
+        File(filePath).delete()
+        emit("onDownloadError", Arguments.createMap().apply {
+          putBoolean("success", false)
+          putString("downloadId", downloadId)
+          putString("error", error)
+        }, bufferUntilSubscribed = true)
+        return
       }
     }
+    emit("onDownloadComplete", Arguments.createMap().apply {
+      putBoolean("success", true)
+      putString("downloadId", downloadId)
+      putString("filePath", filePath)
+    }, bufferUntilSubscribed = true)
   }
 
   // ─── executeDownload (Foreground) ─────────────────────────────────────────────────────────
@@ -676,6 +979,8 @@ class FileToolkitModule(private val reactContext: ReactApplicationContext) :
       return
     }
     state.paused = true
+    // Abort a read blocked on a stalled socket; the thread keeps the partial.
+    state.interrupt()
     promise.resolve(Arguments.createMap().apply { putBoolean("success", true) })
   }
 
@@ -701,23 +1006,37 @@ class FileToolkitModule(private val reactContext: ReactApplicationContext) :
   // ─── cancelDownload ────────────────────────────────────────────────────────
 
   override fun cancelDownload(downloadId: String, promise: Promise) {
-    val state = activeDownloads[downloadId]
+    // Removed synchronously so the id can be reused as soon as this resolves;
+    // the old thread only removes its own entry and deletes its own partial.
+    val state = activeDownloads.remove(downloadId)
     if (state != null) {
       state.cancelled = true
-      activeDownloads.remove(downloadId)
-    }
-    // Resolve foreground promise if download thread hasn't yet (atomic — safe from races)
-    foregroundPromises.remove(downloadId)?.resolve(
-      Arguments.createMap().apply {
-        putBoolean("success", false)
-        putString("downloadId", downloadId)
-        putString("error", "CANCELLED")
+      state.interrupt()
+      if (state.claim(OUTCOME_CANCELLED)) {
+        state.promise.resolve(cancelledResult(downloadId))
+      } else if (state.result != OUTCOME_CANCELLED) {
+        // The download committed (or failed) before the cancel arrived.
+        promise.resolve(Arguments.createMap().apply {
+          putBoolean("success", false)
+          putString("downloadId", downloadId)
+          putString("error", "ALREADY_COMPLETED")
+        })
+        return
       }
-    )
+    }
     // Also cancel background DownloadManager downloads
     val bgId = bgDownloadIds[downloadId]
     if (bgId != null) {
-      forgetBackgroundDownload(downloadId, bgId)
+      if (!forgetBackgroundDownload(downloadId, bgId)) {
+        // finalizeBackground won: JS has been (or is being) told the outcome, and
+        // dm.remove() would delete the finished file.
+        promise.resolve(Arguments.createMap().apply {
+          putBoolean("success", false)
+          putString("downloadId", downloadId)
+          putString("error", "ALREADY_COMPLETED")
+        })
+        return
+      }
       try {
         val dm = reactContext.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
         dm.remove(bgId)
@@ -735,7 +1054,7 @@ class FileToolkitModule(private val reactContext: ReactApplicationContext) :
       // Scan only toolkit-owned subdirectories to avoid returning files from other apps
       for (dir in toolkitDirs()) {
         dir.listFiles()?.forEach { f ->
-          if (!f.isFile) return@forEach
+          if (!f.isFile || isPartialFile(f)) return@forEach
           list.pushMap(Arguments.createMap().apply {
             putString("fileName", f.name)
             putString("filePath", f.absolutePath)
@@ -791,7 +1110,9 @@ class FileToolkitModule(private val reactContext: ReactApplicationContext) :
       val downloadsDir = getDestinationDir("downloads").absolutePath
       val dirs = toolkitDirs().filter { it.absolutePath != downloadsDir }
       for (dir in dirs) {
-        dir.listFiles()?.forEach { it.deleteRecursively() }
+        // Skip partial files of running downloads: deleting one would fail that
+        // download at commit time.
+        dir.listFiles()?.forEach { if (it.absolutePath !in livePartFiles) it.deleteRecursively() }
       }
       promise.resolve(Arguments.createMap().apply { putBoolean("success", true) })
     } catch (e: Exception) {
@@ -927,9 +1248,7 @@ class FileToolkitModule(private val reactContext: ReactApplicationContext) :
         return
       }
 
-      val dst = File(toPath)
-      dst.parentFile?.mkdirs()
-      src.copyTo(dst, overwrite = true)
+      transferItem(src, File(toPath), move = false)
 
       promise.resolve(Arguments.createMap().apply {
         putBoolean("success", true)
@@ -955,16 +1274,7 @@ class FileToolkitModule(private val reactContext: ReactApplicationContext) :
         return
       }
 
-      val dst = File(toPath)
-      dst.parentFile?.mkdirs()
-
-      val renamed = src.renameTo(dst)
-      if (!renamed) {
-        // renameTo fails across filesystems for both files and directories.
-        // Fall back to recursive copy + delete, which works in all cases.
-        src.copyRecursively(dst, overwrite = true)
-        src.deleteRecursively()
-      }
+      transferItem(src, File(toPath), move = true)
 
       promise.resolve(Arguments.createMap().apply {
         putBoolean("success", true)
@@ -975,6 +1285,32 @@ class FileToolkitModule(private val reactContext: ReactApplicationContext) :
         putString("error", e.message ?: "MOVE_FILE_ERROR")
       })
     }
+  }
+
+  /**
+   * Copies or moves [src] to [dst] without losing data on failure. A copy is
+   * staged next to [dst] and renamed over it, so an existing destination
+   * survives until the new one is complete. `File.copyTo(overwrite = true)`
+   * deletes the target first, which destroyed the source when both were the
+   * same file. An existing directory is never replaced (that wiped it).
+   */
+  private fun transferItem(src: File, dst: File, move: Boolean) {
+    if (dst.exists()) {
+      if (src.canonicalPath == dst.canonicalPath) return
+      if (dst.isDirectory) throw IOException("Destination is a directory: ${dst.path}")
+    }
+    dst.parentFile?.mkdirs()
+    if (move && src.renameTo(dst)) return // same filesystem: atomic
+    // Cross-filesystem move, or a copy.
+    val tmp = File(dst.absoluteFile.parentFile, ".${UUID.randomUUID()}.ftk-tmp")
+    try {
+      src.copyRecursively(tmp)
+      if (!tmp.renameTo(dst)) throw IOException("Could not replace ${dst.path}")
+    } catch (e: Throwable) {
+      tmp.deleteRecursively()
+      throw e
+    }
+    if (move) src.deleteRecursively()
   }
 
   // ─── mkdir ─────────────────────────────────────────────────────────────────
@@ -1284,56 +1620,55 @@ class FileToolkitModule(private val reactContext: ReactApplicationContext) :
         }
 
         val headersMap = options.getMap("headers")
-        val url = URL(urlString)
-        val connection = url.openConnection() as HttpURLConnection
-        
-        connection.requestMethod = "GET"
-        connection.connectTimeout = 30000
-        connection.readTimeout = 30000
-
-        // Add custom headers if provided
-        headersMap?.toHashMap()?.forEach { (key, value) ->
-          connection.setRequestProperty(key, value.toString())
-        }
-
-        connection.connect()
-
-        val responseCode = connection.responseCode
-        if (responseCode !in 200..299) {
-          connection.disconnect()
-          promise.resolve(Arguments.createMap().apply {
-            putBoolean("success", false)
-            putString("error", "HTTP $responseCode")
-          })
-          return@thread
-        }
-
-        // Get MIME type from response
-        val mimeType = connection.contentType?.split(";")?.get(0)?.trim() ?: "application/octet-stream"
-
-        // Read all bytes — cap at 50 MB to match readFile limit and prevent OOM.
+        // Same helper as downloads: timeouts + cross-protocol (http→https) redirects.
+        val connection = openDownloadConnection(urlString, headersMap, 0L)
         val maxBytes = 50L * 1024 * 1024
-        val contentLength = connection.contentLength.toLong()
-        if (contentLength > maxBytes) {
-          connection.disconnect()
-          promise.resolve(Arguments.createMap().apply {
-            putBoolean("success", false)
-            putString("error", "Response exceeds 50 MB limit for urlToBase64")
-          })
-          return@thread
+        val tooLarge = Arguments.createMap().apply {
+          putBoolean("success", false)
+          putString("error", "Response exceeds 50 MB limit for urlToBase64")
         }
-        val bytes = connection.inputStream.use { input ->
-          val buf = input.readBytes()
-          if (buf.size > maxBytes) {
+        val mimeType: String
+        val bytes: ByteArray
+        try {
+          val responseCode = connection.responseCode
+          if (responseCode !in 200..299) {
             promise.resolve(Arguments.createMap().apply {
               putBoolean("success", false)
-              putString("error", "Response exceeds 50 MB limit for urlToBase64")
+              putString("error", "HTTP $responseCode")
             })
             return@thread
           }
-          buf
+
+          // Get MIME type from response
+          mimeType = connection.contentType?.split(";")?.get(0)?.trim() ?: "application/octet-stream"
+
+          // Cap at 50 MB to match readFile limit and prevent OOM. Checked up front
+          // when the size is declared, and while streaming for chunked responses.
+          val contentLength = connection.getHeaderField("Content-Length")?.toLongOrNull() ?: -1L
+          if (contentLength > maxBytes) {
+            promise.resolve(tooLarge)
+            return@thread
+          }
+          val out = ByteArrayOutputStream(if (contentLength > 0) contentLength.toInt() else 64 * 1024)
+          connection.inputStream.use { input ->
+            val buffer = ByteArray(8192)
+            var total = 0L
+            while (true) {
+              val count = input.read(buffer)
+              if (count == -1) break
+              total += count
+              if (total > maxBytes) {
+                promise.resolve(tooLarge)
+                return@thread
+              }
+              out.write(buffer, 0, count)
+            }
+          }
+          bytes = out.toByteArray()
+        } finally {
+          connection.disconnect()
         }
-        
+
         // Encode to base64
         val base64String = android.util.Base64.encodeToString(bytes, android.util.Base64.NO_WRAP)
 
@@ -1427,19 +1762,20 @@ class FileToolkitModule(private val reactContext: ReactApplicationContext) :
         addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
       }
 
-      // Check if there's an app to handle this file type
-      val packageManager = reactContext.packageManager
-      if (openIntent.resolveActivity(packageManager) != null) {
+      // No resolveActivity() pre-check: on Android 11+ package visibility makes
+      // it return null for most viewers unless the app declares <queries>.
+      try {
         reactContext.startActivity(openIntent)
-        promise.resolve(Arguments.createMap().apply {
-          putBoolean("success", true)
-        })
-      } else {
+      } catch (_: ActivityNotFoundException) {
         promise.resolve(Arguments.createMap().apply {
           putBoolean("success", false)
           putString("error", "No app found to open this file type: $detectedMimeType")
         })
+        return
       }
+      promise.resolve(Arguments.createMap().apply {
+        putBoolean("success", true)
+      })
 
     } catch (e: Exception) {
       promise.resolve(Arguments.createMap().apply {
@@ -1464,6 +1800,25 @@ class FileToolkitModule(private val reactContext: ReactApplicationContext) :
 
   override fun unzip(sourcePath: String, destDir: String, promise: Promise) {
     thread {
+      // Everything this call creates, so a failure midway can be rolled back
+      // without touching anything that existed before (matches iOS).
+      val createdFiles = ArrayList<File>()
+      val createdDirs = ArrayList<File>() // in creation order, outermost first
+      var tempFile: File? = null
+
+      fun mkdirsTracked(dir: File) {
+        val missing = ArrayList<File>()
+        var d: File? = dir
+        while (d != null && !d.exists()) {
+          missing.add(0, d)
+          d = d.parentFile
+        }
+        for (m in missing) {
+          if (m.mkdir()) createdDirs.add(m)
+          else if (!m.isDirectory) throw java.io.IOException("Could not create directory: ${m.absolutePath}")
+        }
+      }
+
       try {
         val sourceFile = File(sourcePath)
         if (!sourceFile.exists()) {
@@ -1475,16 +1830,19 @@ class FileToolkitModule(private val reactContext: ReactApplicationContext) :
         }
 
         val destDirFile = File(destDir)
-        destDirFile.mkdirs()
-
         val extractedFiles = Arguments.createArray()
 
-        ZipInputStream(FileInputStream(sourceFile).buffered()).use { zis ->
-          var entry: ZipEntry? = zis.nextEntry
-          while (entry != null) {
+        // ZipFile reads the authoritative central directory, so a truncated or
+        // non-zip source fails here with a ZipException (ZipInputStream treated
+        // truncation at an entry boundary as a clean end, and rejects STORED
+        // entries with data descriptors). Unsupported compression methods and
+        // truncated entry data throw from getInputStream()/read().
+        java.util.zip.ZipFile(sourceFile).use { zip ->
+          mkdirsTracked(destDirFile)
+          val canonicalDest = destDirFile.canonicalPath
+          for (entry in zip.entries()) {
             // Prevent zip-slip attacks
             val entryFile = File(destDirFile, entry.name)
-            val canonicalDest = destDirFile.canonicalPath
             val canonicalEntry = entryFile.canonicalPath
             if (!canonicalEntry.startsWith(canonicalDest + File.separator) &&
                 canonicalEntry != canonicalDest) {
@@ -1495,16 +1853,30 @@ class FileToolkitModule(private val reactContext: ReactApplicationContext) :
             }
 
             if (entry.isDirectory) {
-              entryFile.mkdirs()
+              mkdirsTracked(entryFile)
             } else {
-              entryFile.parentFile?.mkdirs()
-              FileOutputStream(entryFile).buffered().use { fos ->
-                zis.copyTo(fos)
+              val parent = entryFile.parentFile ?: destDirFile
+              mkdirsTracked(parent)
+              // Write to a temp file and rename on success, so a failure midway
+              // never leaves a pre-existing file half-overwritten.
+              val existed = entryFile.exists()
+              val tmp = File(parent, ".${entryFile.name.take(64)}.${UUID.randomUUID()}.unzip")
+              tempFile = tmp
+              // ZipFile does not verify CRCs (ZipInputStream did), so check here.
+              val crc = java.util.zip.CRC32()
+              val written = java.util.zip.CheckedInputStream(zip.getInputStream(entry), crc).use { input ->
+                FileOutputStream(tmp).buffered().use { fos -> input.copyTo(fos) }
               }
+              if ((entry.size >= 0 && written != entry.size) || (entry.crc >= 0 && crc.value != entry.crc)) {
+                throw java.util.zip.ZipException("ZIP entry is corrupt: ${entry.name}")
+              }
+              if (!tmp.renameTo(entryFile)) {
+                throw java.io.IOException("Could not write ${entryFile.absolutePath}")
+              }
+              tempFile = null
+              if (!existed) createdFiles.add(entryFile)
               extractedFiles.pushString(entryFile.absolutePath)
             }
-            zis.closeEntry()
-            entry = zis.nextEntry
           }
         }
 
@@ -1514,6 +1886,11 @@ class FileToolkitModule(private val reactContext: ReactApplicationContext) :
           putArray("files", extractedFiles)
         })
       } catch (e: Exception) {
+        // Roll back: files first, then directories innermost-first. File.delete()
+        // on a directory only succeeds when empty, so foreign content survives.
+        tempFile?.delete()
+        createdFiles.asReversed().forEach { it.delete() }
+        createdDirs.asReversed().forEach { it.delete() }
         promise.resolve(Arguments.createMap().apply {
           putBoolean("success", false)
           putString("error", e.message ?: "UNZIP_ERROR")
@@ -1537,12 +1914,20 @@ class FileToolkitModule(private val reactContext: ReactApplicationContext) :
         }
 
         val destFile = File(destPath)
+        val destCanonical = destFile.canonicalPath
+        if (sourceFile.isFile && sourceFile.canonicalPath == destCanonical) {
+          promise.resolve(Arguments.createMap().apply {
+            putBoolean("success", false)
+            putString("error", "Destination path must differ from the source")
+          })
+          return@thread
+        }
         destFile.parentFile?.mkdirs()
         destFile.delete()
 
         ZipOutputStream(FileOutputStream(destFile).buffered()).use { zos ->
           if (sourceFile.isDirectory) {
-            zipDirectory(sourceFile, sourceFile.name, zos)
+            zipDirectory(sourceFile, sourceFile.name, zos, destCanonical)
           } else {
             zipFile(sourceFile, sourceFile.name, zos)
           }
@@ -1561,7 +1946,8 @@ class FileToolkitModule(private val reactContext: ReactApplicationContext) :
     }
   }
 
-  private fun zipDirectory(dir: File, baseName: String, zos: ZipOutputStream) {
+  /** [skipPath]: the archive being written, which may live inside [dir]. */
+  private fun zipDirectory(dir: File, baseName: String, zos: ZipOutputStream, skipPath: String) {
     val files = dir.listFiles() ?: return
     if (files.isEmpty()) {
       // Add empty directory entry
@@ -1572,8 +1958,8 @@ class FileToolkitModule(private val reactContext: ReactApplicationContext) :
     for (file in files) {
       val entryName = "$baseName/${file.name}"
       if (file.isDirectory) {
-        zipDirectory(file, entryName, zos)
-      } else {
+        zipDirectory(file, entryName, zos, skipPath)
+      } else if (file.canonicalPath != skipPath) {
         zipFile(file, entryName, zos)
       }
     }
@@ -1736,16 +2122,41 @@ class FileToolkitModule(private val reactContext: ReactApplicationContext) :
         }
       } else {
         // Android CookieManager does not support per-domain clearing directly.
-        // We read cookies for the domain and set each to expired.
+        // We read cookies for the domain and overwrite each with an expired one.
+        // A cookie is keyed by (name, domain, path) and getCookie() reports only
+        // names, so expire every variant it could have been set with: host-only
+        // and Domain= for the host and each parent domain, at Path=/ and at each
+        // prefix of the URL's path.
         val cookieUrl = cookieUrlFor(domain)
         val cookieString = cookieManager.getCookie(cookieUrl)
         if (!cookieString.isNullOrBlank()) {
+          val parsed = Uri.parse(cookieUrl)
+          val host = parsed.host ?: domain.trimStart('.')
+          val isIp = host.contains(':') || host.matches(Regex("""\d{1,3}(\.\d{1,3}){3}"""))
+          val labels = host.split('.')
+          // "a.b.example.com" → a.b.example.com, b.example.com, example.com (never the bare TLD)
+          val domains = if (isIp) listOf(host) else (0 until maxOf(labels.size - 1, 1)).map {
+            labels.drop(it).joinToString(".")
+          }
+          val paths = mutableListOf("/")
+          parsed.pathSegments.fold("") { prefix, segment ->
+            ("$prefix/$segment").also { paths.add(it) }
+          }
+          // Overwriting a Secure (or __Secure-/__Host-) cookie needs Secure, which
+          // is only accepted from an https URL.
+          val secure = if (cookieUrl.startsWith("https://")) "; Secure" else ""
+          val expired = "Expires=Thu, 01 Jan 1970 00:00:00 GMT; Max-Age=0"
           cookieString.split(";").forEach { pair ->
             val trimmed = pair.trim()
             val eqIndex = trimmed.indexOf("=")
             if (eqIndex > 0) {
               val name = trimmed.substring(0, eqIndex)
-              cookieManager.setCookie(cookieUrl, "$name=; Expires=Thu, 01 Jan 1970 00:00:00 GMT")
+              for (path in paths) {
+                cookieManager.setCookie(cookieUrl, "$name=; $expired; Path=$path$secure")
+                for (d in domains) {
+                  cookieManager.setCookie(cookieUrl, "$name=; $expired; Domain=$d; Path=$path$secure")
+                }
+              }
             }
           }
           cookieManager.flush()
@@ -1824,26 +2235,45 @@ class FileToolkitModule(private val reactContext: ReactApplicationContext) :
             return@thread
           }
 
-          resolver.openOutputStream(uri)?.use { outputStream ->
-            FileInputStream(file).use { inputStream ->
-              val buffer = ByteArray(8192)
-              var count: Int
-              while (inputStream.read(buffer).also { count = it } != -1) {
-                outputStream.write(buffer, 0, count)
-              }
+          // Never leave a half-written, IS_PENDING row behind on failure.
+          try {
+            val outputStream = resolver.openOutputStream(uri)
+            if (outputStream == null) {
+              try { resolver.delete(uri, null, null) } catch (_: Exception) {}
+              promise.resolve(Arguments.createMap().apply {
+                putBoolean("success", false)
+                putString("error", "Failed to open MediaStore entry for writing")
+              })
+              return@thread
             }
+            outputStream.use { os ->
+              FileInputStream(file).use { inputStream -> inputStream.copyTo(os, 8192) }
+            }
+            values.clear()
+            values.put(android.provider.MediaStore.MediaColumns.IS_PENDING, 0)
+            resolver.update(uri, values, null, null)
+          } catch (e: Exception) {
+            try { resolver.delete(uri, null, null) } catch (_: Exception) {}
+            throw e
           }
-
-          values.clear()
-          values.put(android.provider.MediaStore.MediaColumns.IS_PENDING, 0)
-          resolver.update(uri, values, null, null)
 
           promise.resolve(Arguments.createMap().apply {
             putBoolean("success", true)
             putString("uri", uri.toString())
           })
         } else {
-          // Android 9 and below — copy to public directory and media-scan
+          // Android 9 and below — copy to public directory and media-scan.
+          // Needs WRITE_EXTERNAL_STORAGE, which the host app must declare and
+          // request (not declared here: it would clash with the Expo plugin's
+          // maxSdkVersion during manifest merging).
+          if (ContextCompat.checkSelfPermission(reactContext, android.Manifest.permission.WRITE_EXTERNAL_STORAGE)
+            != PackageManager.PERMISSION_GRANTED) {
+            promise.resolve(Arguments.createMap().apply {
+              putBoolean("success", false)
+              putString("error", "WRITE_EXTERNAL_STORAGE permission is required on Android 9 and below")
+            })
+            return@thread
+          }
           val destDir = when (mediaType) {
             "image" -> Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES)
             "video" -> Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MOVIES)
@@ -1854,7 +2284,7 @@ class FileToolkitModule(private val reactContext: ReactApplicationContext) :
           val albumDir = if (album != null) File(destDir, album) else destDir
           albumDir.mkdirs()
           val destFile = File(albumDir, file.name)
-          file.copyTo(destFile, overwrite = true)
+          transferItem(file, destFile, move = false)
 
           android.media.MediaScannerConnection.scanFile(
             reactContext,
@@ -1878,6 +2308,9 @@ class FileToolkitModule(private val reactContext: ReactApplicationContext) :
 
   companion object {
     const val NAME = NativeFileToolkitSpec.NAME
+    /** Same limit as the platform's own redirect follower. */
+    private const val MAX_REDIRECTS = 20
+    private val CREDENTIAL_HEADERS = setOf("authorization", "cookie", "proxy-authorization")
   }
 }
 

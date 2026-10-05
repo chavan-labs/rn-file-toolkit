@@ -35,6 +35,8 @@ retry: { attempts: 3, delay: 1000 }
 - pass `onProgress` directly in the same `download()` call
 - test with larger file size
 - if using controls, keep a stable `downloadId`
+- if `percent` is `-1`, the server sent no `Content-Length`; show
+  `bytesDownloaded` instead of a percentage
 
 ## 3) Pause/resume/cancel does not work
 
@@ -42,11 +44,21 @@ Control APIs require the exact same `downloadId` used to start the download.
 
 ```ts
 const id = 'my-download-1';
-await download({ url, downloadId: id });
+const done = download({ url, downloadId: id }); // don't await yet
 await pauseDownload(id);
+await resumeDownload(id);
+const result = await done;
 ```
 
-If IDs differ, control calls target a different task.
+If IDs differ, control calls target a different task. `download()` resolves
+when the download finishes, so control calls made after `await download(...)`
+target a task that no longer exists. A queued download that has not started
+yet can be cancelled but not paused.
+
+On iOS, a server that does not support resuming (no `Range` / `ETag` support)
+produces no resume data when paused. The download then ends with
+`error: 'PAUSE_FAILED_NO_RESUME_DATA'` (through `onDownloadError` for
+background downloads) and must be started again.
 
 ## 4) Upload fails
 
@@ -100,6 +112,15 @@ This is normal behavior. Treat it as a user choice, not an error.
 
 - verify source with `fs.exists(sourcePath)`
 - unzip into a directory you can write to
+- only stored and deflated entries are supported; encrypted entries and other
+  compression methods (e.g. bzip2) return an error naming the entry
+- on iOS, `zip()` cannot create archives larger than 4 GB or with more than
+  65,535 entries (`ZIP64_NOT_SUPPORTED`); unzipping such archives works
+- `zip()` fails if `destPath` equals the source or is a directory
+- a corrupt, truncated or non-zip archive returns an error (for example
+  `ZIP entry is corrupt: <name>` or `ZIP entry is truncated: <name>`) instead
+  of a partial success. Files and folders created by the failed call are
+  removed again; existing files are never deleted
 
 ## 9) Expo app error with native module not found
 
@@ -136,20 +157,49 @@ Pause and resume are only available for **foreground** downloads
 ## 12) Background downloads on iOS finish only while the app is open
 
 iOS wakes the app to hand over a finished background transfer, but only if the
-app forwards the system's completion handler. Add this to your `AppDelegate`:
+app forwards the system's completion handler to `rn-file-toolkit`. Add this to
+your `AppDelegate.swift` (no import needed):
+
+```swift
+func application(_ application: UIApplication,
+                 handleEventsForBackgroundURLSession identifier: String,
+                 completionHandler: @escaping () -> Void) {
+  NotificationCenter.default.post(
+    name: Notification.Name("RNFileToolkitBackgroundSessionEvents"),
+    object: nil,
+    userInfo: [
+      "identifier": identifier,
+      "completionHandler": (completionHandler as @convention(block) () -> Void) as AnyObject,
+    ])
+}
+```
+
+Objective-C `AppDelegate.mm` equivalent:
 
 ```objc
 - (void)application:(UIApplication *)application
     handleEventsForBackgroundURLSession:(NSString *)identifier
                       completionHandler:(void (^)(void))completionHandler
 {
-  // Keep the handler and call it once your session delegate reports it is done.
-  self.backgroundSessionCompletionHandler = completionHandler;
+  [[NSNotificationCenter defaultCenter]
+      postNotificationName:@"RNFileToolkitBackgroundSessionEvents"
+                    object:nil
+                  userInfo:@{@"identifier": identifier,
+                             @"completionHandler": [completionHandler copy]}];
 }
 ```
 
-Without it the download still completes, but `onDownloadComplete` may not fire
-until the user next opens the app.
+The library moves the finished file to the requested `destination` /
+`fileName` and verifies the `checksum` even if the app was terminated in the
+meantime. `onDownloadComplete` / `onDownloadError` events that happen before
+JS subscribes are kept (up to 100) and delivered when you subscribe — so
+register `onDownloadComplete` / `onDownloadError` early (e.g. at app start) to
+receive downloads that finished while the app was not running.
+
+A background download whose task no longer exists on the next launch (for
+example one that was paused when the app was terminated — iOS keeps its resume
+data only in memory) is reported once through `onDownloadError` with
+`error: 'DOWNLOAD_LOST'`. Start it again with `download()`.
 
 ## 13) `getBackgroundDownloads()` returns different `status` values per platform
 

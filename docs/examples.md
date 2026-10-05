@@ -216,6 +216,8 @@ import {
   onUploadProgress,
 } from 'rn-file-toolkit';
 
+// Completion/error events fire for background downloads; foreground
+// downloads report through the promise returned by download().
 const offComplete = onDownloadComplete((event) =>
   console.log('complete', event)
 );

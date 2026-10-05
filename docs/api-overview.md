@@ -26,16 +26,16 @@ Main options:
 
 Progress payload (`ProgressInfo`):
 
-- `percent`
+- `percent` — 0–100, or `-1` when the server sends no `Content-Length`
 - `bytesDownloaded`
-- `totalBytes`
+- `totalBytes` — `-1` when the server sends no `Content-Length`
 - `speedBps`
 - `etaSeconds`
 
 Result (`DownloadResult`):
 
 - `success: boolean`
-- `filePath?: string`
+- `filePath?: string` — not set for `background: true`; the path arrives with `onDownloadComplete`
 - `downloadId?: string`
 - `error?: string`
 
@@ -46,13 +46,20 @@ Control an active download by ID. Returns `Promise<ActionResult>`:
 - `success: boolean`
 - `error?: string`
 
+Pausing keeps the partial file; resuming continues with an HTTP `Range` request (or restarts if the server ignores it). `cancelDownload()` also removes a download still waiting in the queue — its `download()` promise resolves with `{ success: false, error: 'CANCELLED' }`.
+
+- Starting a download with a `downloadId` that is still running resolves with `error: 'DOWNLOAD_ID_IN_USE'` (Android). Cancel it first, or use a new id.
+- On Android, `cancelDownload()` resolves with `error: 'ALREADY_COMPLETED'` when the download finished before the cancel took effect.
+- On Android, a connection that ends before the expected number of bytes arrived is retried (with `retry`) or fails with `error: 'INCOMPLETE_DOWNLOAD: received <n> of <expected> bytes'` instead of saving a truncated file.
+- While a foreground download is in progress, Android writes it to a hidden `.<name>.<random>.part` file in the destination folder and renames it when complete. `getCachedFiles()` skips these files; `ls()` shows them.
+
 ### `getBackgroundDownloads()`
 
-Returns an array of actively running or pending background download tasks, allowing you to re-attach or manage them after app restart.
+Returns `{ success, downloads?, error? }`, where `downloads` lists the running or pending background tasks as `{ downloadId, url, status, progress }`, so you can re-attach to them after an app restart. `status` is the raw platform value (see troubleshooting).
 
 ### `setQueueOptions({ maxConcurrent })`
 
-Sets global queue concurrency for queued downloads.
+Sets global queue concurrency for queued downloads. Queued background downloads keep their slot until they finish.
 
 ### `getQueueStatus()`
 
@@ -339,7 +346,7 @@ Options (`MediaStoreOptions`):
 
 - `filePath: string` (required) — path to the source file
 - `mediaType?: 'image' | 'video' | 'audio' | 'download'` — defaults to `download`
-- `album?: string` — optional album/subfolder name
+- `album?: string` — optional album (iOS) or subfolder (Android) name
 
 Result (`MediaStoreResult`):
 
@@ -351,14 +358,16 @@ Result (`MediaStoreResult`):
 
 - **Android:** Uses `MediaStore` ContentResolver API on Android 10+ (scoped storage). Falls back to public directory copy + `MediaScannerConnection` on Android 9-.
 - **iOS:** Uses `PHPhotoLibrary` for images and videos. For audio/download types, copies the file to the Documents directory (iOS has no shared media store for these types).
-- **Permissions:** The host app must include `NSPhotoLibraryAddUsageDescription` in `Info.plist` for iOS. Android may require `WRITE_EXTERNAL_STORAGE` on API < 29.
+- **Permissions:**
+  - **iOS:** `NSPhotoLibraryAddUsageDescription` in `Info.plist`; saving into an `album` additionally needs `NSPhotoLibraryUsageDescription`. A missing key resolves with `success: false` instead of crashing.
+  - **Android 9 and below:** `WRITE_EXTERNAL_STORAGE` (declare it with `android:maxSdkVersion="28"` and request it at runtime; the Expo plugin declares it for you). Without it the call resolves with `success: false`.
 
 ## Events
 
 Subscribe helpers:
 
-- `onDownloadComplete(callback)`
-- `onDownloadError(callback)`
+- `onDownloadComplete(callback)` — background downloads
+- `onDownloadError(callback)` — background downloads
 - `onUploadProgress(callback)`
 - `onDownloadRetry(callback)`
 

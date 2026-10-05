@@ -31,6 +31,24 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
 
     return true
   }
+
+  // Background downloads: iOS relaunches the app to deliver URLSession events and
+  // expects this handler to be called once they are processed. rn-file-toolkit
+  // listens for this notification (no import needed) and calls it at the right time.
+  func application(
+    _ application: UIApplication,
+    handleEventsForBackgroundURLSession identifier: String,
+    completionHandler: @escaping () -> Void
+  ) {
+    NotificationCenter.default.post(
+      name: Notification.Name("RNFileToolkitBackgroundSessionEvents"),
+      object: nil,
+      userInfo: [
+        "identifier": identifier,
+        "completionHandler": (completionHandler as @convention(block) () -> Void) as AnyObject,
+      ]
+    )
+  }
 }
 
 class ReactNativeDelegate: RCTDefaultReactNativeFactoryDelegate {
